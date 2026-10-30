@@ -180,7 +180,12 @@ secrets = [
   token, otherwise don't give it to the agent.
 
 `agentbox doctor <profile>` lists any `*KEY*/*TOKEN*/*SECRET*/*PASSW*` env vars visible inside
-the VM (values hidden) so you can confirm they're sentinels/placeholders.
+the VM and classifies each one *inside the VM*, so the value never leaves it: only the name,
+a class and the length are printed. A value starting with a known real-token prefix (`ghp_`,
+`gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `sk-ant-`, `sk-`, `xoxa-`/`xoxb-`/`xoxp-`, `AKIA`,
+`glpat-`) is a **WARN** ("looks like a real credential"): check `sbx secret ls` for a global
+secret, the profile's `env`, and the sbx agent template. Anything else is "placeholder/unknown",
+which is what proxy-injected credentials should look like. `HOSTTOOLS_TOKEN` is skipped.
 
 ## 5. Host tools (compilers, flashers, debuggers outside the VM)
 

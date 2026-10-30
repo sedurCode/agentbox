@@ -1245,6 +1245,36 @@ def cmd_status(cfg: Config) -> int:
     return 0
 
 
+# Value prefixes of real credentials. The VM classifies each token-like variable itself
+# (see TOKEN_PROBE), so a value never leaves it: only name, class and length come back.
+REAL_TOKEN_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-ant-", "sk-",
+                       "xoxa-", "xoxb-", "xoxp-", "AKIA", "glpat-")
+TOKEN_PROBE = (
+    "env | while IFS== read -r n v; do "
+    "case \"$n\" in *[Kk][Ee][Yy]*|*[Tt][Oo][Kk][Ee][Nn]*|*[Ss][Ee][Cc][Rr][Ee][Tt]*|*[Pp][Aa][Ss][Ss][Ww]*) ;; "
+    "*) continue;; esac; "
+    "[ \"$n\" = HOSTTOOLS_TOKEN ] && continue; "
+    "case \"$v\" in " + "|".join(f"{p}*" for p in REAL_TOKEN_PREFIXES) + ") c=real;; *) c=placeholder;; esac; "
+    "echo \"TOKENVAR $n $c ${#v}\"; done")
+TOKEN_HINT = ("check `sbx secret ls` for a global secret, the profile's `env`, and the sbx agent template;"
+              " a placeholder is expected for proxy-injected credentials")
+
+
+def classify_token_value(value: str) -> str:
+    """Host-side twin of TOKEN_PROBE's classifier (the probe runs in the VM)."""
+    return "real" if value.startswith(REAL_TOKEN_PREFIXES) else "placeholder"
+
+
+def parse_token_vars(out: str) -> list[tuple[str, str, int]]:
+    """TOKEN_PROBE output -> [(name, "real"|"placeholder", length)]; malformed lines are dropped."""
+    found = []
+    for line in out.splitlines():
+        m = re.fullmatch(r"TOKENVAR ([A-Za-z_][A-Za-z0-9_]*) (real|placeholder) (\d+)", line.strip())
+        if m:
+            found.append((m.group(1), m.group(2), int(m.group(3))))
+    return found
+
+
 # ssh-add output meaning "nothing answered": the socket sbx always creates has no agent behind it.
 SSH_ADD_NO_AGENT = ("could not open a connection", "communication with agent failed",
                     "error connecting", "no such file", "not found", "ssh-add-missing")
@@ -1313,11 +1343,17 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
             except SystemExit:
                 chk(False, "host tools preflight", "see message above")
         if sandbox_exists(prof):
-            probe = ("env | grep -iE '(key|token|secret|passw)' | grep -v HOSTTOOLS_TOKEN | sed 's/=.*/=<set>/'; "
+            probe = (TOKEN_PROBE + "; "
                      "command -v hosttool >/dev/null && hosttool ping || echo hosttool=absent")
             r = sbx(cfg, "exec", prof.sandbox, "sh", "-c", probe, check=False, capture=True)
             out = r.stdout or ""
-            print("  inside sandbox:\n    " + "\n    ".join(out.strip().splitlines()))
+            lines = [ln for ln in out.strip().splitlines() if not ln.startswith("TOKENVAR ")]
+            print("  inside sandbox:\n    " + "\n    ".join(lines))
+            for tname, cls, length in parse_token_vars(out):
+                if cls == "real":
+                    print(f"  warn {tname}: looks like a real credential ({length} chars)\n         -> {TOKEN_HINT}")
+                else:
+                    print(f"  info {tname}: placeholder/unknown ({length} chars)")
             if not cfg.settings["forward_ssh_agent"]:
                 # sbx always creates /run/ssh-agent.sock and sets SSH_AUTH_SOCK, so ask the
                 # socket itself. Only the classification is printed, never ssh-add's output.
