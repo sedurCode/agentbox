@@ -42,8 +42,12 @@ sbx login                      # Docker account; required by sbx
 unzip agentbox.zip && cd agentbox && ./install.sh
 ```
 
-`install.sh` puts the CLI in `~/.local/share/agentbox`, links `~/.local/bin/agentbox`,
-and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything.
+`install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
+small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything.
+
+The launcher looks for Python at run time (`python3.14`, `3.13`, `3.12`, `3.11`, then `python3`;
+the first that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the
+install. With none it prints "agentbox needs Python 3.11+ (brew install python)" and exits 1.
 
 ### One-time sbx settings
 

@@ -22,6 +22,11 @@ State:  ~/.local/state/agentbox/<sandbox>/
 """
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):          # before anything that needs 3.11 (tomllib)
+    sys.exit("agentbox needs Python 3.11+ (brew install python)")
+
 import argparse
 import fnmatch
 import hashlib
@@ -36,14 +41,11 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
-if sys.version_info < (3, 11):
-    sys.exit("agentbox needs Python 3.11+ (e.g. `brew install python`)")
-import tomllib  # noqa: E402
+import tomllib
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))

@@ -15,18 +15,21 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 - $2" >&2; exit 
 
 need sbx "brew trust docker/tap && brew install docker/tap/sbx"
 PY=""
-for c in python3.13 python3.12 python3.11 python3; do
+for c in python3.14 python3.13 python3.12 python3.11 python3; do
   if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3,11))'; then
     PY="$(command -v "$c")"; break
   fi
 done
 [ -n "$PY" ] || { echo "need Python 3.11+ (brew install python)" >&2; exit 1; }
+echo "found $PY"
 
 mkdir -p "$DEST/bin" "$DEST/share" "$BIN" "$CFG/kits" "$CFG/gdb"
 cp "$SRC/share/hosttool" "$DEST/share/hosttool"
-# pin the interpreter so `agentbox` works even if python3 on PATH is older
-{ echo "#!$PY"; tail -n +2 "$SRC/bin/agentbox"; } > "$DEST/bin/agentbox"
-chmod 0755 "$DEST/bin/agentbox" "$DEST/share/hosttool"
+# the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
+# removing the interpreter found above doesn't break agentbox
+cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
+cp "$SRC/share/agentbox-launcher" "$DEST/bin/agentbox"
+chmod 0755 "$DEST/bin/agentbox" "$DEST/bin/agentbox.py" "$DEST/share/hosttool"
 ln -sf "$DEST/bin/agentbox" "$BIN/agentbox"
 
 for k in "$SRC"/kits/*/; do

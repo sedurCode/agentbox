@@ -1,0 +1,21 @@
+#!/bin/sh
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
+# agentbox launcher: finds a Python 3.11+ at run time, so removing or upgrading one
+# interpreter doesn't break the install. Installed as $DEST/bin/agentbox next to agentbox.py.
+self=$0
+while [ -h "$self" ]; do                # follow the ~/.local/bin symlink
+  dir=$(cd "$(dirname "$self")" && pwd)
+  target=$(readlink "$self")
+  case $target in /*) self=$target ;; *) self=$dir/$target ;; esac
+done
+here=$(cd "$(dirname "$self")" && pwd)
+for py in python3.14 python3.13 python3.12 python3.11 python3; do
+  if command -v "$py" >/dev/null 2>&1 &&
+     "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    exec "$py" "$here/agentbox.py" "$@"
+  fi
+done
+echo "agentbox needs Python 3.11+ (brew install python)" >&2
+exit 1
