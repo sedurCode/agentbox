@@ -43,6 +43,8 @@ extra_workspaces = [
   "~/src/stm32-common:ro",           # read-only reference code
 ]
 kits = ["embedded-arm"]              # toolchain inside the sandbox
+# kits = ["embedded-arm", "claude-team"]   # + opusplan main loop and reader/worker/architect subagents (Claude profiles only)
+# kits = ["embedded-arm", "python-node"]   # + Python 3 / venv / pip, Node, git
 allow = [
   "github.com", "codeload.github.com", "objects.githubusercontent.com",  # fetch deps (no creds)
 ]

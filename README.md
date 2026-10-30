@@ -84,6 +84,15 @@ the important keys:
 | `host_tools`, `host_tools_port` | which `[tools.*]` this sandbox may call, and a unique port per profile |
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
 
+Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing ones are kept):
+
+| kit | what it does |
+|---|---|
+| `embedded-arm` | arm-none-eabi GCC/newlib, CMake, Ninja, gdb-multiarch, cppcheck, clang-format |
+| `junie` | JetBrains Junie CLI as an agent (`agent = "junie"`) |
+| `claude-team` | Claude model routing, **Claude profiles only**: `ANTHROPIC_MODEL=opusplan` (Opus when planning, Sonnet when executing) plus user-level subagents `reader` (Haiku, read-only lookup), `worker` (Sonnet, scoped edits and tests) and `architect` (Opus, read-only design/review), and delegation instructions. Use as `kits = [..., "claude-team"]` |
+| `python-node` | Python 3 with venv/pip, Node and git, plus the Ubuntu/Debian package hosts needed to install them |
+
 **Keep the config and kits out of every workspace.** A kit in the repo is agent-writable,
 so an agent could widen its own allow-list or add host tools for next time. The bridge
 refuses to start if the config or kits dir sits inside a mounted workspace.
