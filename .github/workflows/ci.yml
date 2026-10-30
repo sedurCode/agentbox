@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4   # TODO: pin to SHA
+      - uses: actions/setup-python@v5   # TODO: pin to SHA
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile bin/agentbox share/hosttool
+          bash -n install.sh
+          sh -n share/agentbox-launcher

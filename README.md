@@ -331,6 +331,17 @@ until you `git fetch sandbox-ab-<profile>` and merge. Safest for untrusted repos
 - **Changed the profile but nothing happened** → `agentbox fresh <profile>`.
 - **Verbose** → `verbose = true` in `[settings]` prints every `sbx` command.
 
+## Development
+
+Tests use only the standard library and never call the real `sbx` (any attempt fails the test):
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher
+```
+
+CI (`.github/workflows/ci.yml`) runs the same on Ubuntu and macOS with Python 3.11 and 3.14.
+
 ## Licence
 
 agentbox is dual licensed under the GNU AGPLv3 or a commercial licence. See [LICENSING.md](LICENSING.md) for an explanation and [LICENSE](LICENSE) for the AGPLv3 text.
