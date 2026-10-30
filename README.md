@@ -112,7 +112,7 @@ agentbox shell h750        # bash inside the VM
 agentbox tools h750        # what the agent can run on the host
 agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation
 agentbox stop h750         # pause sandbox + bridge
-agentbox down h750         # audit, delete sandbox, scoped secrets, local state
+agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force kills a running job)
 agentbox fresh h750        # down + up — use after editing the profile (kits apply at creation)
 agentbox status
 ```
@@ -122,6 +122,62 @@ For throw-away work: `agentbox fresh <profile>` every time.
 
 Inside the sandbox agents run in their "skip permissions" mode — the VM is the boundary.
 Use `Shift+Tab` / `/permissions` in Claude Code if you want prompts back.
+
+### Headless jobs
+
+For scripted or long unattended runs (VoiceDev's gateway, CI-like use) `agentbox up -- -p "..."` is
+fragile: it needs an attached terminal, so the `sbx run` client dies on daemon timeouts and the
+output is lost. `agentbox run` starts the agent *inside* the VM, detached from any session, and
+keeps its state in files you can poll. Supported agent: `claude` (profiles with `agent = "claude"`).
+
+```bash
+agentbox run h750 --prompt-file task.md --detach     # prints the job id, returns at once
+agentbox wait h750 --timeout 3600                    # block; exit status = the job's exit status
+agentbox logs h750 -f                                # follow, one human line per event
+agentbox logs h750 --raw                             # the raw stream-json lines
+agentbox resume h750                                 # interactive `claude --resume <session id>`
+agentbox run h750 --prompt-file task.md              # without --detach: run, then follow logs, then exit with the job's status
+agentbox run h750 --prompt-file - --agent-args --model opus < task.md
+```
+
+- **Prompt handling.** The prompt is sent into the VM on the `sbx exec` *stdin* and stored in
+  `prompt.md` (mode `0600`); the agent reads it on stdin. agentbox never puts it on an `sbx` or VM
+  command line. `--prompt-file` (or `-` for stdin) is preferred over `--prompt TEXT`, because
+  `--prompt` text is part of *your own* `agentbox` command line on the Mac. `--agent-args ...`
+  takes the rest of the line; the profile's `agent_args` (meant for interactive `up`) are not used.
+- **What runs.** `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+  (the VM is the boundary, as for `up`), in the primary workspace, via `setsid nohup`, so the job
+  survives the exec session that started it.
+- **Job directory** (inside the VM, `~/.agentbox/jobs/<id>/`, id like `20260101T120000Z-ab12cd`):
+  `prompt.md`, `wrap.sh` (the wrapper), `pid`, `started_at`, `output.jsonl` (the stream),
+  `stderr.log`, `finished_at`, `exit_code` (written last, atomically, by the wrapper) and
+  `session_id` (taken from the stream's init message). The host keeps only
+  `~/.local/state/agentbox/ab-<profile>/job.json` (current job id, session id, and the result once seen).
+- **Job state** comes from those files only: `finished` if `exit_code` exists; `running` if the
+  `pid` file's process is alive **and** `/proc/<pid>/cmdline` runs this job's `wrap.sh` (so a
+  reused pid doesn't count); otherwise `lost`. Processes are never found with `pgrep -f`, which
+  matches its own command line. A **VM reboot, `stop`, or `down` loses a running job**: its state
+  becomes `lost` (the files may remain after a reboot; the process doesn't).
+- **Why `resume`, not `--continue`:** `claude --continue` doesn't find a `-p` session; `--resume <id>`
+  does, and agentbox records the id. `resume` refuses while the job is still running, and for agents
+  without a resume flag.
+- **Keep-alive.** While a job runs, `agentbox run` starts a host-side `agentbox keepalive <profile>`
+  process (pid in the state dir) that holds an `sbx exec` session open in the VM and re-opens it
+  if it drops; it ends when the job does, and `stop`/`down` stop it. This exists because a VM with
+  no attached session may be stopped by sbx.
+  **TODO:** confirm whether sbx has an idle/auto-stop setting or a keep-alive flag (nothing in this
+  repo or agentbox's own `sbx` calls documents one, and `sbx` couldn't be run while writing this).
+  If it does, use that and drop the keep-alive.
+- **Retries.** `run`, `wait` and `logs` retry transient `sbx` errors (`context deadline exceeded`,
+  connection reset/refused) with exponential backoff (1, 2, 4, 8 s; five attempts). A failed
+  `create` is not repeated blindly: agentbox first checks whether the sandbox now exists.
+- **`down` / `fresh`** refuse while a job is running; `--force` kills it (the wrapper's process
+  group, after checking the pid is really this job's wrapper) and removes the sandbox anyway.
+
+Exit codes for `wait` (and the final status of a foreground `run`): the **job's own exit code**
+(claude: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still
+running; `5` = job lost. Codes 1-3 keep their meaning from the table above for agentbox's own
+errors, so a job that exits with 2-5 is ambiguous: read `status --json` (`job.exit_code`) if you need to tell.
 
 ### VS Code inside the sandbox
 
@@ -167,19 +223,26 @@ in any of them (`doctor` reports token-like variables by name, class and length 
 | `0` | ok |
 | `1` | checks failed (`doctor`) or a command failed (`sbx` error, bridge, SSH, ...) |
 | `2` | usage or config error: bad arguments, no/invalid config, unknown or disabled profile, unsafe tool definition |
-| `3` | sandbox not found (`shell`, `stop`, and `audit` when nothing was ever created) |
+| `3` | sandbox not found (`shell`, `stop`, `resume`, and `audit` when nothing was ever created) |
+| `4` | `wait --timeout` expired, job still running |
+| `5` | `wait`: job lost (process gone: VM stopped or reset) |
 
 `up` and `shell` return the agent's / shell's own exit status once attached. On a `2` or `1` error
 the message is on stderr and stdout is empty, so check the exit code before parsing.
 
-`agentbox status --json` (sandbox existence is probed with `sbx inspect`; disabled profiles aren't):
+`agentbox status --json` (sandbox existence is probed with `sbx inspect`; disabled profiles aren't).
+`job.state` is `none`, `running`, `finished` or `lost` (see *Headless jobs*); `exit_code` is set only when
+finished. A profile with a recorded, unfinished job costs one `sbx exec` to check it:
 
 ```json
 {"profiles": [
   {"name": "h750", "valid": true, "enabled": true, "sandbox": "ab-h750", "agent": "claude",
    "mode": "direct", "sandbox_exists": true, "host_tools": ["flash-elf"], "host_tools_port": 47111,
-   "bridge": {"running": true, "pid": 4242}},
-  {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone"},
+   "bridge": {"running": true, "pid": 4242},
+   "job": {"id": "20260101T120000Z-ab12cd", "state": "finished", "exit_code": 0,
+           "session_id": "0b1c...", "started_at": "2026-01-01T12:00:01Z", "finished_at": "2026-01-01T12:07:45Z"}},
+  {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone",
+   "job": {"id": null, "state": "none", "exit_code": null, "session_id": null, "started_at": null, "finished_at": null}},
   {"name": "broken", "valid": false}
 ]}
 ```

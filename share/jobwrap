@@ -1,0 +1,21 @@
+#!/bin/sh
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
+# agentbox job wrapper, run INSIDE the sandbox, detached from the exec session:
+#   sh wrap.sh JOBDIR WORKDIR CMD [ARGS...]
+# The prompt is read from JOBDIR/prompt.md on stdin, never from an argument. Writes
+# pid, started_at, output.jsonl, stderr.log, finished_at and (last, atomically) exit_code.
+jd=$1; wd=$2; shift 2
+umask 077
+echo $$ > "$jd/pid"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$jd/started_at"
+if cd "$wd"; then
+  "$@" < "$jd/prompt.md" > "$jd/output.jsonl" 2> "$jd/stderr.log"
+  rc=$?
+else
+  echo "agentbox: cannot cd to $wd" > "$jd/stderr.log"
+  rc=126
+fi
+date -u +%Y-%m-%dT%H:%M:%SZ > "$jd/finished_at"
+echo "$rc" > "$jd/exit_code.tmp" && mv "$jd/exit_code.tmp" "$jd/exit_code"

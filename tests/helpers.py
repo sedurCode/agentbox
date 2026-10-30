@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+REAL_KILL, REAL_KILLPG = os.kill, os.killpg
 REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen   # for the few tests that run `sh` on purpose
 
 
@@ -66,6 +67,32 @@ class AgentboxTestCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         ab._WARNED_TOOLS.clear()
+        # A test once SIGTERMed PID 1 (the VM's init) and took the sandbox down. Only processes
+        # a test registered with allow_kill() can be signalled; anything else fails loudly.
+        self.killable = set()
+        for mod, name in ((os, "kill"), (os, "killpg")):
+            p = mock.patch.object(mod, name, self._guarded(name))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _guarded(self, name):
+        real = REAL_KILL if name == "kill" else REAL_KILLPG
+
+        def guard(pid, sig):
+            if not isinstance(pid, int) or pid <= 1 or pid not in self.killable:
+                raise AssertionError(f"test tried os.{name}({pid!r}, {sig!r}) on a process it did not start")
+            return real(pid, sig)
+        return guard
+
+    def allow_kill(self, pid: int):
+        self.killable.add(pid)
+
+    def spawn_sleep(self, seconds: int = 30):
+        """A harmless process we own, for tests that need a live pid that is NOT a job wrapper."""
+        proc = REAL_POPEN(["sleep", str(seconds)])
+        self.allow_kill(proc.pid)
+        self.addCleanup(lambda: (proc.poll() is None and proc.terminate(), proc.wait()))
+        return proc
 
     def write_config(self, body: str) -> "ab.Config":
         header = f'[settings]\nsbx = "sbx-must-not-run"\nstate_dir = "{self.state_dir}"\n'
@@ -110,8 +137,62 @@ class FakeSbx:
         raise AssertionError(f"unexpected sbx call: {args!r}")
 
     def install(self, case):
-        for name, fn in (("sbx", self), ("sandbox_exists", lambda prof: self.exists)):
+        for name, fn in (("sbx", self), ("sandbox_exists", lambda prof, retry=False: self.exists)):
             p = mock.patch.object(ab, name, fn)
             p.start()
             case.addCleanup(p.stop)
         return self
+
+
+FAKE_CLAUDE = """#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"sess-12345678","model":"m"}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello there"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}'
+sleep ${FAKE_CLAUDE_SLEEP:-0}
+echo '{"type":"result","subtype":"success","result":"all done"}'
+exit ${FAKE_CLAUDE_EXIT:-0}
+"""
+
+
+class LocalVM:
+    """Stands in for sbx by running `exec ... sh -c SCRIPT` on THIS machine with HOME pointed at a
+    temp dir and a fake `claude` on PATH, so the job scripts really run. Nothing else is allowed."""
+
+    def __init__(self, case, exists=True):
+        self.case, self.exists, self.calls, self.stdins = case, exists, [], []
+        self.home = case.tmp / "vmhome"
+        self.home.mkdir()
+        bindir = case.tmp / "vmbin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(FAKE_CLAUDE)
+        (bindir / "claude").chmod(0o755)
+        self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bindir}:{os.environ['PATH']}"}
+        for name, fn in (("sbx", self), ("sandbox_exists", lambda prof, retry=False: self.exists)):
+            p = mock.patch.object(ab, name, fn)
+            p.start()
+            case.addCleanup(p.stop)
+        case.addCleanup(self.kill_jobs)
+
+    def jobdir(self, job_id):
+        return self.home / ".agentbox" / "jobs" / job_id
+
+    def kill_jobs(self):
+        """Cleanup: stop leftover fake agents through the same validated killer `down --force` uses."""
+        for jobdir in self.home.glob(".agentbox/jobs/*"):
+            if ab.JOB_ID_RE.match(jobdir.name):
+                with mock.patch.object(subprocess, "Popen", REAL_POPEN):
+                    REAL_RUN(["sh", "-c", ab.kill_script(jobdir.name)], env=self.env, capture_output=True)
+
+    def __call__(self, cfg, *args, check=True, capture=False, stdin=None):
+        self.calls.append(args)
+        self.stdins.append(stdin)
+        done = lambda rc=0, out="", err="": subprocess.CompletedProcess(args, rc, out, err)
+        if args[0] == "inspect":
+            return done(0 if self.exists else 1)
+        if args[0] == "rm":
+            return done()
+        if args[0] == "exec" and args[-3:-1] == ("sh", "-c"):
+            with mock.patch.object(subprocess, "Popen", REAL_POPEN):
+                r = REAL_RUN(["sh", "-c", args[-1]], env=self.env, input=stdin, capture_output=True, text=True)
+            return done(r.returncode, r.stdout, r.stderr)
+        raise AssertionError(f"unexpected sbx call: {args!r}")

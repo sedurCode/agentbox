@@ -16,8 +16,13 @@ Docker Sandboxes (`sbx`).
     agentbox status              sandboxes and bridges (--json)
     agentbox doctor [<profile>]  sanity / security checks (--json)
     agentbox bridge <profile>    run the host-tool bridge in the foreground
+    agentbox run <profile> (--prompt-file F | --prompt T) [--detach]   headless agent job
+    agentbox wait <profile> [--job ID] [--timeout S]   block; exit with the job's exit code
+    agentbox logs <profile> [--job ID] [-f] [--raw]    job output
+    agentbox resume <profile> [--job ID]               attach interactively to the job's session
 
-Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found.
+Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
+`wait` also 4 = timeout, 5 = job lost (otherwise it exits with the job's own exit code).
 
 Config: ~/.config/agentbox/agentbox.toml   (kept OUTSIDE every workspace)
 State:  ~/.local/state/agentbox/<sandbox>/
@@ -121,6 +126,7 @@ MERGED_LISTS = ("allow", "deny", "kits")   # defaults + profile are unioned
 # ----------------------------------------------------------------- helpers
 # Exit codes (documented in the README): scripts can rely on these.
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NO_SANDBOX = 0, 1, 2, 3
+EXIT_TIMEOUT, EXIT_LOST = 4, 5          # `wait`: --timeout expired / the job's process is gone
 
 
 def die(msg: str, code: int = EXIT_FAIL):
@@ -292,7 +298,38 @@ def sbx(cfg: Config, *args, check=True, capture=False, stdin=None):
             + (f"\n{e.stderr}" if e.stderr else ""))
 
 
-def sandbox_exists(prof: Profile) -> bool:
+TRANSIENT_MARKERS = ("context deadline exceeded", "connection reset", "connection refused")
+
+
+def is_transient(r) -> bool:
+    """True if a finished sbx call failed in a way worth retrying (daemon hiccup, not a real answer)."""
+    text = ((r.stderr or "") + (r.stdout or "")).lower()
+    return r.returncode != 0 and any(m in text for m in TRANSIENT_MARKERS)
+
+
+def backoff_delay(attempt: int, base: float = 1.0, cap: float = 15.0) -> float:
+    return min(cap, base * 2 ** attempt)
+
+
+def retry_transient(call, attempts: int = 5):
+    """Run call() -> CompletedProcess, retrying transient failures with bounded exponential backoff.
+    Permanent failures and success return immediately; the last result is returned as is."""
+    for i in range(attempts):
+        r = call()
+        if r.returncode == 0 or not is_transient(r) or i == attempts - 1:
+            return r
+        delay = backoff_delay(i)
+        info(f"sbx daemon error (transient); retrying in {delay:g}s ({i + 1}/{attempts - 1})")
+        time.sleep(delay)
+
+
+def sbx_retry(cfg: Config, *args, stdin=None, attempts: int = 5):
+    return retry_transient(lambda: sbx(cfg, *args, check=False, capture=True, stdin=stdin), attempts)
+
+
+def sandbox_exists(prof: Profile, retry: bool = False) -> bool:
+    if retry:       # a daemon hiccup must not read as "no such sandbox"
+        return sbx_retry(prof.cfg, "inspect", prof.sandbox).returncode == 0
     r = sbx(prof.cfg, "inspect", prof.sandbox, check=False, capture=True)
     return r.returncode == 0
 
@@ -1034,15 +1071,22 @@ class Bridge:
 
 
 def bridge_pid(prof: Profile) -> int | None:
-    pf = prof.state / "bridge.pid"
+    return _pid_of(prof.state / "bridge.pid", "bridge", prof.name)
+
+
+def _pid_of(pf: Path, word: str, profile: str) -> int | None:
+    """pid from a state-dir pid file, only if it is still OUR `agentbox <word> <profile>` process.
+    A stale file (pid reused by something else, pid 0/1/negative, ourselves) is removed and
+    nothing is returned, so callers can never signal an unrelated process."""
     if not pf.exists():
         return None
     try:
         pid = int(pf.read_text().strip())
-        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                             capture_output=True, text=True).stdout
-        if "agentbox" in cmd and "bridge" in cmd:
-            return pid
+        if pid > 1 and pid not in (os.getpid(), os.getppid()):
+            cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True).stdout.split()
+            if any("agentbox" in t for t in cmd) and word in cmd and profile in cmd:
+                return pid
     except (ValueError, OSError):
         pass
     pf.unlink(missing_ok=True)
@@ -1117,8 +1161,26 @@ def remove_secrets(prof: Profile):
             sbx(prof.cfg, "secret", "rm", s["service"], "--sandbox", prof.sandbox, check=False, capture=True)
 
 
-def ensure_sandbox(prof: Profile):
-    """Create the sandbox if needed (without attaching) and start the bridge."""
+def create_sandbox_retrying(prof: Profile, create: list, attempts: int = 5):
+    """`sbx create` with backoff on transient errors. After a failed attempt the sandbox may
+    already exist (the call timed out, not the creation), so re-check before creating again."""
+    for i in range(attempts):
+        r = sbx(prof.cfg, *create, check=False, capture=True)
+        if r.returncode == 0:
+            return
+        if not is_transient(r) or i == attempts - 1:
+            die(f"`sbx create` failed (exit {r.returncode})" + (f"\n{r.stderr}" if r.stderr else ""))
+        delay = backoff_delay(i)
+        info(f"sbx create failed transiently; checking before retrying in {delay:g}s")
+        time.sleep(delay)
+        if sandbox_exists(prof, retry=True):
+            info(f"{prof.sandbox} exists after the error; continuing")
+            return
+
+
+def ensure_sandbox(prof: Profile, retry: bool = False):
+    """Create the sandbox if needed (without attaching) and start the bridge.
+    retry=True (headless jobs) retries transient daemon errors."""
     cfg = prof.cfg
     for r in prof.roots:
         if not r.exists():
@@ -1129,7 +1191,7 @@ def ensure_sandbox(prof: Profile):
     kit_dir, digest = render_local_kit(prof, token)
     digest_file = prof.state / "kit.digest"
 
-    if sandbox_exists(prof):
+    if sandbox_exists(prof, retry=retry):
         if digest_file.exists() and digest_file.read_text() != digest:
             info("profile/config changed since this sandbox was created; kits apply at creation only."
                  f" Run `agentbox fresh {prof.name}` to rebuild.")
@@ -1150,7 +1212,10 @@ def ensure_sandbox(prof: Profile):
         write_snapshot(prof)
         start_bridge(prof)
         info(f"creating sandbox {prof.sandbox}")
-        sbx(cfg, *create)
+        if retry:
+            create_sandbox_retrying(prof, create)
+        else:
+            sbx(cfg, *create)
         digest_file.write_text(digest)
         set_secrets(prof)
         for p in prof.d["publish"]:
@@ -1232,10 +1297,18 @@ def cmd_code(prof: Profile, args) -> int:
 
 
 def cmd_down(prof: Profile, args) -> int:
+    job = job_info(prof)
+    if job["state"] == "running":
+        if not getattr(args, "force", False):
+            die(f"job {job['id']} is still running in {prof.sandbox}; removing the sandbox would kill it."
+                f" Wait for it (`agentbox wait {prof.name}`) or pass --force")
+        info(f"--force: killing running job {job['id']}")
+        vm_exec(prof, kill_script(job["id"]))
     if (prof.state / "snapshot.json").exists():
         cmd_audit(prof)
         print()
     stop_bridge(prof)
+    stop_keepalive(prof)
     if sandbox_exists(prof):
         sbx(prof.cfg, "rm", prof.sandbox, check=False)
     remove_secrets(prof)
@@ -1243,6 +1316,389 @@ def cmd_down(prof: Profile, args) -> int:
         shutil.rmtree(prof.state)
     info(f"{prof.sandbox} removed")
     return 0
+
+
+# ------------------------------------------------------------ headless jobs
+# A job is one headless agent run started by `agentbox run`. It lives INSIDE the VM in
+# ~/.agentbox/jobs/<id>/ (prompt.md, wrap.sh, pid, output.jsonl, stderr.log, started_at,
+# finished_at, exit_code, session_id); the host keeps only prof.state/job.json. State is
+# derived from those files plus /proc/<pid>/cmdline - never from `pgrep -f`, which matches
+# its own command line. The prompt travels on stdin only, never on an argv.
+JOB_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+JOB_DIR = '"$HOME/.agentbox/jobs/{id}"'
+HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resumes a session
+    "claude": {"cmd": ["claude", "-p", "--output-format", "stream-json", "--verbose",
+                       "--dangerously-skip-permissions"], "resume": "--resume"},
+}
+NO_JOB = {"id": None, "state": "none", "exit_code": None, "session_id": None,
+          "started_at": None, "finished_at": None}
+
+
+def new_job_id() -> str:
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + pysecrets.token_hex(3)
+
+
+def check_job_id(job_id: str) -> str:
+    if not JOB_ID_RE.match(job_id):
+        die(f"bad job id '{job_id}'", EXIT_USAGE)
+    return job_id
+
+
+def probe_script(job_id: str) -> str:
+    """sh run in the VM: print the job's state files and the live process's cmdline. Also
+    caches the session id (from the stream's first session_id) into the job dir."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    return (
+        f'd={d}; echo "D $d"; [ -d "$d" ] || {{ echo MISSING; exit 0; }}; '
+        'if [ ! -s "$d/session_id" ]; then grep -m1 -o \'"session_id":"[^"]*"\' "$d/output.jsonl" 2>/dev/null '
+        '| head -n1 | sed \'s/.*"session_id":"\\([^"]*\\)".*/\\1/\' > "$d/session_id.tmp"; '
+        '[ -s "$d/session_id.tmp" ] && mv "$d/session_id.tmp" "$d/session_id" || rm -f "$d/session_id.tmp"; fi; '
+        'for f in pid exit_code started_at finished_at session_id; do '
+        '[ -f "$d/$f" ] && echo "F $f $(head -c 80 "$d/$f" | tr -d \'\\n\')"; done; '
+        'p=$(cat "$d/pid" 2>/dev/null); case $p in *[!0-9]*|"") p=;; esac; '
+        '[ -n "$p" ] && [ -r "/proc/$p/cmdline" ] && echo "CMD $(tr \'\\0\' \' \' < "/proc/$p/cmdline")"; true')
+
+
+def hold_script(job_id: str) -> str:
+    """sh run in the VM by the keep-alive: an open exec session that ends when the job does."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    return (f'd={d}; w="$d/wrap.sh"; while [ ! -e "$d/exit_code" ]; do p=$(cat "$d/pid" 2>/dev/null) || break; '
+            'case $p in *[!0-9]*|"") break;; esac; grep -qa -- "$w" "/proc/$p/cmdline" 2>/dev/null || break; '
+            'sleep 5; done')
+
+
+def kill_script(job_id: str) -> str:
+    """sh run in the VM: signal the job's wrapper (and its process group) - the ONLY place a job
+    pid read from a file is signalled. The pid file is agent-writable, so never trust it: it must
+    be digits, > 1 (PID 1 is the VM's init: TERM to it takes the whole sandbox down), not this
+    shell or its parent, and /proc/<pid>/cmdline must contain THIS job's wrap.sh path."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    return (f'd={d}; w="$d/wrap.sh"; p=$(cat "$d/pid" 2>/dev/null); '
+            'case $p in ""|*[!0-9]*) exit 0;; esac; '
+            '[ "$p" -gt 1 ] 2>/dev/null || exit 0; '
+            '[ "$p" -ne "$$" ] && [ "$p" -ne "$PPID" ] || exit 0; '
+            'grep -qa -- "$w" "/proc/$p/cmdline" 2>/dev/null || exit 0; '
+            'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; true')
+
+
+def parse_probe(out: str) -> dict:
+    res = {"dir": None, "missing": False, "files": {}, "cmdline": None}
+    for line in out.splitlines():
+        if line.startswith("D "):
+            res["dir"] = line[2:].strip()
+        elif line.strip() == "MISSING":
+            res["missing"] = True
+        elif line.startswith("F "):
+            parts = line.split(" ", 2) + [""]
+            res["files"][parts[1]] = parts[2].strip()
+        elif line.startswith("CMD "):
+            res["cmdline"] = line[4:]
+    return res
+
+
+def classify_job(probe: dict) -> str:
+    """finished if exit_code exists; running if the pid file's process is alive AND its cmdline
+    runs this job's wrapper (a reused pid runs something else); lost otherwise (VM rebooted...)."""
+    if probe["missing"]:
+        return "lost"
+    if "exit_code" in probe["files"]:
+        return "finished"
+    pid = probe["files"].get("pid", "")
+    wrapper = f"{probe['dir']}/wrap.sh"
+    if pid.isdigit() and probe["cmdline"] is not None and wrapper in probe["cmdline"].split():
+        return "running"
+    return "lost"
+
+
+def job_record(prof: Profile) -> dict:
+    try:
+        return json.loads((prof.state / "job.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_job_record(prof: Profile, rec: dict):
+    prof.state.mkdir(parents=True, exist_ok=True)
+    (prof.state / "job.json").write_text(json.dumps(rec, indent=1))
+
+
+def job_summary(job_id: str, state: str, files: dict) -> dict:
+    code = files.get("exit_code")
+    sid = files.get("session_id")
+    return {"id": job_id, "state": state,
+            "exit_code": (int(code) if code and code.lstrip("-").isdigit() else 1) if state == "finished" else None,
+            "session_id": sid if sid and SESSION_ID_RE.match(sid) else None,
+            "started_at": files.get("started_at") or None, "finished_at": files.get("finished_at") or None}
+
+
+def job_info(prof: Profile, job_id: str | None = None) -> dict:
+    """Current state of a job (default: the profile's recorded one). Makes no sbx call when the
+    profile has never run a job or the recorded job is already known to be finished."""
+    rec = job_record(prof)
+    job_id = job_id or rec.get("id")
+    if not job_id:
+        return dict(NO_JOB)
+    if rec.get("id") == job_id and rec.get("exit_code") is not None:
+        return {k: rec.get(k) for k in NO_JOB} | {"id": job_id, "state": "finished"}
+    r = sbx_retry(prof.cfg, "exec", prof.sandbox, "sh", "-c", probe_script(job_id))
+    if r.returncode != 0:
+        # VM stopped or gone: the process is gone with it. `probe_failed` lets `wait` double-check.
+        sid = rec.get("session_id") if rec.get("id") == job_id else None
+        return job_summary(job_id, "lost", {"session_id": sid}) | {"probe_failed": True}
+    probe = parse_probe(r.stdout or "")
+    state = classify_job(probe)
+    out = job_summary(job_id, state, probe["files"])
+    if rec.get("id") == job_id and state != "running":
+        save_job_record(prof, {**rec, **{k: out[k] for k in NO_JOB if k != "id"}, "id": job_id})
+    elif rec.get("id") == job_id and out["session_id"] and rec.get("session_id") != out["session_id"]:
+        save_job_record(prof, {**rec, "session_id": out["session_id"]})
+    return out
+
+
+def public_job(info_: dict) -> dict:
+    return {k: info_.get(k) for k in NO_JOB}
+
+
+def session_id_from_stream(text: str) -> str | None:
+    """First session id in a claude stream-json transcript (its system/init message)."""
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        sid = obj.get("session_id") if isinstance(obj, dict) else None
+        if isinstance(sid, str) and SESSION_ID_RE.match(sid):
+            return sid
+    return None
+
+
+def _squash(text, width: int = 200) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def render_stream_line(line: str) -> str | None:
+    """One human line for a stream-json event (assistant text, tool calls, init, result)."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return f"? {_squash(line)}" if line.strip() else None
+    if not isinstance(ev, dict):
+        return None
+    kind = ev.get("type")
+    if kind == "system" and ev.get("subtype") == "init":
+        return f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}"
+    if kind == "assistant":
+        parts = []
+        content = (ev.get("message") or {}).get("content")
+        for block in content if isinstance(content, list) else []:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                parts.append(f"assistant: {_squash(block['text'])}")
+            elif block.get("type") == "tool_use":
+                parts.append(f"tool: {block.get('name', '?')} {_squash(json.dumps(block.get('input', {})), 120)}")
+        return "\n".join(parts) or None
+    if kind == "result":
+        return f"[result] {ev.get('subtype', '?')}: {_squash(ev.get('result', ''))}".rstrip(": ")
+    return None
+
+
+def vm_exec(prof: Profile, script: str, stdin: str | None = None):
+    args = ["exec"] + (["-i"] if stdin is not None else []) + [prof.sandbox, "sh", "-c", script]
+    return sbx_retry(prof.cfg, *args, stdin=stdin)
+
+
+def vm_write(prof: Profile, job_id: str, name: str, data: str):
+    """Write a file into the job dir through the exec's stdin (0600; data never on an argv)."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    r = vm_exec(prof, f'umask 077; d={d}; mkdir -p "$d" && cat > "$d/{name}"', stdin=data)
+    if r.returncode != 0:
+        die(f"could not write {name} into the sandbox (exit {r.returncode})\n{r.stderr or ''}".rstrip())
+
+
+def keepalive_pid(prof: Profile) -> int | None:
+    return _pid_of(prof.state / "keepalive.pid", "keepalive", prof.name)
+
+
+def start_keepalive(prof: Profile):
+    """Host-side: hold an `sbx exec` session open while the job runs, in case sbx stops
+    sandboxes that have no attached session (UNCONFIRMED - see README)."""
+    if keepalive_pid(prof):
+        return
+    log = open(prof.state / "keepalive.out", "a")
+    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "keepalive", prof.name],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
+                         env={k: v for k, v in os.environ.items()
+                              if k in ("PATH", "HOME", "LANG", "USER", "AGENTBOX_CONFIG_DIR")})
+    (prof.state / "keepalive.pid").write_text(str(p.pid))
+
+
+def stop_keepalive(prof: Profile):
+    pid = keepalive_pid(prof)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+    (prof.state / "keepalive.pid").unlink(missing_ok=True)
+
+
+def cmd_keepalive(prof: Profile) -> int:
+    """Internal (started by `run`): keep one exec session open until the job is no longer running."""
+    job_id = job_record(prof).get("id")
+    if not job_id:
+        return EXIT_OK
+    held: list = []
+
+    def on_term(*_):
+        if held:
+            held[0].terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    cmd = [prof.cfg.settings["sbx"], "exec", prof.sandbox, "sh", "-c", hold_script(job_id)]
+    drops = unknown = 0
+    while True:
+        held[:] = [subprocess.Popen(cmd, env=sbx_env(prof.cfg), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)]
+        held[0].wait()
+        j = job_info(prof, job_id)
+        if j["state"] == "running":
+            unknown = 0
+        elif not j.get("probe_failed"):
+            return EXIT_OK                  # finished, or lost for certain
+        else:
+            unknown += 1                    # daemon unreachable: keep trying for a while
+            if unknown >= 10:
+                return EXIT_OK
+        time.sleep(backoff_delay(drops, 1.0, 30.0))      # the session dropped but the job lives: re-hold
+        drops = min(drops + 1, 10)
+
+
+def job_exit_status(j: dict) -> int:
+    if j["state"] == "finished":
+        return j["exit_code"] if j["exit_code"] is not None else EXIT_FAIL
+    return EXIT_LOST
+
+
+def poll_delays(first: float = 2.0, cap: float = 30.0):
+    d = first
+    while True:
+        yield d
+        d = min(cap, d * 1.5)
+
+
+def resolve_job(prof: Profile, arg: str | None) -> str:
+    job_id = arg or job_record(prof).get("id")
+    if not job_id:
+        die(f"no job recorded for profile '{prof.name}' - start one with `agentbox run {prof.name} ...`", EXIT_USAGE)
+    return check_job_id(job_id)
+
+
+def cmd_wait(prof: Profile, args) -> int:
+    job_id = resolve_job(prof, args.job)
+    deadline = time.monotonic() + args.timeout if args.timeout else None
+    delays, doubts = poll_delays(), 0
+    while True:
+        j = job_info(prof, job_id)
+        if j["state"] == "finished":
+            info(f"job {job_id} finished (exit {j['exit_code']})")
+            return job_exit_status(j)
+        if j["state"] == "lost":
+            doubts += 1                     # one flaky probe isn't "lost"
+            if not j.get("probe_failed") or doubts >= 3:
+                info(f"job {job_id} lost (its process is gone; VM stopped or reset?)")
+                return EXIT_LOST
+        else:
+            doubts = 0
+        if deadline is not None and time.monotonic() >= deadline:
+            info(f"job {job_id} still running after {args.timeout:g}s")
+            return EXIT_TIMEOUT
+        time.sleep(min(next(delays), max(0.0, deadline - time.monotonic()) if deadline else 1e9))
+
+
+def fetch_new_lines(prof: Profile, job_id: str, have: int) -> list[str]:
+    """Complete lines of output.jsonl after the first `have` ones."""
+    d = JOB_DIR.format(id=job_id)
+    r = vm_exec(prof, f'tail -n +{have + 1} {d}/output.jsonl 2>/dev/null')
+    if r.returncode != 0:
+        die(f"could not read the job output (exit {r.returncode}) - is {prof.sandbox} running?")
+    text = r.stdout or ""
+    return text.split("\n")[:-1]          # a trailing partial line is picked up next time
+
+
+def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
+    job_id = resolve_job(prof, args.job)
+    follow = args.follow if follow is None else follow
+    have, delays = 0, poll_delays(1.0, 10.0)
+    while True:
+        j = job_info(prof, job_id) if follow else None
+        lines = fetch_new_lines(prof, job_id, have)
+        have += len(lines)
+        for ln in lines:
+            shown = ln if args.raw else render_stream_line(ln)
+            if shown:
+                print(shown, flush=True)
+        if not follow:
+            return EXIT_OK
+        if j["state"] != "running":         # state was sampled before the read, so the tail is in
+            return job_exit_status(j) if getattr(args, "wait_status", False) else EXIT_OK
+        time.sleep(next(delays))
+
+
+def cmd_run(prof: Profile, args) -> int:
+    agent = prof.d["agent"]
+    spec = HEADLESS_AGENTS.get(agent)
+    if not spec:
+        die(f"headless jobs support {', '.join(HEADLESS_AGENTS)} (profile agent is '{agent}')", EXIT_USAGE)
+    if args.prompt_file:
+        try:
+            prompt = sys.stdin.read() if args.prompt_file == "-" else Path(args.prompt_file).read_text()
+        except OSError as e:
+            die(f"cannot read prompt file: {e.strerror}", EXIT_USAGE)
+    else:
+        prompt = args.prompt or ""
+    if not prompt.strip():
+        die("empty prompt", EXIT_USAGE)
+    if len(prompt) > 1_000_000:
+        die("prompt is over 1 MB", EXIT_USAGE)
+    current = job_record(prof).get("id")
+    if current and job_info(prof, current)["state"] == "running":
+        die(f"job {current} is still running in {prof.sandbox}; `agentbox wait {prof.name}` for it first")
+    ensure_sandbox(prof, retry=True)
+    job_id = new_job_id()
+    vm_write(prof, job_id, "prompt.md", prompt)
+    vm_write(prof, job_id, "wrap.sh", (SHARE_DIR / "jobwrap").read_text())
+    cmd = [*spec["cmd"], *(args.agent_args or [])]
+    d = JOB_DIR.format(id=job_id)
+    r = vm_exec(prof, (f'd={d}; S=; command -v setsid >/dev/null 2>&1 && S=setsid; '
+                       f'$S nohup sh "$d/wrap.sh" "$d" {shlex.quote(str(prof.primary))} {shlex.join(cmd)} '
+                       '>/dev/null 2>&1 </dev/null & i=0; '
+                       'while [ ! -s "$d/pid" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; [ -s "$d/pid" ]'))
+    if r.returncode != 0:
+        die(f"the job did not start inside {prof.sandbox} (exit {r.returncode})\n{r.stderr or ''}".rstrip())
+    save_job_record(prof, {"id": job_id, "agent": agent, "session_id": None})
+    start_keepalive(prof)
+    info(f"job {job_id} started in {prof.sandbox}")
+    print(job_id)
+    if args.detach:
+        info(f"follow with `agentbox logs {prof.name} -f`, block with `agentbox wait {prof.name}`")
+        return EXIT_OK
+    args.job, args.follow, args.raw, args.wait_status = job_id, True, False, True
+    return cmd_logs(prof, args)
+
+
+def cmd_resume(prof: Profile, args) -> int:
+    spec = HEADLESS_AGENTS.get(prof.d["agent"])
+    if not spec:
+        die(f"resume is not supported for agent '{prof.d['agent']}' (only: {', '.join(HEADLESS_AGENTS)})", EXIT_USAGE)
+    job_id = resolve_job(prof, args.job)
+    if not sandbox_exists(prof, retry=True):
+        die(f"sandbox {prof.sandbox} not found", EXIT_NO_SANDBOX)
+    j = job_info(prof, job_id)
+    if j["state"] == "running":
+        die(f"job {job_id} is still running; `agentbox wait {prof.name}` first")
+    if not j["session_id"]:
+        die(f"no session id recorded for job {job_id} (did the agent start?)")
+    ensure_sandbox(prof)
+    return sbx(prof.cfg, "run", prof.sandbox, "--", spec["resume"], j["session_id"], check=False).returncode
 
 
 def emit_json(obj):
@@ -1253,9 +1709,10 @@ def emit_json(obj):
 def profile_status(prof: Profile) -> dict:
     if not prof.enabled:
         return {"name": prof.name, "valid": True, "enabled": False, "sandbox": prof.sandbox,
-                "agent": prof.d["agent"], "mode": prof.d["mode"]}
+                "agent": prof.d["agent"], "mode": prof.d["mode"], "job": dict(NO_JOB)}
     pid = bridge_pid(prof) if prof.state.exists() else None
     return {"name": prof.name, "valid": True, "enabled": True, "sandbox": prof.sandbox,
+            "job": public_job(job_info(prof)),
             "agent": prof.d["agent"], "mode": prof.d["mode"],
             "sandbox_exists": sandbox_exists(prof),
             "host_tools": prof.tool_names,
@@ -1285,7 +1742,9 @@ def cmd_status(cfg: Config, as_json: bool = False) -> int:
             continue
         pid = bridge_pid(prof) if prof.state.exists() else None
         tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
-        print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}")
+        job = job_info(prof)
+        jobs = f" job={job['id']} {job['state']}" if job["state"] != "none" else ""
+        print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}{jobs}")
     return EXIT_OK
 
 
@@ -1492,7 +1951,21 @@ def main():
         sub.add_parser(c).add_argument("profile")
     p = sub.add_parser("tools"); p.add_argument("profile"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("down"); p.add_argument("profile"); p.add_argument("--keep-state", action="store_true")
+    p.add_argument("--force", action="store_true", help="also kill a running headless job")
     p = sub.add_parser("fresh"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
+    p.add_argument("--force", action="store_true", help="also kill a running headless job")
+    p = sub.add_parser("run"); p.add_argument("profile")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt-file", metavar="F", help="file holding the prompt ('-' = stdin)")
+    g.add_argument("--prompt", metavar="TEXT", help="prompt text (visible in your host's process list; prefer --prompt-file)")
+    p.add_argument("--detach", action="store_true", help="start the job and return")
+    p.add_argument("--agent-args", nargs=argparse.REMAINDER, default=[], help="extra agent arguments (rest of the line)")
+    p = sub.add_parser("wait"); p.add_argument("profile"); p.add_argument("--job")
+    p.add_argument("--timeout", type=float, metavar="S")
+    p = sub.add_parser("logs"); p.add_argument("profile"); p.add_argument("--job")
+    p.add_argument("-f", "--follow", action="store_true"); p.add_argument("--raw", action="store_true")
+    p = sub.add_parser("resume"); p.add_argument("profile"); p.add_argument("--job")
+    sub.add_parser("keepalive", help=argparse.SUPPRESS).add_argument("profile")
     p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
@@ -1506,7 +1979,7 @@ def main():
     if a.cmd == "doctor":
         sys.exit(cmd_doctor(cfg, a.profile, a.json))
     prof = cfg.profile(a.profile)
-    if a.cmd in ("up", "code", "fresh") and not prof.enabled:
+    if a.cmd in ("up", "code", "fresh", "run", "resume") and not prof.enabled:
         die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`", EXIT_USAGE)
     if a.cmd == "up":
         sys.exit(cmd_up(prof, a))
@@ -1520,6 +1993,16 @@ def main():
         sys.exit(cmd_code(prof, a))
     if a.cmd == "audit":
         sys.exit(cmd_audit(prof))
+    if a.cmd == "run":
+        sys.exit(cmd_run(prof, a))
+    if a.cmd == "wait":
+        sys.exit(cmd_wait(prof, a))
+    if a.cmd == "logs":
+        sys.exit(cmd_logs(prof, a))
+    if a.cmd == "resume":
+        sys.exit(cmd_resume(prof, a))
+    if a.cmd == "keepalive":
+        sys.exit(cmd_keepalive(prof))
     if a.cmd == "shell":
         if not sandbox_exists(prof):
             die(f"sandbox {prof.sandbox} not found - run `agentbox up {prof.name}` first", EXIT_NO_SANDBOX)
@@ -1527,6 +2010,7 @@ def main():
         sys.exit(sbx(cfg, "exec", "-it", prof.sandbox, "bash", check=False).returncode)
     if a.cmd == "stop":
         stop_bridge(prof)
+        stop_keepalive(prof)
         if not sandbox_exists(prof):
             die(f"sandbox {prof.sandbox} not found", EXIT_NO_SANDBOX)
         sys.exit(sbx(cfg, "stop", prof.sandbox, check=False).returncode)
