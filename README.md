@@ -1,5 +1,10 @@
 # agentbox — constrained sandboxes for coding agents on top of Docker Sandboxes (`sbx`)
 
+agentbox runs coding agents in constrained Docker Sandboxes, with profiles, scoped credentials and a bridge to allow-listed host tools.
+
+- **Requirements:** macOS, Docker Sandboxes (`sbx`), and Python 3.11+ (standard library only).
+- **Status:** early. The `sbx` kit schema is experimental and may change.
+
 `sbx` already does the heavy lifting: each sandbox is a **microVM** with its own kernel,
 its own Docker engine, and all egress forced through a **host-side proxy** that enforces
 an allow-list and injects API credentials into HTTP headers so the raw keys never enter
@@ -304,3 +309,7 @@ until you `git fetch sandbox-ab-<profile>` and merge. Safest for untrusted repos
   (`render_local_kit`) if it needs adjusting.
 - **Changed the profile but nothing happened** → `agentbox fresh <profile>`.
 - **Verbose** → `verbose = true` in `[settings]` prints every `sbx` command.
+
+## Licence
+
+agentbox is dual licensed under the GNU AGPLv3 or a commercial licence. See [LICENSING.md](LICENSING.md) for an explanation and [LICENSE](LICENSE) for the AGPLv3 text.

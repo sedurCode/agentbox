@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
 """agentbox - profiles, scoped credentials and a host-tool bridge on top of
 Docker Sandboxes (`sbx`).
 

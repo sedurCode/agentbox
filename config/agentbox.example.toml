@@ -1,3 +1,6 @@
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
 # agentbox config  ->  ~/.config/agentbox/agentbox.toml
 #
 # Keep this file (and ~/.config/agentbox/kits) OUTSIDE every workspace you mount.

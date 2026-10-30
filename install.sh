@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
 # Install agentbox into ~/.local/share/agentbox, link ~/.local/bin/agentbox,
 # and seed ~/.config/agentbox (never overwrites an existing config).
 set -euo pipefail

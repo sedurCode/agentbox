@@ -1,3 +1,6 @@
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
 # Mixin: Arm bare-metal toolchain INSIDE the sandbox.
 # Prefer compiling in here - a compiler running on the host against
 # agent-written build files is host code execution in disguise.

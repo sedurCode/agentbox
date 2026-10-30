@@ -1,3 +1,6 @@
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
 # Sandbox kit: JetBrains Junie CLI (not a built-in sbx agent).
 # Use as `agent = "junie"` in agentbox.toml, or directly: sbx run ~/.config/agentbox/kits/junie
 schemaVersion: "2"
