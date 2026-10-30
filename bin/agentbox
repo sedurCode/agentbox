@@ -1245,6 +1245,25 @@ def cmd_status(cfg: Config) -> int:
     return 0
 
 
+# ssh-add output meaning "nothing answered": the socket sbx always creates has no agent behind it.
+SSH_ADD_NO_AGENT = ("could not open a connection", "communication with agent failed",
+                    "error connecting", "no such file", "not found", "ssh-add-missing")
+
+
+def classify_ssh_add(rc: int, out: str) -> str:
+    """Classify `ssh-add -l` run inside the sandbox: "none" (no agent answers, good),
+    "agent" (a live agent is reachable, bad) or "unknown". Output is never echoed:
+    it may hold key fingerprints."""
+    low = out.lower()
+    if rc == 0:
+        return "agent"                  # keys were listed
+    if "the agent has no identities" in low:
+        return "agent"                  # a live agent, just empty
+    if any(m in low for m in SSH_ADD_NO_AGENT):
+        return "none"
+    return "unknown"
+
+
 def cmd_doctor(cfg: Config, name: str | None) -> int:
     ok = True
 
@@ -1294,14 +1313,18 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
             except SystemExit:
                 chk(False, "host tools preflight", "see message above")
         if sandbox_exists(prof):
-            probe = ("echo SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset}; "
-                     "env | grep -iE '(key|token|secret|passw)' | grep -v HOSTTOOLS_TOKEN | sed 's/=.*/=<set>/'; "
+            probe = ("env | grep -iE '(key|token|secret|passw)' | grep -v HOSTTOOLS_TOKEN | sed 's/=.*/=<set>/'; "
                      "command -v hosttool >/dev/null && hosttool ping || echo hosttool=absent")
             r = sbx(cfg, "exec", prof.sandbox, "sh", "-c", probe, check=False, capture=True)
             out = r.stdout or ""
             print("  inside sandbox:\n    " + "\n    ".join(out.strip().splitlines()))
             if not cfg.settings["forward_ssh_agent"]:
-                chk("SSH_AUTH_SOCK=unset" in out, "no SSH agent forwarded",
+                # sbx always creates /run/ssh-agent.sock and sets SSH_AUTH_SOCK, so ask the
+                # socket itself. Only the classification is printed, never ssh-add's output.
+                ra = sbx(cfg, "exec", prof.sandbox, "sh", "-c",
+                         "command -v ssh-add >/dev/null 2>&1 || { echo ssh-add-missing; exit 127; }; "
+                         "ssh-add -l 2>&1; exit $?", check=False, capture=True)
+                chk(classify_ssh_add(ra.returncode, ra.stdout or "") == "none", "no SSH agent forwarded",
                     "restart the sbx daemon from a shell without SSH_AUTH_SOCK: `env -u SSH_AUTH_SOCK sbx daemon stop; env -u SSH_AUTH_SOCK sbx daemon start`")
             if prof.tool_names:
                 chk('"ok": true' in out or "pong" in out, "hosttool reaches the bridge",

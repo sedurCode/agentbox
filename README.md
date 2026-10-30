@@ -57,7 +57,9 @@ and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting an
 3. Optional: `export SBX_NO_TELEMETRY=1`.
 4. If you ever started the sbx daemon from a shell with `SSH_AUTH_SOCK` set, restart it
    without: `env -u SSH_AUTH_SOCK sbx daemon stop && env -u SSH_AUTH_SOCK sbx daemon start`.
-   `agentbox doctor` checks that no agent socket shows up inside the sandbox.
+   `agentbox doctor` runs `ssh-add -l` inside the sandbox and fails if a live agent answers
+   (sbx always creates `/run/ssh-agent.sock`, so the socket existing proves nothing). It prints
+   only the verdict, never key fingerprints.
 
 ## 2. Configure
 
