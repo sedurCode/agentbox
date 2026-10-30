@@ -80,6 +80,7 @@ DEFAULT_SETTINGS = {
 }
 
 DEFAULT_PROFILE = {
+    "enabled": True,            # false = template: doctor/status skip it, up/code/fresh refuse it
     "agent": "claude",
     "workspace": None,
     "extra_workspaces": [],
@@ -188,6 +189,9 @@ class Profile:
             self.extras.append((xp(spec), ro))
         if d["mode"] not in ("direct", "clone"):
             die(f"profile '{name}': mode must be 'direct' or 'clone'")
+        if not isinstance(d["enabled"], bool):
+            die(f"profile '{name}': enabled must be true or false")
+        self.enabled = d["enabled"]
 
     # all host paths the sandbox can see (and so the agent can write to, unless :ro)
     @property
@@ -677,6 +681,9 @@ def _expand_literal(s: str) -> str:
     return os.path.expandvars(os.path.expanduser(s)) if s.startswith(("~", "$")) else s
 
 
+_WARNED_TOOLS: set[str] = set()     # tools already warned about in this run
+
+
 class Bridge:
     MAX_OUT = 256 * 1024
 
@@ -709,7 +716,8 @@ class Bridge:
             if not exe.is_absolute():
                 die(f"tool '{n}': argv[0] must be an absolute path (got {argv[0]})")
             rexe = exe.resolve()
-            if not rexe.exists() or not os.access(rexe, os.X_OK):
+            if (not rexe.exists() or not os.access(rexe, os.X_OK)) and n not in _WARNED_TOOLS:
+                _WARNED_TOOLS.add(n)      # once per run, not once per profile that lists it
                 info(f"warning: tool '{n}': {exe} is not executable/present - calls will fail")
             for r in self.roots:
                 if is_within(rexe, r):
@@ -1239,6 +1247,9 @@ def cmd_status(cfg: Config) -> int:
             prof = cfg.profile(n)
         except SystemExit:
             continue
+        if not prof.enabled:
+            print(f"{n:20s} skipped (disabled)")
+            continue
         pid = bridge_pid(prof) if prof.state.exists() else None
         tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
         print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}")
@@ -1312,6 +1323,9 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
     names = [name] if name else cfg.profile_names()
     for n in names:
         prof = cfg.profile(n)
+        if not prof.enabled:
+            print(f"\nprofile {n} ({prof.sandbox}): skipped (disabled)")
+            continue
         print(f"\nprofile {n} ({prof.sandbox})")
         for r in prof.roots:
             chk(r.exists(), f"workspace {r}", "fix the path in agentbox.toml")
@@ -1393,6 +1407,8 @@ def main():
     if a.cmd == "doctor":
         sys.exit(cmd_doctor(cfg, a.profile))
     prof = cfg.profile(a.profile)
+    if a.cmd in ("up", "code", "fresh") and not prof.enabled:
+        die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`")
     if a.cmd == "up":
         sys.exit(cmd_up(prof, a))
     if a.cmd == "fresh":

@@ -30,8 +30,13 @@ deny = [
 
 # ---------------------------------------------------------------------------
 # Profiles: one sandbox each.  agentbox up <profile>
+#
+# The profiles below are TEMPLATES, so they carry `enabled = false`: doctor and status
+# skip them, and up/code/fresh refuse them. Copy one, point `workspace` at your project,
+# and set `enabled = true` (or delete the line). down/stop work on disabled profiles.
 
 [profiles.h750]
+enabled = false                      # template - see note above
 agent = "claude"                     # claude | copilot | codex | gemini | shell | junie (kit)
 workspace = "~/src/h750-firmware"
 extra_workspaces = [
@@ -54,6 +59,7 @@ Only flash when asked. Use `hosttool fault-snapshot elf=<path>` to inspect a Har
 """
 
 [profiles.h750-copilot]
+enabled = false                      # template - see note above
 agent = "copilot"
 workspace = "~/src/h750-firmware"
 kits = ["embedded-arm"]
@@ -69,6 +75,7 @@ secrets = [
 ]
 
 [profiles.h750-junie]
+enabled = false                      # template - see note above
 agent = "junie"                      # resolves to ~/.config/agentbox/kits/junie
 workspace = "~/src/h750-firmware"
 kits = ["embedded-arm"]
@@ -83,6 +90,7 @@ host_tools_port = 47113
 #  sbx resolves it on the host at request time - the value never appears on a command line)
 
 [profiles.scratch]
+enabled = false                      # template - see note above
 agent = "shell"                      # agent-less shell for poking around
 workspace = "~/src/scratch"
 mode = "clone"

@@ -68,6 +68,7 @@ the important keys:
 
 | key | meaning |
 |---|---|
+| `enabled` | `true` (default). `false` marks a template: `doctor` and `status` print "skipped (disabled)", `up`/`code`/`fresh` refuse it, `down`/`stop`/`tools`/`audit` still work |
 | `agent` | `claude`, `copilot`, `codex`, `gemini`, `shell` (built-in) or a sandbox kit name/path (`junie`) |
 | `workspace` | primary project, mounted read-write at the same absolute path |
 | `extra_workspaces` | more mounts, append `:ro` for read-only |
