@@ -168,6 +168,11 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   **TODO:** confirm whether sbx has an idle/auto-stop setting or a keep-alive flag (nothing in this
   repo or agentbox's own `sbx` calls documents one, and `sbx` couldn't be run while writing this).
   If it does, use that and drop the keep-alive.
+- **Stopped sandboxes are never booted by accident.** `sbx exec` starts a stopped sandbox, so agentbox
+  first asks `sbx ls --json`. If the sandbox isn't running, `status`, `wait`, the keep-alive and `audit`'s
+  `git status` treat the job as `lost` (cached in `job.json`, so later calls make no `sbx` call at all) and
+  `doctor` skips its in-sandbox checks ("skipped (sandbox stopped)"; `doctor --start` boots it first).
+  `logs` exits 3 instead of booting; `logs --start` boots it to read the output.
 - **Retries.** `run`, `wait` and `logs` retry transient `sbx` errors (`context deadline exceeded`,
   connection reset/refused) with exponential backoff (1, 2, 4, 8 s; five attempts). A failed
   `create` is not repeated blindly: agentbox first checks whether the sandbox now exists.
@@ -232,7 +237,9 @@ the message is on stderr and stdout is empty, so check the exit code before pars
 
 `agentbox status --json` (sandbox existence is probed with `sbx inspect`; disabled profiles aren't).
 `job.state` is `none`, `running`, `finished` or `lost` (see *Headless jobs*); `exit_code` is set only when
-finished. A profile with a recorded, unfinished job costs one `sbx exec` to check it:
+finished. `job.vm` is the sandbox state (`running`, `stopped`, `missing`, `unknown`) when the job was last
+checked. `status` never boots a stopped sandbox: it asks `sbx ls --json`, and a job whose sandbox isn't
+running is `lost` without any exec. A running sandbox with an unfinished job costs one `sbx exec`:
 
 ```json
 {"profiles": [
@@ -240,9 +247,11 @@ finished. A profile with a recorded, unfinished job costs one `sbx exec` to chec
    "mode": "direct", "sandbox_exists": true, "host_tools": ["flash-elf"], "host_tools_port": 47111,
    "bridge": {"running": true, "pid": 4242},
    "job": {"id": "20260101T120000Z-ab12cd", "state": "finished", "exit_code": 0,
-           "session_id": "0b1c...", "started_at": "2026-01-01T12:00:01Z", "finished_at": "2026-01-01T12:07:45Z"}},
+           "session_id": "0b1c...", "started_at": "2026-01-01T12:00:01Z", "finished_at": "2026-01-01T12:07:45Z",
+           "vm": "running"}},
   {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone",
-   "job": {"id": null, "state": "none", "exit_code": null, "session_id": null, "started_at": null, "finished_at": null}},
+   "job": {"id": null, "state": "none", "exit_code": null, "session_id": null, "started_at": null,
+           "finished_at": null, "vm": null}},
   {"name": "broken", "valid": false}
 ]}
 ```

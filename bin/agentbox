@@ -334,6 +334,24 @@ def sandbox_exists(prof: Profile, retry: bool = False) -> bool:
     return r.returncode == 0
 
 
+def sandbox_state(prof: Profile) -> str:
+    """"running" | "stopped" | "missing" | "unknown", from `sbx ls --json`. Unlike `sbx exec`
+    (which starts a stopped sandbox), asking has no side effects."""
+    r = sbx_retry(prof.cfg, "ls", "--json")
+    if r.returncode != 0:
+        return "unknown"
+    try:
+        rows = json.loads(r.stdout or "[]")
+    except ValueError:
+        return "unknown"
+    if not isinstance(rows, list):
+        return "unknown"
+    for row in rows:
+        if isinstance(row, dict) and row.get("name") == prof.sandbox:
+            return row["status"] if row.get("status") in ("running", "stopped") else "unknown"
+    return "missing"
+
+
 # ----------------------------------------------------- generated kit (YAML)
 def yaml_dump(obj, indent=0) -> str:
     """Tiny YAML emitter; scalars are JSON-quoted (valid YAML)."""
@@ -651,7 +669,7 @@ def write_snapshot(prof: Profile):
 def sandbox_git_status(prof: Profile, root: str) -> str | None:
     """Run `git status` INSIDE the sandbox (where running repo-controlled code is fine).
     Returns output, or None if the sandbox isn't available."""
-    if not sandbox_exists(prof):
+    if sandbox_state(prof) != "running":        # `sbx exec` would start a stopped sandbox
         return None
     try:
         r = subprocess.run([prof.cfg.settings["sbx"], "exec", prof.sandbox,
@@ -1332,7 +1350,7 @@ HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resum
                        "--dangerously-skip-permissions"], "resume": "--resume"},
 }
 NO_JOB = {"id": None, "state": "none", "exit_code": None, "session_id": None,
-          "started_at": None, "finished_at": None}
+          "started_at": None, "finished_at": None, "vm": None}   # vm: sandbox state when last checked
 
 
 def new_job_id() -> str:
@@ -1432,26 +1450,38 @@ def job_summary(job_id: str, state: str, files: dict) -> dict:
             "started_at": files.get("started_at") or None, "finished_at": files.get("finished_at") or None}
 
 
+def probe_job(prof: Profile, job_id: str) -> dict | None:
+    """Exec the probe in the VM (this starts a stopped sandbox: check sandbox_state first)."""
+    r = sbx_retry(prof.cfg, "exec", prof.sandbox, "sh", "-c", probe_script(job_id))
+    return parse_probe(r.stdout or "") if r.returncode == 0 else None
+
+
 def job_info(prof: Profile, job_id: str | None = None) -> dict:
-    """Current state of a job (default: the profile's recorded one). Makes no sbx call when the
-    profile has never run a job or the recorded job is already known to be finished."""
+    """Current state of a job (default: the profile's recorded one). Never boots a stopped VM,
+    and makes no sbx call at all once the job is known to be finished or lost - neither comes back."""
     rec = job_record(prof)
     job_id = job_id or rec.get("id")
     if not job_id:
         return dict(NO_JOB)
-    if rec.get("id") == job_id and rec.get("exit_code") is not None:
-        return {k: rec.get(k) for k in NO_JOB} | {"id": job_id, "state": "finished"}
-    r = sbx_retry(prof.cfg, "exec", prof.sandbox, "sh", "-c", probe_script(job_id))
-    if r.returncode != 0:
-        # VM stopped or gone: the process is gone with it. `probe_failed` lets `wait` double-check.
-        sid = rec.get("session_id") if rec.get("id") == job_id else None
-        return job_summary(job_id, "lost", {"session_id": sid}) | {"probe_failed": True}
-    probe = parse_probe(r.stdout or "")
-    state = classify_job(probe)
-    out = job_summary(job_id, state, probe["files"])
-    if rec.get("id") == job_id and state != "running":
+    mine = rec.get("id") == job_id
+    if mine and rec.get("state") in ("finished", "lost"):
+        return {k: rec.get(k) for k in NO_JOB} | {"id": job_id}
+    known = {k: rec.get(k) for k in ("session_id", "started_at", "finished_at")} if mine else {}
+    vm = sandbox_state(prof)
+    if vm != "running":
+        # The process died with the VM. "unknown" (daemon unreachable) isn't certain: don't cache it,
+        # and flag it so `wait` can double-check.
+        out = job_summary(job_id, "lost", known) | {"vm": vm}
+        if vm == "unknown":
+            return out | {"probe_failed": True}
+    else:
+        probe = probe_job(prof, job_id)
+        if probe is None:
+            return job_summary(job_id, "lost", known) | {"vm": "unknown", "probe_failed": True}
+        out = job_summary(job_id, classify_job(probe), {**known, **probe["files"]}) | {"vm": "running"}
+    if mine and out["state"] != "running":
         save_job_record(prof, {**rec, **{k: out[k] for k in NO_JOB if k != "id"}, "id": job_id})
-    elif rec.get("id") == job_id and out["session_id"] and rec.get("session_id") != out["session_id"]:
+    elif mine and out["session_id"] and rec.get("session_id") != out["session_id"]:
         save_job_record(prof, {**rec, "session_id": out["session_id"]})
     return out
 
@@ -1556,18 +1586,21 @@ def cmd_keepalive(prof: Profile) -> int:
     cmd = [prof.cfg.settings["sbx"], "exec", prof.sandbox, "sh", "-c", hold_script(job_id)]
     drops = unknown = 0
     while True:
+        vm = sandbox_state(prof)            # our own `sbx exec` would boot a stopped VM: never do that
+        if vm in ("stopped", "missing"):
+            return EXIT_OK
+        if vm == "unknown":                 # daemon unreachable: keep trying for a while
+            unknown += 1
+            if unknown >= 10:
+                return EXIT_OK
+            time.sleep(backoff_delay(unknown, 1.0, 30.0))
+            continue
+        unknown = 0
         held[:] = [subprocess.Popen(cmd, env=sbx_env(prof.cfg), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)]
         held[0].wait()
-        j = job_info(prof, job_id)
-        if j["state"] == "running":
-            unknown = 0
-        elif not j.get("probe_failed"):
-            return EXIT_OK                  # finished, or lost for certain
-        else:
-            unknown += 1                    # daemon unreachable: keep trying for a while
-            if unknown >= 10:
-                return EXIT_OK
+        if job_info(prof, job_id)["state"] != "running":
+            return EXIT_OK
         time.sleep(backoff_delay(drops, 1.0, 30.0))      # the session dropped but the job lives: re-hold
         drops = min(drops + 1, 10)
 
@@ -1604,7 +1637,7 @@ def cmd_wait(prof: Profile, args) -> int:
         if j["state"] == "lost":
             doubts += 1                     # one flaky probe isn't "lost"
             if not j.get("probe_failed") or doubts >= 3:
-                info(f"job {job_id} lost (its process is gone; VM stopped or reset?)")
+                info(f"job {job_id} lost (its process is gone; sandbox {j['vm']})")
                 return EXIT_LOST
         else:
             doubts = 0
@@ -1614,8 +1647,20 @@ def cmd_wait(prof: Profile, args) -> int:
         time.sleep(min(next(delays), max(0.0, deadline - time.monotonic()) if deadline else 1e9))
 
 
-def fetch_new_lines(prof: Profile, job_id: str, have: int) -> list[str]:
+def require_running(prof: Profile, start: bool = False):
+    """Reading from the VM (`sbx exec`) would boot a stopped sandbox; only do that if asked (--start)."""
+    vm = sandbox_state(prof)
+    if vm == "running" or (start and vm in ("stopped", "unknown")):
+        return
+    if vm == "unknown":
+        die(f"cannot tell whether {prof.sandbox} is running (`sbx ls --json` failed)")
+    die(f"sandbox {prof.sandbox} is {vm}; its job output can't be read without starting it"
+        + (" (pass --start to boot it)" if vm == "stopped" else ""), EXIT_NO_SANDBOX)
+
+
+def fetch_new_lines(prof: Profile, job_id: str, have: int, start: bool = False) -> list[str]:
     """Complete lines of output.jsonl after the first `have` ones."""
+    require_running(prof, start)
     d = JOB_DIR.format(id=job_id)
     r = vm_exec(prof, f'tail -n +{have + 1} {d}/output.jsonl 2>/dev/null')
     if r.returncode != 0:
@@ -1630,7 +1675,7 @@ def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
     have, delays = 0, poll_delays(1.0, 10.0)
     while True:
         j = job_info(prof, job_id) if follow else None
-        lines = fetch_new_lines(prof, job_id, have)
+        lines = fetch_new_lines(prof, job_id, have, getattr(args, "start", False))
         have += len(lines)
         for ln in lines:
             shown = ln if args.raw else render_stream_line(ln)
@@ -1695,6 +1740,9 @@ def cmd_resume(prof: Profile, args) -> int:
     j = job_info(prof, job_id)
     if j["state"] == "running":
         die(f"job {job_id} is still running; `agentbox wait {prof.name}` first")
+    if not j["session_id"] and j["vm"] != "running":
+        probe = probe_job(prof, job_id)       # `sbx run` below boots the sandbox anyway
+        j = job_summary(job_id, j["state"], probe["files"]) if probe else j
     if not j["session_id"]:
         die(f"no session id recorded for job {job_id} (did the agent start?)")
     ensure_sandbox(prof)
@@ -1858,7 +1906,7 @@ class Report:
         return {"ok": self.ok, "checks": self.items}
 
 
-def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False) -> int:
+def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool = False) -> int:
     rep = Report(as_json)
     chk = rep.chk
 
@@ -1906,7 +1954,16 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False) -> int:
                 chk(True, f"host tools preflight: {', '.join(prof.tool_names)}")
             except SystemExit:
                 chk(False, "host tools preflight", "see message above")
-        if sandbox_exists(prof):
+        vm = sandbox_state(prof) if sandbox_exists(prof) else "missing"
+        if vm == "missing":
+            rep.say("  (sandbox not created yet - in-sandbox checks skipped)")
+            rep.skip("sandbox not created yet - in-sandbox checks skipped")
+        elif vm != "running" and not (start and vm == "stopped"):
+            # `sbx exec` would boot it; a diagnostic shouldn't change what it inspects
+            why = "sandbox stopped" if vm == "stopped" else "sandbox state unknown"
+            rep.say(f"  (in-sandbox checks skipped ({why}){'; --start boots it' if vm == 'stopped' else ''})")
+            rep.skip(f"skipped ({why})")
+        else:
             probe = (TOKEN_PROBE + "; "
                      "command -v hosttool >/dev/null && hosttool ping || echo hosttool=absent")
             r = sbx(cfg, "exec", prof.sandbox, "sh", "-c", probe, check=False, capture=True)
@@ -1932,9 +1989,6 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False) -> int:
             if prof.tool_names:
                 chk('"ok": true' in out or "pong" in out, "hosttool reaches the bridge",
                     f"is the bridge up? `agentbox up {n}`; check `sbx policy log` for localhost:{prof.port}")
-        else:
-            rep.say("  (sandbox not created yet - in-sandbox checks skipped)")
-            rep.skip("sandbox not created yet - in-sandbox checks skipped")
     rep.scope = None
     rep.say("\n" + ("all good" if rep.ok else "problems found"))
     if as_json:
@@ -1964,11 +2018,13 @@ def main():
     p.add_argument("--timeout", type=float, metavar="S")
     p = sub.add_parser("logs"); p.add_argument("profile"); p.add_argument("--job")
     p.add_argument("-f", "--follow", action="store_true"); p.add_argument("--raw", action="store_true")
+    p.add_argument("--start", action="store_true", help="boot the sandbox if it is stopped")
     p = sub.add_parser("resume"); p.add_argument("profile"); p.add_argument("--job")
     sub.add_parser("keepalive", help=argparse.SUPPRESS).add_argument("profile")
     p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
+    p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
     a = ap.parse_args()
 
     os.umask(0o077)          # everything agentbox creates (token, kit, logs) is owner-only
@@ -1977,7 +2033,7 @@ def main():
     if a.cmd == "status":
         sys.exit(cmd_status(cfg, a.json))
     if a.cmd == "doctor":
-        sys.exit(cmd_doctor(cfg, a.profile, a.json))
+        sys.exit(cmd_doctor(cfg, a.profile, a.json, a.start))
     prof = cfg.profile(a.profile)
     if a.cmd in ("up", "code", "fresh", "run", "resume") and not prof.enabled:
         die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`", EXIT_USAGE)

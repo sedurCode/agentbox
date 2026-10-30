@@ -3,6 +3,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -118,8 +119,9 @@ class FakeSbx:
     """Stand-in for ab.sbx. `exec_out` maps a marker found in the exec command to (rc, stdout);
     anything unexpected fails the test."""
 
-    def __init__(self, exists=False, exec_out=None):
+    def __init__(self, exists=False, exec_out=None, vm="running", names=("ab-on", "ab-plain", "ab-p"), boot=False):
         self.exists, self.exec_out, self.calls = exists, exec_out or {}, []
+        self.vm, self.names, self.boot = vm, names, boot      # boot: an exec may start a stopped VM
 
     def __call__(self, cfg, *args, check=True, capture=False, stdin=None):
         self.calls.append(args)
@@ -128,6 +130,12 @@ class FakeSbx:
             return done(0, "sbx 9.9.9\n")
         if args == ("ls",):
             return done(0, "NAME STATUS\n")
+        if args == ("ls", "--json"):
+            return done(0, json.dumps([{"name": n, "status": self.vm} for n in self.names] if self.exists else []))
+        if args[0] == "exec" and self.vm != "running":
+            if not self.boot:
+                raise AssertionError(f"exec into a {self.vm} sandbox would boot it: {args!r}")
+            self.vm = "running"
         if args[:2] == ("kit", "validate"):
             return done()
         if args[0] == "exec":
@@ -158,8 +166,9 @@ class LocalVM:
     """Stands in for sbx by running `exec ... sh -c SCRIPT` on THIS machine with HOME pointed at a
     temp dir and a fake `claude` on PATH, so the job scripts really run. Nothing else is allowed."""
 
-    def __init__(self, case, exists=True):
-        self.case, self.exists, self.calls, self.stdins = case, exists, [], []
+    def __init__(self, case, exists=True, vm="running"):
+        self.case, self.exists, self.vm, self.calls, self.stdins = case, exists, vm, [], []
+        self.ls_fail = self.boot = False       # ls_fail: the daemon is unreachable; boot: exec may start a stopped VM
         self.home = case.tmp / "vmhome"
         self.home.mkdir()
         bindir = case.tmp / "vmbin"
@@ -189,6 +198,14 @@ class LocalVM:
         done = lambda rc=0, out="", err="": subprocess.CompletedProcess(args, rc, out, err)
         if args[0] == "inspect":
             return done(0 if self.exists else 1)
+        if args == ("ls", "--json"):
+            if self.ls_fail:
+                return done(1, "", "error: context deadline exceeded")
+            return done(0, json.dumps([{"name": "ab-p", "status": self.vm}] if self.exists else []))
+        if args[0] == "exec" and self.vm != "running":
+            if not self.boot:
+                raise AssertionError(f"exec into a {self.vm} sandbox would boot it: {args!r}")
+            self.vm = "running"
         if args[0] == "rm":
             return done()
         if args[0] == "exec" and args[-3:-1] == ("sh", "-c"):
