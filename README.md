@@ -154,6 +154,61 @@ starting the agent), starts the host-tool bridge, checks SSH, then runs
 - VS Code port forwarding works but only reaches loopback inside the VM, and listens on
   `127.0.0.1` on your Mac unless you change it.
 
+### Scripting agentbox
+
+`status`, `doctor` and `tools` take `--json`: stdout is then exactly one JSON document, the human
+text is unchanged without the flag, and diagnostics still go to stderr. No secret values appear
+in any of them (`doctor` reports token-like variables by name, class and length only).
+
+**Exit codes** (all commands):
+
+| code | meaning |
+|---|---|
+| `0` | ok |
+| `1` | checks failed (`doctor`) or a command failed (`sbx` error, bridge, SSH, ...) |
+| `2` | usage or config error: bad arguments, no/invalid config, unknown or disabled profile, unsafe tool definition |
+| `3` | sandbox not found (`shell`, `stop`, and `audit` when nothing was ever created) |
+
+`up` and `shell` return the agent's / shell's own exit status once attached. On a `2` or `1` error
+the message is on stderr and stdout is empty, so check the exit code before parsing.
+
+`agentbox status --json` (sandbox existence is probed with `sbx inspect`; disabled profiles aren't):
+
+```json
+{"profiles": [
+  {"name": "h750", "valid": true, "enabled": true, "sandbox": "ab-h750", "agent": "claude",
+   "mode": "direct", "sandbox_exists": true, "host_tools": ["flash-elf"], "host_tools_port": 47111,
+   "bridge": {"running": true, "pid": 4242}},
+  {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone"},
+  {"name": "broken", "valid": false}
+]}
+```
+
+`agentbox doctor [profile] --json` (exit `0` when `ok`, else `1`). `status` is one of `pass`, `fail`,
+`warn`, `info`, `skip`; `profile` is `null` for host-level checks; `hint`, `details` and `data` are
+optional:
+
+```json
+{"ok": false, "checks": [
+  {"profile": null, "status": "pass", "message": "sbx present: sbx 1.2.3"},
+  {"profile": "h750", "status": "warn", "message": "GH_TOKEN: looks like a real credential (40 chars)",
+   "hint": "check `sbx secret ls` ...", "data": {"name": "GH_TOKEN", "class": "real", "length": 40}},
+  {"profile": "h750", "status": "fail", "message": "no SSH agent forwarded", "hint": "restart the sbx daemon ..."},
+  {"profile": "scratch", "status": "skip", "message": "skipped (disabled)"}
+]}
+```
+
+`agentbox tools <profile> --json` (`params` are the `[tools.*]` param specs from the config;
+the argv is not included):
+
+```json
+{"profile": "h750", "tools": [
+  {"name": "flash-elf", "description": "Program an ELF via ST-LINK, verify, reset",
+   "params": {"elf": {"type": "path", "suffixes": [".elf", ".hex", ".bin"]}},
+   "extra_args": false, "timeout": 180, "confirm": true}
+]}
+```
+
 ## 4. Credentials per agent
 
 Nothing is set globally. Each entry in a profile's `secrets` is applied with

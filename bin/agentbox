@@ -8,14 +8,16 @@ Docker Sandboxes (`sbx`).
     agentbox up <profile>        create (first time) or re-attach to the sandbox
     agentbox shell <profile>     bash inside the sandbox
     agentbox code <profile> [p]  open VS Code (Remote-SSH) inside the sandbox
-    agentbox tools <profile>     list the host tools this profile exposes
+    agentbox tools <profile>     list the host tools this profile exposes (--json)
     agentbox audit <profile>     show changes to build/hook/agent-config files
     agentbox stop <profile>      stop the sandbox and the host-tool bridge
     agentbox down <profile>      audit, then delete sandbox, scoped secrets, state
     agentbox fresh <profile>     down + up (use after editing the profile)
-    agentbox status              sandboxes and bridges
-    agentbox doctor [<profile>]  sanity / security checks
+    agentbox status              sandboxes and bridges (--json)
+    agentbox doctor [<profile>]  sanity / security checks (--json)
     agentbox bridge <profile>    run the host-tool bridge in the foreground
+
+Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found.
 
 Config: ~/.config/agentbox/agentbox.toml   (kept OUTSIDE every workspace)
 State:  ~/.local/state/agentbox/<sandbox>/
@@ -117,7 +119,11 @@ MERGED_LISTS = ("allow", "deny", "kits")   # defaults + profile are unioned
 
 
 # ----------------------------------------------------------------- helpers
-def die(msg: str, code: int = 1):
+# Exit codes (documented in the README): scripts can rely on these.
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NO_SANDBOX = 0, 1, 2, 3
+
+
+def die(msg: str, code: int = EXIT_FAIL):
     print(f"agentbox: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -146,7 +152,7 @@ def sha256_file(p: Path) -> str:
 class Config:
     def __init__(self):
         if not CONFIG_FILE.exists():
-            die(f"no config at {CONFIG_FILE} - run install.sh or copy agentbox.example.toml there")
+            die(f"no config at {CONFIG_FILE} - run install.sh or copy agentbox.example.toml there", EXIT_USAGE)
         self.raw = tomllib.loads(CONFIG_FILE.read_text())
         self.settings = {**DEFAULT_SETTINGS, **self.raw.get("settings", {})}
         self.tools = self.raw.get("tools", {})
@@ -158,9 +164,9 @@ class Config:
     def profile(self, name: str) -> "Profile":
         profs = self.raw.get("profiles", {})
         if name not in profs:
-            die(f"unknown profile '{name}'. Known: {', '.join(self.profile_names()) or '(none)'}")
+            die(f"unknown profile '{name}'. Known: {', '.join(self.profile_names()) or '(none)'}", EXIT_USAGE)
         if not NAME_RE.match(name):
-            die(f"profile name '{name}' must match {NAME_RE.pattern}")
+            die(f"profile name '{name}' must match {NAME_RE.pattern}", EXIT_USAGE)
         defaults = self.raw.get("defaults", {})
         merged = {**DEFAULT_PROFILE, **defaults, **profs[name]}
         for key in MERGED_LISTS:
@@ -177,7 +183,7 @@ class Profile:
     def __init__(self, cfg: Config, name: str, d: dict):
         self.cfg, self.name, self.d = cfg, name, d
         if not d.get("workspace"):
-            die(f"profile '{name}' needs `workspace = \"...\"`")
+            die(f"profile '{name}' needs `workspace = \"...\"`", EXIT_USAGE)
         self.sandbox = f"{cfg.settings['name_prefix']}-{name}"
         self.state = cfg.state_root / self.sandbox
         self.primary = xp(d["workspace"])
@@ -190,9 +196,9 @@ class Profile:
                 spec = spec[:-3]
             self.extras.append((xp(spec), ro))
         if d["mode"] not in ("direct", "clone"):
-            die(f"profile '{name}': mode must be 'direct' or 'clone'")
+            die(f"profile '{name}': mode must be 'direct' or 'clone'", EXIT_USAGE)
         if not isinstance(d["enabled"], bool):
-            die(f"profile '{name}': enabled must be true or false")
+            die(f"profile '{name}': enabled must be true or false", EXIT_USAGE)
         self.enabled = d["enabled"]
 
     # all host paths the sandbox can see (and so the agent can write to, unless :ro)
@@ -212,7 +218,7 @@ class Profile:
     def port(self) -> int:
         p = int(self.d.get("host_tools_port") or 0)
         if self.tool_names and not p:
-            die(f"profile '{self.name}' lists host_tools but has no host_tools_port")
+            die(f"profile '{self.name}' lists host_tools but has no host_tools_port", EXIT_USAGE)
         return p
 
     def agent_ref(self) -> str:
@@ -231,7 +237,7 @@ def resolve_kit(ref: str) -> Path:
     cand = KITS_DIR / ref
     p = cand if cand.is_dir() else xp(ref)
     if not (p / "spec.yaml").exists():
-        die(f"kit '{ref}' not found (looked in {cand} and {p})")
+        die(f"kit '{ref}' not found (looked in {cand} and {p})", EXIT_USAGE)
     return p
 
 
@@ -623,7 +629,7 @@ def cmd_audit(prof: Profile) -> int:
     snap_file = prof.state / "snapshot.json"
     if not snap_file.exists():
         info("no snapshot for this profile (created before first `up`?)")
-        return 1
+        return EXIT_NO_SANDBOX
     old = json.loads(snap_file.read_text())
     new = snapshot(prof)
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(old["time"]))
@@ -702,34 +708,34 @@ class Bridge:
         self.tools = {}
         for n in prof.tool_names:
             if n not in self.cfg.tools:
-                die(f"profile '{prof.name}' references unknown tool '{n}'")
+                die(f"profile '{prof.name}' references unknown tool '{n}'", EXIT_USAGE)
             self.tools[n] = self.cfg.tools[n]
         self.preflight()
 
     def preflight(self):
         for r in self.roots:
             if is_within(CONFIG_FILE.resolve(), r) or is_within(KITS_DIR.resolve(), r):
-                die(f"config/kits live inside workspace {r}: the agent could grant itself tools. Move them.")
+                die(f"config/kits live inside workspace {r}: the agent could grant itself tools. Move them.", EXIT_USAGE)
         for n, t in self.tools.items():
             argv = t.get("argv")
             if not argv or not isinstance(argv, list):
-                die(f"tool '{n}': argv must be a non-empty list")
+                die(f"tool '{n}': argv must be a non-empty list", EXIT_USAGE)
             exe = Path(_expand_literal(argv[0]))
             if not exe.is_absolute():
-                die(f"tool '{n}': argv[0] must be an absolute path (got {argv[0]})")
+                die(f"tool '{n}': argv[0] must be an absolute path (got {argv[0]})", EXIT_USAGE)
             rexe = exe.resolve()
             if (not rexe.exists() or not os.access(rexe, os.X_OK)) and n not in _WARNED_TOOLS:
                 _WARNED_TOOLS.add(n)      # once per run, not once per profile that lists it
                 info(f"warning: tool '{n}': {exe} is not executable/present - calls will fail")
             for r in self.roots:
                 if is_within(rexe, r):
-                    die(f"tool '{n}': executable {exe} is inside workspace {r} (agent-writable)")
+                    die(f"tool '{n}': executable {exe} is inside workspace {r} (agent-writable)", EXIT_USAGE)
             for a in argv[1:]:
                 lit = Path(_expand_literal(a))
                 if lit.is_absolute() and "{" not in a:
                     for r in self.roots:
                         if is_within(lit.resolve(), r):
-                            die(f"tool '{n}': fixed argument {a} points inside workspace {r} (agent-writable)")
+                            die(f"tool '{n}': fixed argument {a} points inside workspace {r} (agent-writable)", EXIT_USAGE)
 
     # ---- validation
     def _root_for(self, p: Path) -> Path | None:
@@ -947,10 +953,7 @@ class Bridge:
             f.write(json.dumps(rec) + "\n")
 
     def describe(self):
-        return {n: {"description": t.get("description", ""),
-                    "params": t.get("params", {}),
-                    "extra_args": bool(t.get("extra_args")),
-                    "timeout": int(t.get("timeout", 60))} for n, t in self.tools.items()}
+        return {n: describe_tool(t) for n, t in self.tools.items()}
 
     # ---- HTTP
     def handler(self):
@@ -1079,7 +1082,7 @@ def set_secrets(prof: Profile):
         if s.get("custom"):
             host, envn = s.get("host"), s.get("env")
             if not host or not envn:
-                die("custom secret needs host and env")
+                die("custom secret needs host and env", EXIT_USAGE)
             # Hand sbx the SOURCE (op:// ref or a command it runs on the host), never the
             # value: values on argv are visible to `ps`, and agentbox never needs to see them.
             if s.get("ref"):
@@ -1088,14 +1091,15 @@ def set_secrets(prof: Profile):
                 src = ["--command", s["command"]]
             else:
                 die(f"custom secret {envn}: set `ref = \"op://...\"` or `command = \"...\"` "
-                    "(e.g. command = \"security find-generic-password -s junie -w\" for the macOS keychain)")
+                    "(e.g. command = \"security find-generic-password -s junie -w\" for the macOS keychain)",
+                    EXIT_USAGE)
             info(f"custom secret {envn} -> {host} (sandbox-scoped, resolved on the host by sbx)")
             sbx(prof.cfg, "secret", "set-custom", "--sandbox", prof.sandbox,
                 "--host", host, "--env", envn, *src)
             continue
         svc = s.get("service")
         if not svc:
-            die(f"secret entry without service: {s}")
+            die(f"secret entry without service: {s}", EXIT_USAGE)
         args = ["secret", "set", svc, "--sandbox", prof.sandbox]
         if s.get("ref"):
             args += ["--ref", s["ref"]]
@@ -1118,9 +1122,9 @@ def ensure_sandbox(prof: Profile):
     cfg = prof.cfg
     for r in prof.roots:
         if not r.exists():
-            die(f"workspace {r} does not exist")
+            die(f"workspace {r} does not exist", EXIT_USAGE)
     if prof.tool_names and prof.d["mode"] == "clone":
-        die("host tools need mode = \"direct\": in clone mode the code lives only inside the VM")
+        die("host tools need mode = \"direct\": in clone mode the code lives only inside the VM", EXIT_USAGE)
     token = get_token(prof)
     kit_dir, digest = render_local_kit(prof, token)
     digest_file = prof.state / "kit.digest"
@@ -1193,7 +1197,7 @@ def cmd_code(prof: Profile, args) -> int:
         die("ssh client not found")
     folder = xp(args.path) if args.path else prof.primary
     if prof.d["mode"] == "direct" and not any(is_within(folder, r) for r in prof.roots):
-        die(f"{folder} isn't one of this sandbox's workspaces: {', '.join(map(str, prof.roots))}")
+        die(f"{folder} isn't one of this sandbox's workspaces: {', '.join(map(str, prof.roots))}", EXIT_USAGE)
     if not ssh_config_has_sbx():
         info("configuring SSH for *.sbx hosts (sbx setup ssh)")
         sbx(cfg, "setup", "ssh")
@@ -1241,7 +1245,34 @@ def cmd_down(prof: Profile, args) -> int:
     return 0
 
 
-def cmd_status(cfg: Config) -> int:
+def emit_json(obj):
+    """The one JSON document a --json command prints on stdout. Never put secret values in obj."""
+    print(json.dumps(obj, indent=2, default=str))
+
+
+def profile_status(prof: Profile) -> dict:
+    if not prof.enabled:
+        return {"name": prof.name, "valid": True, "enabled": False, "sandbox": prof.sandbox,
+                "agent": prof.d["agent"], "mode": prof.d["mode"]}
+    pid = bridge_pid(prof) if prof.state.exists() else None
+    return {"name": prof.name, "valid": True, "enabled": True, "sandbox": prof.sandbox,
+            "agent": prof.d["agent"], "mode": prof.d["mode"],
+            "sandbox_exists": sandbox_exists(prof),
+            "host_tools": prof.tool_names,
+            "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
+            "bridge": {"running": pid is not None, "pid": pid}}
+
+
+def cmd_status(cfg: Config, as_json: bool = False) -> int:
+    if as_json:
+        rows = []
+        for n in cfg.profile_names():
+            try:
+                rows.append(profile_status(cfg.profile(n)))
+            except SystemExit:               # message already on stderr
+                rows.append({"name": n, "valid": False})
+        emit_json({"profiles": rows})
+        return EXIT_OK
     sbx(cfg, "ls", check=False)
     print()
     for n in cfg.profile_names():
@@ -1255,7 +1286,30 @@ def cmd_status(cfg: Config) -> int:
         pid = bridge_pid(prof) if prof.state.exists() else None
         tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
         print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}")
-    return 0
+    return EXIT_OK
+
+
+def describe_tool(t: dict) -> dict:
+    return {"description": t.get("description", ""),
+            "params": t.get("params", {}),
+            "extra_args": bool(t.get("extra_args")),
+            "timeout": int(t.get("timeout", 60))}
+
+
+def cmd_tools(prof: Profile, as_json: bool = False) -> int:
+    cfg = prof.cfg
+    if not as_json:
+        print(tool_summary(cfg, prof.tool_names) or "(no host tools)")
+        return EXIT_OK
+    tools = []
+    for n in prof.tool_names:
+        if n not in cfg.tools:
+            die(f"profile '{prof.name}' references unknown tool '{n}'", EXIT_USAGE)
+        t = cfg.tools[n]
+        tools.append({"name": n, **describe_tool(t),
+                      "confirm": bool(t.get("confirm", prof.d.get("confirm_host_tools", False)))})
+    emit_json({"profile": prof.name, "tools": tools})
+    return EXIT_OK
 
 
 # Value prefixes of real credentials. The VM classifies each token-like variable itself
@@ -1307,28 +1361,64 @@ def classify_ssh_add(rc: int, out: str) -> str:
     return "unknown"
 
 
-def cmd_doctor(cfg: Config, name: str | None) -> int:
-    ok = True
+class Report:
+    """doctor results: printed as human text as they arrive, or collected for --json."""
 
-    def chk(cond, msg, hint=""):
-        nonlocal ok
-        print(("  ok   " if cond else "  FAIL ") + msg + ("" if cond else f"\n         -> {hint}"))
-        ok &= bool(cond)
+    def __init__(self, as_json: bool):
+        self.as_json, self.ok, self.items, self.scope = as_json, True, [], None
 
-    print("host")
+    def say(self, text: str = ""):
+        if not self.as_json:
+            print(text)
+
+    def add(self, status: str, msg: str, hint: str = "", details=(), data=None):
+        item = {"profile": self.scope, "status": status, "message": msg}
+        if hint:
+            item["hint"] = hint
+        if details:
+            item["details"] = list(details)
+        if data:
+            item["data"] = data
+        self.items.append(item)
+
+    def chk(self, cond, msg, hint=""):
+        self.ok &= bool(cond)
+        self.add("pass" if cond else "fail", msg, "" if cond else hint)
+        self.say(("  ok   " if cond else "  FAIL ") + msg + ("" if cond else f"\n         -> {hint}"))
+
+    def note(self, kind: str, msg: str, hint: str = "", details=(), data=None):
+        """kind: info | warn. Never fails the run."""
+        self.add(kind, msg, hint, details, data)
+        self.say(f"  {kind} {msg}" + "".join(f"\n         {d}" for d in details)
+                 + (f"\n         -> {hint}" if hint else ""))
+
+    def skip(self, msg: str):
+        self.add("skip", msg)
+
+    def result(self) -> dict:
+        return {"ok": self.ok, "checks": self.items}
+
+
+def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False) -> int:
+    rep = Report(as_json)
+    chk = rep.chk
+
+    rep.say("host")
     v = sbx(cfg, "version", check=False, capture=True)
     chk(v.returncode == 0, f"sbx present: {(v.stdout or '').strip().splitlines()[0] if v.stdout else '?'}",
         "brew trust docker/tap && brew install docker/tap/sbx && sbx login")
-    print(f"  info config: {CONFIG_FILE}")
+    rep.note("info", f"config: {CONFIG_FILE}")
     if cfg.settings["forward_ssh_agent"]:
-        print("  warn forward_ssh_agent = true: the agent can use your SSH keys (push, ssh to servers)")
+        rep.note("warn", "forward_ssh_agent = true: the agent can use your SSH keys (push, ssh to servers)")
     names = [name] if name else cfg.profile_names()
     for n in names:
         prof = cfg.profile(n)
+        rep.scope = n
         if not prof.enabled:
-            print(f"\nprofile {n} ({prof.sandbox}): skipped (disabled)")
+            rep.say(f"\nprofile {n} ({prof.sandbox}): skipped (disabled)")
+            rep.skip("skipped (disabled)")
             continue
-        print(f"\nprofile {n} ({prof.sandbox})")
+        rep.say(f"\nprofile {n} ({prof.sandbox})")
         for r in prof.roots:
             chk(r.exists(), f"workspace {r}", "fix the path in agentbox.toml")
             chk(not is_within(CONFIG_FILE.resolve(), r), "config is outside the workspace",
@@ -1337,11 +1427,10 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
                 # read config with Python only - never run git against an agent-writable repo
                 findings = risky_git_config(r)
                 if findings:
-                    print(f"  warn {r}: git config entries that can run commands (check them before using git on the host):")
-                    for f in findings:
-                        print(f"         {f}")
-                print(f"  info {r}: hooks in .git/hooks run on the host when you commit; a global"
-                      " core.hooksPath helps, but a repo-level core.hooksPath overrides it - `agentbox audit` flags that")
+                    rep.note("warn", f"{r}: git config entries that can run commands (check them before using git on the host):",
+                             details=findings)
+                rep.note("info", f"{r}: hooks in .git/hooks run on the host when you commit; a global"
+                         " core.hooksPath helps, but a repo-level core.hooksPath overrides it - `agentbox audit` flags that")
         for k in prof.kit_paths():
             rv = sbx(cfg, "kit", "validate", "--offline", k, check=False, capture=True)
             if rv.returncode != 0:
@@ -1364,12 +1453,15 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
             r = sbx(cfg, "exec", prof.sandbox, "sh", "-c", probe, check=False, capture=True)
             out = r.stdout or ""
             lines = [ln for ln in out.strip().splitlines() if not ln.startswith("TOKENVAR ")]
-            print("  inside sandbox:\n    " + "\n    ".join(lines))
+            rep.say("  inside sandbox:\n    " + "\n    ".join(lines))
+            for ln in lines:
+                rep.add("info", f"inside sandbox: {ln}")
             for tname, cls, length in parse_token_vars(out):
+                data = {"name": tname, "class": cls, "length": length}
                 if cls == "real":
-                    print(f"  warn {tname}: looks like a real credential ({length} chars)\n         -> {TOKEN_HINT}")
+                    rep.note("warn", f"{tname}: looks like a real credential ({length} chars)", TOKEN_HINT, data=data)
                 else:
-                    print(f"  info {tname}: placeholder/unknown ({length} chars)")
+                    rep.note("info", f"{tname}: placeholder/unknown ({length} chars)", data=data)
             if not cfg.settings["forward_ssh_agent"]:
                 # sbx always creates /run/ssh-agent.sock and sets SSH_AUTH_SOCK, so ask the
                 # socket itself. Only the classification is printed, never ssh-add's output.
@@ -1382,9 +1474,13 @@ def cmd_doctor(cfg: Config, name: str | None) -> int:
                 chk('"ok": true' in out or "pong" in out, "hosttool reaches the bridge",
                     f"is the bridge up? `agentbox up {n}`; check `sbx policy log` for localhost:{prof.port}")
         else:
-            print("  (sandbox not created yet - in-sandbox checks skipped)")
-    print("\n" + ("all good" if ok else "problems found"))
-    return 0 if ok else 1
+            rep.say("  (sandbox not created yet - in-sandbox checks skipped)")
+            rep.skip("sandbox not created yet - in-sandbox checks skipped")
+    rep.scope = None
+    rep.say("\n" + ("all good" if rep.ok else "problems found"))
+    if as_json:
+        emit_json(rep.result())
+    return EXIT_OK if rep.ok else EXIT_FAIL
 
 
 def main():
@@ -1392,25 +1488,26 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("up"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
-    for c in ("shell", "tools", "audit", "stop", "bridge"):
+    for c in ("shell", "audit", "stop", "bridge"):
         sub.add_parser(c).add_argument("profile")
+    p = sub.add_parser("tools"); p.add_argument("profile"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("down"); p.add_argument("profile"); p.add_argument("--keep-state", action="store_true")
     p = sub.add_parser("fresh"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
     p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
-    sub.add_parser("status")
-    p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?")
+    p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
     os.umask(0o077)          # everything agentbox creates (token, kit, logs) is owner-only
     cfg = Config()
     secure_state(cfg)
     if a.cmd == "status":
-        sys.exit(cmd_status(cfg))
+        sys.exit(cmd_status(cfg, a.json))
     if a.cmd == "doctor":
-        sys.exit(cmd_doctor(cfg, a.profile))
+        sys.exit(cmd_doctor(cfg, a.profile, a.json))
     prof = cfg.profile(a.profile)
     if a.cmd in ("up", "code", "fresh") and not prof.enabled:
-        die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`")
+        die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`", EXIT_USAGE)
     if a.cmd == "up":
         sys.exit(cmd_up(prof, a))
     if a.cmd == "fresh":
@@ -1424,14 +1521,17 @@ def main():
     if a.cmd == "audit":
         sys.exit(cmd_audit(prof))
     if a.cmd == "shell":
+        if not sandbox_exists(prof):
+            die(f"sandbox {prof.sandbox} not found - run `agentbox up {prof.name}` first", EXIT_NO_SANDBOX)
         start_bridge(prof)
         sys.exit(sbx(cfg, "exec", "-it", prof.sandbox, "bash", check=False).returncode)
     if a.cmd == "stop":
         stop_bridge(prof)
+        if not sandbox_exists(prof):
+            die(f"sandbox {prof.sandbox} not found", EXIT_NO_SANDBOX)
         sys.exit(sbx(cfg, "stop", prof.sandbox, check=False).returncode)
     if a.cmd == "tools":
-        print(tool_summary(cfg, prof.tool_names) or "(no host tools)")
-        sys.exit(0)
+        sys.exit(cmd_tools(prof, a.json))
     if a.cmd == "bridge":
         Bridge(prof).serve()
 

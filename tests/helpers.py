@@ -3,6 +3,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ class AgentboxTestCase(unittest.TestCase):
         """Run main() with argv; returns (exit_code, stdout, stderr)."""
         out, err = io.StringIO(), io.StringIO()
         code = 0
+        old_umask = os.umask(0o022)         # main() sets a restrictive umask; don't leak it
+        self.addCleanup(os.umask, old_umask)
         with mock.patch.object(sys, "argv", ["agentbox", *argv]), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -82,3 +85,33 @@ class AgentboxTestCase(unittest.TestCase):
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         return code, out.getvalue(), err.getvalue()
+
+
+class FakeSbx:
+    """Stand-in for ab.sbx. `exec_out` maps a marker found in the exec command to (rc, stdout);
+    anything unexpected fails the test."""
+
+    def __init__(self, exists=False, exec_out=None):
+        self.exists, self.exec_out, self.calls = exists, exec_out or {}, []
+
+    def __call__(self, cfg, *args, check=True, capture=False, stdin=None):
+        self.calls.append(args)
+        done = lambda rc=0, out="": subprocess.CompletedProcess(args, rc, out, "")
+        if args[0] == "version":
+            return done(0, "sbx 9.9.9\n")
+        if args == ("ls",):
+            return done(0, "NAME STATUS\n")
+        if args[:2] == ("kit", "validate"):
+            return done()
+        if args[0] == "exec":
+            for marker, (rc, out) in self.exec_out.items():
+                if marker in args[-1]:
+                    return done(rc, out)
+        raise AssertionError(f"unexpected sbx call: {args!r}")
+
+    def install(self, case):
+        for name, fn in (("sbx", self), ("sandbox_exists", lambda prof: self.exists)):
+            p = mock.patch.object(ab, name, fn)
+            p.start()
+            case.addCleanup(p.stop)
+        return self
