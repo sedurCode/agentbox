@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""hosttool - call allow-listed tools on the host from inside an agentbox sandbox.
+
+  hosttool list                         show available host tools and their parameters
+  hosttool ping                         check the bridge is reachable
+  hosttool <tool> [name=value ...] [-- extra args]
+
+Run it from inside the workspace: the bridge resolves relative paths against your
+current directory and refuses anything outside the mounted workspaces.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+URL = os.environ.get("HOSTTOOLS_URL", "").rstrip("/")
+TOKEN = os.environ.get("HOSTTOOLS_TOKEN", "")
+
+
+def call(method, path, body=None, timeout=3600):
+    if not URL or not TOKEN:
+        sys.exit("hosttool: HOSTTOOLS_URL / HOSTTOOLS_TOKEN not set - this sandbox has no host tools")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(URL + path, data=data, method=method,
+                                 headers={"X-Agentbox-Token": TOKEN,
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", str(e))
+        except Exception:
+            msg = str(e)
+        sys.exit(f"hosttool: {msg}")
+    except urllib.error.URLError as e:
+        sys.exit(f"hosttool: cannot reach host bridge at {URL} ({e.reason}). "
+                 "The user may need to run `agentbox up` / check `sbx policy log`.")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "ping":
+        print(json.dumps(call("GET", "/ping", timeout=10)))
+        return 0
+    if argv[0] == "list":
+        tools = call("GET", "/tools", timeout=10)
+        for name, t in tools.items():
+            print(f"{name}: {t['description']}  (timeout {t['timeout']}s)")
+            for p, spec in t["params"].items():
+                bits = [spec.get("type", "string")]
+                for k in ("values", "suffixes", "min", "max", "pattern", "default"):
+                    if k in spec:
+                        bits.append(f"{k}={spec[k]}")
+                print(f"    {p}: {', '.join(str(b) for b in bits)}")
+            if t["extra_args"]:
+                print("    -- extra args accepted (validated)")
+        return 0
+    tool, rest = argv[0], argv[1:]
+    params, extra = {}, []
+    if "--" in rest:
+        i = rest.index("--")
+        rest, extra = rest[:i], rest[i + 1:]
+    for kv in rest:
+        if "=" not in kv:
+            sys.exit(f"hosttool: expected name=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        params[k] = v
+    res = call("POST", "/run", {"tool": tool, "params": params, "args": extra, "cwd": os.getcwd()})
+    sys.stderr.write(f"[host] {' '.join(res['argv'])}  -> exit {res['exit_code']} in {res['seconds']}s\n")
+    if res["stdout"]:
+        sys.stdout.write(res["stdout"])
+    if res["stderr"]:
+        sys.stderr.write(res["stderr"])
+    if res.get("truncated"):
+        sys.stderr.write("[host] output truncated to the last 256 KiB\n")
+    return res["exit_code"]
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

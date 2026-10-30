@@ -1,0 +1,189 @@
+# agentbox config  ->  ~/.config/agentbox/agentbox.toml
+#
+# Keep this file (and ~/.config/agentbox/kits) OUTSIDE every workspace you mount.
+# Anything an agent can write to, it can use to widen its own permissions.
+
+[settings]
+sbx = "sbx"                          # or an absolute path, e.g. /opt/homebrew/bin/sbx
+name_prefix = "ab"                   # sandbox names become ab-<profile>
+state_dir = "~/.local/state/agentbox"
+forward_ssh_agent = false            # true = agent can use your SSH keys. Leave off.
+verbose = false                      # print every sbx command
+vscode = "code"                      # VS Code CLI for `agentbox code` (falls back to the app bundle)
+
+# ---------------------------------------------------------------------------
+# Defaults applied to every profile. allow / deny / kits are MERGED with the
+# profile's lists; everything else is overridden by the profile.
+[defaults]
+agent = "claude"
+mode = "direct"                      # direct: host files mounted read-write
+                                     # clone: agent works on its own git clone; you
+                                     #        `git fetch sandbox-<name>` to review (no host tools)
+deny = [
+  # Belt and braces on top of the global policy. Deny beats allow across all kits.
+  # "*.yourcompany.internal",
+  # "vault.yourcompany.com",
+]
+
+# ---------------------------------------------------------------------------
+# Profiles: one sandbox each.  agentbox up <profile>
+
+[profiles.h750]
+agent = "claude"                     # claude | copilot | codex | gemini | shell | junie (kit)
+workspace = "~/src/h750-firmware"
+extra_workspaces = [
+  "~/src/stm32-common:ro",           # read-only reference code
+]
+kits = ["embedded-arm"]              # toolchain inside the sandbox
+allow = [
+  "github.com", "codeload.github.com", "objects.githubusercontent.com",  # fetch deps (no creds)
+]
+env = { TARGET_MCU = "STM32H750IB" }
+vscode = true                        # allow VS Code server/Marketplace hosts for `agentbox code`
+host_tools = ["probe-info", "flash-elf", "fault-snapshot", "read-mem"]
+host_tools_port = 47111
+# confirm_host_tools = true          # approve every host-tool call with a dialog
+# Claude: log in once with /login inside the sandbox; sbx keeps the token on the host.
+secrets = []
+instructions = """
+Firmware for an STM32H750IB. Build in the sandbox with cmake/ninja.
+Only flash when asked. Use `hosttool fault-snapshot elf=<path>` to inspect a HardFault.
+"""
+
+[profiles.h750-copilot]
+agent = "copilot"
+workspace = "~/src/h750-firmware"
+kits = ["embedded-arm"]
+host_tools = ["probe-info"]
+host_tools_port = 47112
+secrets = [
+  # Use a fine-grained PAT with ONLY the "Copilot Requests" permission and no
+  # repository access, so the token can't push or read private repos.
+  # Stored in 1Password and resolved on the host at request time:
+  { service = "github", ref = "op://Private/copilot-cli-pat/credential" },
+  # or prompt once:   { service = "github" }
+  # (avoid `command = "gh auth token"` - that's your full-power gh token)
+]
+
+[profiles.h750-junie]
+agent = "junie"                      # resolves to ~/.config/agentbox/kits/junie
+workspace = "~/src/h750-firmware"
+kits = ["embedded-arm"]
+host_tools = ["probe-info"]
+host_tools_port = 47113
+# Junie: either sign in with your JetBrains account inside the sandbox (the token
+# then lives in the VM), or keep the key on the host with a custom secret once you
+# know which host Junie sends it to (`sbx policy log` shows it):
+# secrets = [ { custom = true, host = "<junie api host>", env = "JUNIE_API_KEY",
+#               ref = "op://Private/junie/credential" } ]
+# (or command = "security find-generic-password -s junie -w" for the macOS keychain;
+#  sbx resolves it on the host at request time - the value never appears on a command line)
+
+[profiles.scratch]
+agent = "shell"                      # agent-less shell for poking around
+workspace = "~/src/scratch"
+mode = "clone"
+
+# ---------------------------------------------------------------------------
+# Host tools. Each one is a FIXED argv run on the host with no shell.
+# The sandbox can only fill in typed {params}; nothing else.
+#
+# Param types:
+#   path   - resolved against the caller's cwd; must sit inside a mounted
+#            workspace. Options: must_exist (default true), kind = file|dir,
+#            suffixes = [".elf"]
+#   int    - accepts 123 / 0x7b. Options: min, max, format = "hex",
+#            ranges = [ {name, start, end}, ... ] (inclusive; value must be in one),
+#            span = { param = "words", scale = 4 } (the whole value .. value + words*4 - 1
+#            must be inside a single range)
+#   enum   - values = ["a", "b"]
+#   string - pattern = "<regex>" (full match), no leading '-' unless allow_leading_dash
+# Any param can have default = ...; required defaults to true otherwise.
+# Built-ins: {workspace} (root containing the caller's cwd), {cwd}.
+# An argv element that is exactly "{param}" is dropped if that optional param is omitted.
+# Other keys: timeout (s, default 60), lock (serialise tools sharing a name),
+#             env = { K = "v" } (the tool gets a clean env otherwise),
+#             cwd = "{workspace}" | "{cwd}" (default: an empty dir OUTSIDE the workspace,
+#                   because many tools load config from ./ - only opt in if the tool is safe there),
+#             max_calls = N, per_seconds = 60 (rate limit per tool),
+#             confirm = true (ask on the host with a macOS dialog before every call;
+#                   confirm_timeout = 120 s, no answer = deny). Or set
+#                   confirm_host_tools = true on a profile to confirm every tool.
+#             extra_args = { pattern = "...", max = 16, deny_prefixes = [...] }
+#
+# Rules the bridge enforces at start-up: argv[0] must be absolute and outside
+# every workspace, and fixed path arguments must be outside every workspace.
+#
+# Think before adding: if the tool reads a file that can make it run commands
+# (Makefile, CMakeLists.txt, .gdbinit, gdb Python auto-load, compiler plugins,
+# OpenOCD .cfg with TCL), exposing it means the agent can run code on your host.
+
+[tools.probe-info]
+description = "List attached ST-LINK probes and the connected target"
+argv = ["/opt/homebrew/bin/st-info", "--probe"]
+timeout = 20
+lock = "probe"
+
+[tools.flash-elf]
+description = "Program an ELF via ST-LINK (STM32CubeProgrammer), verify, reset"
+argv = [
+  "/Applications/STMicroelectronics/STM32Cube/STM32CubeProgrammer/STM32CubeProgrammer.app/Contents/MacOs/bin/STM32_Programmer_CLI",
+  "-c", "port=SWD", "mode=UR",
+  "-w", "{elf}", "-v", "-rst",
+  # H750 code in QSPI? add your external loader as a FIXED arg (path outside workspaces):
+  # "-el", "/Applications/STMicroelectronics/.../ExternalLoader/MT25TL01G_STM32H750B-DISCO.stldr",
+]
+params.elf = { type = "path", suffixes = [".elf", ".hex", ".bin"] }
+timeout = 180
+lock = "probe"
+confirm = true                     # macOS dialog on your Mac before each flash
+
+[tools.fault-snapshot]
+description = "Halt target, dump registers, backtrace, stack and Cortex-M7 fault status (needs OpenOCD/ST-LINK gdbserver on localhost:3333)"
+# -nx and 'set auto-load off': never run .gdbinit or Python embedded in an agent-built ELF.
+argv = [
+  "/opt/homebrew/bin/arm-none-eabi-gdb", "-nx", "-batch",
+  "-iex", "set auto-load off",
+  "-x", "~/.config/agentbox/gdb/fault-snapshot.gdb",
+  "{elf}",
+]
+params.elf = { type = "path", suffixes = [".elf"] }
+timeout = 60
+lock = "probe"
+
+[tools.read-mem]
+description = "Read N 32-bit words at an address from the halted target"
+argv = [
+  "/opt/homebrew/bin/arm-none-eabi-gdb", "-nx", "-batch",
+  "-iex", "set auto-load off",
+  "-ex", "set confirm off",
+  "-ex", "target extended-remote localhost:3333",
+  "-ex", "x/{words}wx {addr}",
+  "-ex", "detach",
+]
+# Memory-only: reading some peripheral registers has side effects (clears status flags,
+# pops UART/SPI FIFOs), so the peripheral space 0x40000000-0x5FFFFFFF and the system
+# space 0xE0000000+ are NOT allowed. The whole read (addr .. addr + words*4 - 1) must sit
+# inside ONE range. STM32H750 map (RM0433) - check against your part and linker script,
+# and remove ranges you don't want the agent reading (e.g. flash, if it holds keys).
+params.addr = { type = "int", format = "hex", span = { param = "words", scale = 4 }, ranges = [
+  { name = "ITCM",        start = 0x00000000, end = 0x0000FFFF },
+  { name = "Flash",       start = 0x08000000, end = 0x0801FFFF },
+  { name = "DTCM",        start = 0x20000000, end = 0x2001FFFF },
+  { name = "AXI SRAM",    start = 0x24000000, end = 0x2407FFFF },
+  { name = "SRAM1-3",     start = 0x30000000, end = 0x30047FFF },
+  { name = "SRAM4",       start = 0x38000000, end = 0x3800FFFF },
+  { name = "Backup SRAM", start = 0x38800000, end = 0x38800FFF },
+] }
+params.words = { type = "int", min = 1, max = 256, default = 16 }
+timeout = 30
+lock = "probe"
+max_calls = 30                       # rate limit: at most 30 reads ...
+per_seconds = 60                     # ... per minute
+
+# Example of what NOT to do lightly - running the build on the host means running
+# whatever the agent put in the Makefile, as you:
+# [tools.host-build]
+# description = "Build with the host toolchain"
+# argv = ["/usr/bin/make", "-C", "{workspace}", "-j8"]
+# timeout = 600

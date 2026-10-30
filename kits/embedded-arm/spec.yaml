@@ -1,0 +1,36 @@
+# Mixin: Arm bare-metal toolchain INSIDE the sandbox.
+# Prefer compiling in here - a compiler running on the host against
+# agent-written build files is host code execution in disguise.
+schemaVersion: "2"
+kind: mixin
+name: embedded-arm
+displayName: Arm embedded toolchain
+description: arm-none-eabi GCC/newlib, CMake, Ninja, gdb-multiarch, cppcheck, clang-format
+
+permissions:
+  network:
+    allow:
+      # package mirrors used by apt in the template (arm64 uses ports.ubuntu.com)
+      - "ports.ubuntu.com"
+      - "archive.ubuntu.com"
+      - "security.ubuntu.com"
+      - "deb.debian.org"
+
+setup:
+  install:
+    - command: >-
+        apt-get update &&
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+        gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+        binutils-arm-none-eabi cmake ninja-build make gdb-multiarch
+        cppcheck clang-format python3 &&
+        rm -rf /var/lib/apt/lists/*
+      user: "0"
+      description: Install Arm GNU toolchain and build tools
+
+agentInstructions:
+  content: |
+    ## Embedded toolchain
+    arm-none-eabi-gcc, cmake, ninja, make, gdb-multiarch, cppcheck and clang-format are
+    installed in this sandbox. Build and run static analysis here. Hardware (flashing,
+    debug probe) is only reachable through `hosttool` - see `hosttool list`.

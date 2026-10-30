@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+"""agentbox - profiles, scoped credentials and a host-tool bridge on top of
+Docker Sandboxes (`sbx`).
+
+    agentbox up <profile>        create (first time) or re-attach to the sandbox
+    agentbox shell <profile>     bash inside the sandbox
+    agentbox code <profile> [p]  open VS Code (Remote-SSH) inside the sandbox
+    agentbox tools <profile>     list the host tools this profile exposes
+    agentbox audit <profile>     show changes to build/hook/agent-config files
+    agentbox stop <profile>      stop the sandbox and the host-tool bridge
+    agentbox down <profile>      audit, then delete sandbox, scoped secrets, state
+    agentbox fresh <profile>     down + up (use after editing the profile)
+    agentbox status              sandboxes and bridges
+    agentbox doctor [<profile>]  sanity / security checks
+    agentbox bridge <profile>    run the host-tool bridge in the foreground
+
+Config: ~/.config/agentbox/agentbox.toml   (kept OUTSIDE every workspace)
+State:  ~/.local/state/agentbox/<sandbox>/
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import hmac
+import http.server
+import json
+import os
+import re
+import secrets as pysecrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    sys.exit("agentbox needs Python 3.11+ (e.g. `brew install python`)")
+import tomllib  # noqa: E402
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))
+CONFIG_FILE = CONFIG_DIR / "agentbox.toml"
+KITS_DIR = CONFIG_DIR / "kits"
+SHARE_DIR = Path(__file__).resolve().parent.parent / "share"
+
+BUILTIN_AGENTS = {"claude", "codex", "copilot", "cursor", "droid", "gemini",
+                  "kiro", "opencode", "docker-agent", "shell"}
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+
+DEFAULT_SETTINGS = {
+    "sbx": "sbx",
+    "name_prefix": "ab",
+    "state_dir": "~/.local/state/agentbox",
+    "forward_ssh_agent": False,
+    "verbose": False,
+    "vscode": "code",           # VS Code CLI; falls back to the app bundle on macOS
+    "audit_globs": [
+        ".git/config", ".git/hooks/*", ".gitmodules", ".gitattributes",
+        "Makefile", "makefile", "GNUmakefile", "*.mk", "**/*.mk",
+        "CMakeLists.txt", "**/CMakeLists.txt", "CMakePresets.json",
+        "CMakeUserPresets.json", "*.cmake", "**/*.cmake",
+        ".vscode/*", ".idea/*", ".idea/**/*", ".envrc", ".env", ".env.*",
+        ".github/workflows/*", ".gitlab-ci.yml", ".pre-commit-config.yaml",
+        ".gdbinit", "**/.gdbinit", "*.cfg", "openocd*.cfg",
+        ".claude/*", ".claude/**/*", ".mcp.json", "CLAUDE.md", "AGENTS.md",
+        ".junie/*", ".junie/**/*", ".github/copilot-instructions.md",
+        "sbxenv.yaml", ".sbxenv.yaml", ".sbx/**/*", ".devcontainer/*",
+        "package.json", "pyproject.toml", "setup.py", "tasks.py", "justfile",
+    ],
+    "audit_skip_dirs": ["build", "Build", "cmake-build-*", "node_modules",
+                        ".venv", "venv", "dist", "target", "Debug", "Release"],
+}
+
+DEFAULT_PROFILE = {
+    "agent": "claude",
+    "workspace": None,
+    "extra_workspaces": [],
+    "mode": "direct",           # direct | clone
+    "template": "",
+    "kits": [],
+    "allow": [],
+    "deny": [],
+    "env": {},
+    "secrets": [],
+    "host_tools": [],
+    "host_tools_port": 0,
+    "publish": [],
+    "agent_args": [],
+    "instructions": "",
+    "vscode": False,            # allow the hosts VS Code's remote server + extensions need
+    "confirm_host_tools": False,  # ask on the host (macOS dialog) before every host-tool call
+}
+
+# From https://code.visualstudio.com/docs/setup/network (server download + Marketplace).
+VSCODE_HOSTS = [
+    "update.code.visualstudio.com", "code.visualstudio.com",
+    "vscode.download.prss.microsoft.com", "download.visualstudio.microsoft.com",
+    "*.vscode-cdn.net", "marketplace.visualstudio.com",
+    "*.gallery.vsassets.io", "*.gallerycdn.vsassets.io", "*.vscode-unpkg.net",
+]
+VSCODE_APP_CLIS = [
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
+]
+MERGED_LISTS = ("allow", "deny", "kits")   # defaults + profile are unioned
+
+
+# ----------------------------------------------------------------- helpers
+def die(msg: str, code: int = 1):
+    print(f"agentbox: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str):
+    print(f"agentbox: {msg}", file=sys.stderr)
+
+
+def xp(p: str | Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(p)))).resolve()
+
+
+def is_within(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
+
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------------ config
+class Config:
+    def __init__(self):
+        if not CONFIG_FILE.exists():
+            die(f"no config at {CONFIG_FILE} - run install.sh or copy agentbox.example.toml there")
+        self.raw = tomllib.loads(CONFIG_FILE.read_text())
+        self.settings = {**DEFAULT_SETTINGS, **self.raw.get("settings", {})}
+        self.tools = self.raw.get("tools", {})
+        self.state_root = xp(self.settings["state_dir"])
+
+    def profile_names(self):
+        return sorted(self.raw.get("profiles", {}).keys())
+
+    def profile(self, name: str) -> "Profile":
+        profs = self.raw.get("profiles", {})
+        if name not in profs:
+            die(f"unknown profile '{name}'. Known: {', '.join(self.profile_names()) or '(none)'}")
+        if not NAME_RE.match(name):
+            die(f"profile name '{name}' must match {NAME_RE.pattern}")
+        defaults = self.raw.get("defaults", {})
+        merged = {**DEFAULT_PROFILE, **defaults, **profs[name]}
+        for key in MERGED_LISTS:
+            seen, out = set(), []
+            for v in list(defaults.get(key, [])) + list(profs[name].get(key, [])):
+                if v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            merged[key] = out
+        return Profile(self, name, merged)
+
+
+class Profile:
+    def __init__(self, cfg: Config, name: str, d: dict):
+        self.cfg, self.name, self.d = cfg, name, d
+        if not d.get("workspace"):
+            die(f"profile '{name}' needs `workspace = \"...\"`")
+        self.sandbox = f"{cfg.settings['name_prefix']}-{name}"
+        self.state = cfg.state_root / self.sandbox
+        self.primary = xp(d["workspace"])
+        self.extras: list[tuple[Path, bool]] = []      # (path, read_only)
+        for spec in d["extra_workspaces"]:
+            ro = False
+            if spec.endswith(":ro"):
+                spec, ro = spec[:-3], True
+            elif spec.endswith(":rw"):
+                spec = spec[:-3]
+            self.extras.append((xp(spec), ro))
+        if d["mode"] not in ("direct", "clone"):
+            die(f"profile '{name}': mode must be 'direct' or 'clone'")
+
+    # all host paths the sandbox can see (and so the agent can write to, unless :ro)
+    @property
+    def roots(self) -> list[Path]:
+        return [self.primary] + [p for p, _ in self.extras]
+
+    @property
+    def writable_roots(self) -> list[Path]:
+        return [self.primary] + [p for p, ro in self.extras if not ro]
+
+    @property
+    def tool_names(self) -> list[str]:
+        return list(self.d["host_tools"])
+
+    @property
+    def port(self) -> int:
+        p = int(self.d.get("host_tools_port") or 0)
+        if self.tool_names and not p:
+            die(f"profile '{self.name}' lists host_tools but has no host_tools_port")
+        return p
+
+    def agent_ref(self) -> str:
+        a = self.d["agent"]
+        if a in BUILTIN_AGENTS:
+            return a
+        return str(resolve_kit(a))
+
+    def kit_paths(self) -> list[Path]:
+        return [resolve_kit(k) for k in self.d["kits"]]
+
+
+def resolve_kit(ref: str) -> Path:
+    """A kit is a name under ~/.config/agentbox/kits or a path. Kits live outside
+    workspaces on purpose: a kit in the repo is agent-writable."""
+    cand = KITS_DIR / ref
+    p = cand if cand.is_dir() else xp(ref)
+    if not (p / "spec.yaml").exists():
+        die(f"kit '{ref}' not found (looked in {cand} and {p})")
+    return p
+
+
+# --------------------------------------------------------------- sbx shell
+def sbx_env(cfg: Config) -> dict:
+    env = dict(os.environ)
+    if not cfg.settings["forward_ssh_agent"]:
+        # sbx forwards the host SSH agent when SSH_AUTH_SOCK is set; that would
+        # let the agent authenticate as you anywhere your keys work.
+        env.pop("SSH_AUTH_SOCK", None)
+    return env
+
+
+SECRET_FLAGS = {"--value", "--token", "-t", "--password"}
+
+
+def redact(cmd: list[str]) -> str:
+    """For logs and error messages: hide the argument after any value-carrying flag."""
+    out, hide = [], False
+    for a in cmd:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        flag, eq, _ = a.partition("=")
+        if flag in SECRET_FLAGS:
+            if eq:
+                out.append(f"{flag}=<redacted>")
+            else:
+                out.append(a)
+                hide = True
+            continue
+        out.append(a)
+    return shlex.join(out)
+
+
+def sbx(cfg: Config, *args, check=True, capture=False, stdin=None):
+    cmd = [cfg.settings["sbx"], *[str(a) for a in args]]
+    if any(a.partition("=")[0] in SECRET_FLAGS for a in cmd[1:]):
+        # Belt and braces: agentbox itself never passes secret values on argv
+        # (visible to `ps` and process inspection), so refuse if anything tries to.
+        die("internal error: refusing to pass a secret value on the sbx command line")
+    if cfg.settings["verbose"]:
+        info("+ " + redact(cmd))
+    try:
+        return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True,
+                              capture_output=capture, input=stdin)
+    except FileNotFoundError:
+        die(f"'{cfg.settings['sbx']}' not found - brew trust docker/tap && brew install docker/tap/sbx")
+    except subprocess.CalledProcessError as e:
+        die(f"`{redact(cmd)}` failed (exit {e.returncode})"
+            + (f"\n{e.stderr}" if e.stderr else ""))
+
+
+def sandbox_exists(prof: Profile) -> bool:
+    r = sbx(prof.cfg, "inspect", prof.sandbox, check=False, capture=True)
+    return r.returncode == 0
+
+
+# ----------------------------------------------------- generated kit (YAML)
+def yaml_dump(obj, indent=0) -> str:
+    """Tiny YAML emitter; scalars are JSON-quoted (valid YAML)."""
+    pad = "  " * indent
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and v:
+                out.append(f"{pad}{k}:")
+                out.append(yaml_dump(v, indent + 1))
+            else:
+                out.append(f"{pad}{k}: {json.dumps(v) if not isinstance(v, (dict, list)) else ('{}' if isinstance(v, dict) else '[]')}")
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, dict):
+                lines = yaml_dump(v, indent + 1).split("\n")
+                out.append(f"{pad}- {lines[0].lstrip()}")
+                out.extend(lines[1:])
+            else:
+                out.append(f"{pad}- {json.dumps(v)}")
+    return "\n".join(out)
+
+
+def tool_summary(cfg: Config, names: list[str]) -> str:
+    lines = []
+    for n in names:
+        t = cfg.tools.get(n, {})
+        params = t.get("params", {})
+        ps = " ".join(f"{k}=<{v.get('type', 'string')}{'' if v.get('required', 'default' not in v) else '?'}>"
+                      for k, v in params.items())
+        extra = " [-- extra args]" if t.get("extra_args") else ""
+        lines.append(f"- `hosttool {n} {ps}{extra}`".rstrip() + f" - {t.get('description', '')}")
+    return "\n".join(lines)
+
+
+def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
+    """Per-sandbox mixin: network allow/deny, env, host-tool client, instructions.
+    Stored in the state dir (not a workspace), so the agent can't edit it."""
+    cfg = prof.cfg
+    allow = list(prof.d["allow"])
+    if prof.d.get("vscode"):
+        allow += [h for h in VSCODE_HOSTS if h not in allow]
+    env = {str(k): str(v) for k, v in prof.d["env"].items()}
+    env["AGENTBOX_PROFILE"] = prof.name
+    instructions = [
+        "# Sandbox rules (agentbox)",
+        "You are running inside a Docker Sandboxes microVM managed by agentbox.",
+        "- Network egress is allow-listed; if a host is blocked, say so and ask the user - do not try to work around it.",
+        "- There are no git push credentials or production secrets in here, by design. Commit locally; the user reviews and pushes.",
+        "- Do not edit git hooks, CI config, editor task files or anything under .sbx/ unless asked; these are reviewed separately.",
+    ]
+    setup = {"install": []}
+    files = {}
+    if prof.tool_names:
+        allow.append(f"localhost:{prof.port}")
+        env["HOSTTOOLS_URL"] = f"http://host.docker.internal:{prof.port}"
+        env["HOSTTOOLS_TOKEN"] = token
+        files["home/.agentbox/hosttool"] = (SHARE_DIR / "hosttool").read_text()
+        setup["install"].append({
+            "command": "install -m 0755 /home/agent/.agentbox/hosttool /usr/local/bin/hosttool"
+                       " && (command -v python3 >/dev/null || (apt-get update && apt-get install -y python3))",
+            "user": "0",
+            "description": "Install agentbox hosttool client",
+        })
+        instructions += [
+            "",
+            "## Host tools",
+            "Some tools run on the user's host machine (hardware access, licensed tools). Call them with `hosttool`;"
+            " run `hosttool list` for details. Run it from inside the workspace - paths are checked against it.",
+            tool_summary(cfg, prof.tool_names),
+            "Host tools are deliberately narrow. If you need something they don't allow, ask the user.",
+        ]
+    if prof.d.get("instructions"):
+        instructions += ["", prof.d["instructions"]]
+    spec = {
+        "schemaVersion": "2",
+        "kind": "mixin",
+        "name": f"{prof.sandbox}-local"[:64],
+        "displayName": f"agentbox {prof.name}",
+        "description": "Generated by agentbox - do not edit; edit agentbox.toml instead",
+        "permissions": {"network": {k: v for k, v in (("allow", allow), ("deny", list(prof.d["deny"]))) if v}},
+        "environment": {"variables": env},
+        "agentInstructions": {"content": "\n".join(instructions) + "\n"},
+    }
+    if not spec["permissions"]["network"]:
+        del spec["permissions"]
+    if setup["install"]:
+        spec["setup"] = setup
+    text = "# generated by agentbox - edit ~/.config/agentbox/agentbox.toml instead\n" + yaml_dump(spec) + "\n"
+    kit_dir = prof.state / "kit"
+    if kit_dir.exists():
+        shutil.rmtree(kit_dir)
+    (kit_dir / "files").mkdir(parents=True)
+    (kit_dir / "spec.yaml").write_text(text)
+    for rel, content in files.items():
+        p = kit_dir / "files" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    digest = hashlib.sha256((text + json.dumps(files, sort_keys=True)
+                             + json.dumps(prof.d, sort_keys=True, default=str)).encode()).hexdigest()
+    return str(kit_dir), digest
+
+
+def secure_state(cfg: Config):
+    """State holds the bridge token (in `token` and in the generated kit's spec.yaml),
+    logs and snapshots. Make it owner-only, including anything created by older versions."""
+    root = cfg.state_root
+    root.mkdir(parents=True, exist_ok=True)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in [dirpath] + [os.path.join(dirpath, n) for n in dirnames]:
+            try:
+                if not os.path.islink(d):
+                    os.chmod(d, 0o700)
+            except OSError:
+                pass
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                if not os.path.islink(fp):
+                    os.chmod(fp, 0o600)
+            except OSError:
+                pass
+    st = root.stat()
+    if st.st_uid != os.getuid():
+        die(f"state dir {root} is owned by uid {st.st_uid}, not you - refusing to use it")
+
+
+def get_token(prof: Profile) -> str:
+    tf = prof.state / "token"
+    if not tf.exists():
+        prof.state.mkdir(parents=True, exist_ok=True)
+        tf.write_text(pysecrets.token_urlsafe(32))
+        tf.chmod(0o600)
+    return tf.read_text().strip()
+
+
+# -------------------------------------------------------------- audit
+# IMPORTANT: nothing in the audit may run git (or any tool) on the host against a
+# workspace. An agent controls .git/config in direct mode, and git honours settings
+# that execute commands (core.fsmonitor runs on `git status`, textconv/diff drivers on
+# `git diff`, hooks on commit, ...). The audit reads files with Python only; git
+# status is run inside the sandbox.
+
+# Config keys that make git run a program, change where it runs things from, or
+# redirect where it talks to. Patterns are "section.key" or "section.*.key".
+RISKY_GIT_KEYS = [
+    "core.fsmonitor", "core.hookspath", "core.sshcommand", "core.pager", "core.editor",
+    "core.askpass", "core.gitproxy", "core.alternaterefscommand", "core.worktree",
+    "core.attributesfile", "core.excludesfile",
+    "sequence.editor", "gpg.program", "gpg.*.program", "ssh.variant",
+    "credential.helper", "credential.*.helper",
+    "diff.external", "diff.*.command", "diff.*.textconv", "merge.*.driver",
+    "filter.*.clean", "filter.*.smudge", "filter.*.process",
+    "pager.*", "alias.*", "web.browser", "browser.*.cmd", "browser.*.path", "man.*.cmd",
+    "difftool.*.cmd", "difftool.*.path", "mergetool.*.cmd", "mergetool.*.path",
+    "remote.*.uploadpack", "remote.*.receivepack", "remote.*.vcs", "remote.*.proxy",
+    "url.*.insteadof", "url.*.pushinsteadof", "http.proxy", "http.*.proxy",
+    "uploadpack.packobjectshook", "interactive.difffilter", "submodule.*.update",
+    "include.path", "includeif.*.path", "safe.directory", "sendemail.*",
+]
+
+
+def parse_git_config(path: Path) -> list[tuple[str, str]]:
+    """Lenient git-config reader -> [("section[.sub].key", value)]. Never runs git."""
+    out, section = [], ""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return out
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        while line.endswith("\\") and i < len(lines):
+            line = line[:-1] + lines[i].strip()
+            i += 1
+        if not line or line[0] in "#;":
+            continue
+        m = re.match(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\](.*)$', line)
+        if m:
+            sec, sub = m.group(1).lower(), m.group(2)
+            section = f"{sec}.{sub}" if sub is not None else sec
+            line = m.group(3).strip()        # `[core] fsmonitor = x` on one line
+            if not line or line[0] in "#;":
+                continue
+        k, _, v = line.partition("=")
+        key = k.strip().lower()
+        if key:
+            out.append((f"{section}.{key}" if section else key, v.strip().strip('"') if _ else "true"))
+    return out
+
+
+def _risky(name: str) -> bool:
+    parts = name.split(".")
+    if len(parts) < 2:
+        return False
+    sec, key = parts[0].lower(), parts[-1].lower()
+    for pat in RISKY_GIT_KEYS:
+        ps = pat.split(".")
+        if len(ps) == 2 and ps[0] == sec and len(parts) == 2 and fnmatch.fnmatch(key, ps[1]):
+            return True
+        if len(ps) == 3 and ps[0] == sec and len(parts) >= 3 and fnmatch.fnmatch(key, ps[2]):
+            return True
+        if len(ps) == 2 and ps[1] == "*" and ps[0] == sec:      # e.g. alias.*, pager.*
+            return True
+    return False
+
+
+def git_dir_of(root: Path) -> Path | None:
+    g = root / ".git"
+    if g.is_symlink():
+        return g                      # reported as a finding by risky_git_config
+    if g.is_dir():
+        return g
+    if g.is_file():                   # worktree / submodule: "gitdir: <path>"
+        try:
+            m = re.match(r"gitdir:\s*(.+)", g.read_text().strip())
+        except OSError:
+            return None
+        if m:
+            p = Path(m.group(1))
+            return (root / p).resolve() if not p.is_absolute() else p.resolve()
+    return None
+
+
+def risky_git_config(root: Path) -> list[str]:
+    """Findings as printable strings, following include/includeIf paths (max depth 5)."""
+    gd = git_dir_of(root)
+    if gd is None:
+        return []
+    findings = []
+    if (root / ".git").is_symlink():
+        findings.append(f".git is a symlink -> {os.readlink(root / '.git')}")
+    elif not (root / ".git").is_dir():
+        findings.append(f".git is a file pointing at {gd}")
+    seen: set[Path] = set()
+
+    def walk(cfg: Path, depth: int):
+        if depth > 5 or cfg in seen:
+            return
+        seen.add(cfg)
+        label = str(cfg.relative_to(root)) if is_within(cfg, root) else str(cfg)
+        for name, val in parse_git_config(cfg):
+            if _risky(name):
+                findings.append(f"{label}: {name} = {val}")
+            if name == "include.path" or (name.startswith("includeif.") and name.endswith(".path")):
+                p = Path(os.path.expanduser(val))
+                walk((cfg.parent / p).resolve() if not p.is_absolute() else p.resolve(), depth + 1)
+
+    for name in ("config", "config.worktree"):
+        if (gd / name).is_file():
+            walk((gd / name).resolve(), 0)
+    return findings
+
+
+def _scan(root: Path, globs: list[str], skip: list[str]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        if rel_dir.parts and rel_dir.parts[0] == ".git":
+            if len(rel_dir.parts) == 1:
+                dirnames[:] = [d for d in dirnames if d == "hooks"]
+            else:
+                dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in dirnames
+                           if not any(fnmatch.fnmatch(d, s) for s in skip)]
+        for fn in filenames:
+            rel = str(rel_dir / fn) if rel_dir.parts else fn
+            if any(fnmatch.fnmatch(rel, g) for g in globs):
+                if rel.startswith(".git/hooks/") and rel.endswith(".sample"):
+                    continue
+                fp = Path(dirpath) / fn
+                try:
+                    st = fp.lstat()
+                except OSError:
+                    continue
+                # Never follow symlinks or open FIFOs/devices: a symlink could point
+                # outside the workspace, a FIFO would hang the audit.
+                if fp.is_symlink():
+                    found[rel] = "symlink:" + os.readlink(fp)
+                    continue
+                if not stat_is_regular(st.st_mode):
+                    found[rel] = "special-file"
+                    continue
+                try:
+                    found[rel] = sha256_file(fp)
+                except OSError:
+                    pass
+    return found
+
+
+def stat_is_regular(mode: int) -> bool:
+    import stat as _stat
+    return _stat.S_ISREG(mode)
+
+
+def snapshot(prof: Profile) -> dict:
+    s = prof.cfg.settings
+    return {str(r): _scan(r, s["audit_globs"], s["audit_skip_dirs"])
+            for r in prof.writable_roots if r.exists()}
+
+
+def git_snapshot(prof: Profile) -> dict:
+    return {str(r): risky_git_config(r) for r in prof.writable_roots if r.exists()}
+
+
+def write_snapshot(prof: Profile):
+    prof.state.mkdir(parents=True, exist_ok=True)
+    (prof.state / "snapshot.json").write_text(json.dumps(
+        {"time": time.time(), "files": snapshot(prof), "gitcfg": git_snapshot(prof)}, indent=1))
+
+
+def sandbox_git_status(prof: Profile, root: str) -> str | None:
+    """Run `git status` INSIDE the sandbox (where running repo-controlled code is fine).
+    Returns output, or None if the sandbox isn't available."""
+    if not sandbox_exists(prof):
+        return None
+    try:
+        r = subprocess.run([prof.cfg.settings["sbx"], "exec", prof.sandbox,
+                            "git", "-C", root, "status", "--short"],
+                           env=sbx_env(prof.cfg), capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def cmd_audit(prof: Profile) -> int:
+    snap_file = prof.state / "snapshot.json"
+    if not snap_file.exists():
+        info("no snapshot for this profile (created before first `up`?)")
+        return 1
+    old = json.loads(snap_file.read_text())
+    new = snapshot(prof)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(old["time"]))
+    print(f"Changes to sensitive files since sandbox creation ({when}):")
+    flagged = 0
+    old_git = old.get("gitcfg", {})
+    danger = False
+    for root, findings in git_snapshot(prof).items():
+        if findings:
+            before = set(old_git.get(root, []))
+            print(f"\n  !! {root}: git config settings that can run commands or redirect git:")
+            for f in findings:
+                print(f"     {'NEW ' if f not in before else '    '}{f}")
+            danger = danger or any(f not in before for f in findings)
+    if danger:
+        print("\n  !! DO NOT run git (status, diff, commit, push...) on the host in that repo until you've"
+              "\n     checked .git/config (and any included files) in a plain text editor.")
+    for root, files in new.items():
+        before = old["files"].get(root, {})
+        added = sorted(set(files) - set(before))
+        removed = sorted(set(before) - set(files))
+        changed = sorted(k for k in set(files) & set(before) if files[k] != before[k])
+        if added or removed or changed:
+            print(f"\n  {root}")
+            for k in added:
+                print(f"    + {k}")
+            for k in changed:
+                print(f"    ~ {k}")
+            for k in removed:
+                print(f"    - {k}")
+            flagged += len(added) + len(changed) + len(removed)
+        hooks = [k for k in files if k.startswith(".git/hooks/")]
+        if hooks:
+            print(f"  NOTE {root}: active git hooks present: {', '.join(hooks)}")
+        if (Path(root) / ".git").exists():
+            out = sandbox_git_status(prof, root)
+            if out is None:
+                print("  git status: skipped (sandbox not available; agentbox never runs git on the host here)")
+            elif out.strip():
+                n = len(out.strip().splitlines())
+                print(f"  git status (run in sandbox): {n} changed path(s) - review with"
+                      f" `agentbox shell {prof.name}` then `git diff`")
+    if not flagged and not danger:
+        print("  none")
+    else:
+        print("\nReview these before running builds, git commands or IDE tasks on the host:"
+              " they can execute code outside the sandbox.")
+    return 0
+
+
+# -------------------------------------------------------------- bridge
+class ToolError(Exception):
+    pass
+
+
+def _expand_literal(s: str) -> str:
+    return os.path.expandvars(os.path.expanduser(s)) if s.startswith(("~", "$")) else s
+
+
+class Bridge:
+    MAX_OUT = 256 * 1024
+
+    def __init__(self, prof: Profile):
+        self.prof = prof
+        self.cfg = prof.cfg
+        self.roots = [r for r in prof.roots]
+        self.token = get_token(prof)
+        self.locks: dict[str, threading.Lock] = {}
+        self.confirm_lock = threading.Lock()
+        self.rate_lock = threading.Lock()
+        self.calls: dict[str, list[float]] = {}
+        self.log_path = prof.state / "bridge.log"
+        self.tools = {}
+        for n in prof.tool_names:
+            if n not in self.cfg.tools:
+                die(f"profile '{prof.name}' references unknown tool '{n}'")
+            self.tools[n] = self.cfg.tools[n]
+        self.preflight()
+
+    def preflight(self):
+        for r in self.roots:
+            if is_within(CONFIG_FILE.resolve(), r) or is_within(KITS_DIR.resolve(), r):
+                die(f"config/kits live inside workspace {r}: the agent could grant itself tools. Move them.")
+        for n, t in self.tools.items():
+            argv = t.get("argv")
+            if not argv or not isinstance(argv, list):
+                die(f"tool '{n}': argv must be a non-empty list")
+            exe = Path(_expand_literal(argv[0]))
+            if not exe.is_absolute():
+                die(f"tool '{n}': argv[0] must be an absolute path (got {argv[0]})")
+            rexe = exe.resolve()
+            if not rexe.exists() or not os.access(rexe, os.X_OK):
+                info(f"warning: tool '{n}': {exe} is not executable/present - calls will fail")
+            for r in self.roots:
+                if is_within(rexe, r):
+                    die(f"tool '{n}': executable {exe} is inside workspace {r} (agent-writable)")
+            for a in argv[1:]:
+                lit = Path(_expand_literal(a))
+                if lit.is_absolute() and "{" not in a:
+                    for r in self.roots:
+                        if is_within(lit.resolve(), r):
+                            die(f"tool '{n}': fixed argument {a} points inside workspace {r} (agent-writable)")
+
+    # ---- validation
+    def _root_for(self, p: Path) -> Path | None:
+        for r in self.roots:
+            if is_within(p, r):
+                return r
+        return None
+
+    def _param(self, tname: str, pname: str, spec: dict, raw, cwd: Path) -> str:
+        typ = spec.get("type", "string")
+        if not isinstance(raw, (str, int)):
+            raise ToolError(f"{pname}: must be a string")
+        raw = str(raw)
+        if typ == "path":
+            p = Path(raw)
+            p = (cwd / p if not p.is_absolute() else p).resolve()
+            if not self._root_for(p):
+                raise ToolError(f"{pname}: {p} is outside the mounted workspaces")
+            if spec.get("must_exist", True) and not p.exists():
+                raise ToolError(f"{pname}: {p} does not exist")
+            kind = spec.get("kind", "file")
+            if p.exists() and kind == "file" and not p.is_file():
+                raise ToolError(f"{pname}: {p} is not a file")
+            if p.exists() and kind == "dir" and not p.is_dir():
+                raise ToolError(f"{pname}: {p} is not a directory")
+            suf = spec.get("suffixes")
+            if suf and not any(str(p).endswith(s) for s in suf):
+                raise ToolError(f"{pname}: must end with one of {suf}")
+            return str(p)
+        if typ == "int":
+            try:
+                v = int(raw, 0)
+            except ValueError:
+                raise ToolError(f"{pname}: not an integer: {raw!r}")
+            if "min" in spec and v < int(spec["min"]):
+                raise ToolError(f"{pname}: below minimum {spec['min']}")
+            if "max" in spec and v > int(spec["max"]):
+                raise ToolError(f"{pname}: above maximum {spec['max']}")
+            if spec.get("ranges") and not spec.get("span") and not self._in_ranges(spec["ranges"], v, v):
+                raise ToolError(f"{pname}: {hex(v)} is outside the allowed ranges: {self._fmt_ranges(spec['ranges'])}")
+            return hex(v) if spec.get("format") == "hex" else str(v)
+        if typ == "enum":
+            vals = [str(v) for v in spec.get("values", [])]
+            if raw not in vals:
+                raise ToolError(f"{pname}: must be one of {vals}")
+            return raw
+        if typ == "string":
+            pat = spec.get("pattern", r"[A-Za-z0-9_.,:=+/-]{1,128}")
+            if not re.fullmatch(pat, raw):
+                raise ToolError(f"{pname}: does not match {pat}")
+            if raw.startswith("-") and not spec.get("allow_leading_dash"):
+                raise ToolError(f"{pname}: may not start with '-'")
+            return raw
+        raise ToolError(f"tool '{tname}' param '{pname}': unknown type {typ}")
+
+    @staticmethod
+    def _ranges(rs) -> list[tuple[int, int, str]]:
+        out = []
+        for r in rs:
+            if isinstance(r, dict):
+                out.append((int(r["start"]), int(r["end"]), str(r.get("name", ""))))
+            else:
+                out.append((int(r[0]), int(r[1]), ""))
+        return out
+
+    def _in_ranges(self, rs, lo: int, hi: int) -> bool:
+        return any(a <= lo and hi <= b for a, b, _ in self._ranges(rs))
+
+    def _fmt_ranges(self, rs) -> str:
+        return ", ".join(f"{n + ' ' if n else ''}{a:#010x}-{b:#010x}" for a, b, n in self._ranges(rs))
+
+    def check_rate(self, tname: str, t: dict):
+        n = t.get("max_calls")
+        if not n:
+            return
+        per = float(t.get("per_seconds", 60))
+        now = time.monotonic()
+        with self.rate_lock:
+            q = [x for x in self.calls.get(tname, []) if now - x < per]
+            if len(q) >= int(n):
+                self.calls[tname] = q
+                raise ToolError(f"rate limit: {tname} allows {n} calls per {per:g}s - wait, or ask the user")
+            q.append(now)
+            self.calls[tname] = q
+
+    def build(self, tname: str, params: dict, extra: list, cwd_s: str):
+        t = self.tools.get(tname)
+        if not t:
+            raise ToolError(f"unknown tool '{tname}'. Available: {', '.join(self.tools)}")
+        cwd = Path(cwd_s or "/").resolve()
+        ws = self._root_for(cwd)
+        if not ws:
+            raise ToolError(f"cwd {cwd} is not inside a mounted workspace; cd into the project first")
+        specs = t.get("params", {})
+        unknown = set(params) - set(specs)
+        if unknown:
+            raise ToolError(f"unknown parameter(s): {', '.join(sorted(unknown))}")
+        values = {"workspace": str(ws), "cwd": str(cwd)}
+        for pname, spec in specs.items():
+            if pname in params:
+                values[pname] = self._param(tname, pname, spec, params[pname], cwd)
+            elif "default" in spec:
+                values[pname] = self._param(tname, pname, spec, spec["default"], cwd)
+            elif spec.get("required", True):
+                raise ToolError(f"missing required parameter '{pname}'")
+        # Range + span check: e.g. addr .. addr + words*4 - 1 must lie inside ONE allowed
+        # range, so a read can't start in RAM and run on into peripheral registers.
+        for pname, spec in specs.items():
+            span = spec.get("span")
+            if spec.get("type") == "int" and spec.get("ranges") and span and pname in values:
+                start = int(values[pname], 0)
+                n = int(values.get(span["param"], "1"), 0)
+                end = start + n * int(span.get("scale", 1)) - 1
+                if not self._in_ranges(spec["ranges"], start, end):
+                    raise ToolError(f"{pname}: {hex(start)}..{hex(end)} is not inside one allowed range:"
+                                    f" {self._fmt_ranges(spec['ranges'])}")
+        argv = []
+        for a in t["argv"]:
+            whole = re.fullmatch(r"\{(\w+)\}", a)
+            if whole and whole.group(1) not in values:
+                continue   # optional param omitted -> drop the argument
+            def sub(m):
+                k = m.group(1)
+                if k not in values:
+                    raise ToolError(f"parameter '{k}' needed by this argument")
+                return values[k]
+            argv.append(re.sub(r"\{(\w+)\}", sub, _expand_literal(a)))
+        ea = t.get("extra_args")
+        if extra:
+            if not ea:
+                raise ToolError("this tool takes no extra arguments")
+            if len(extra) > int(ea.get("max", 16)):
+                raise ToolError("too many extra arguments")
+            pat = ea.get("pattern", r"[A-Za-z0-9_.,:=+/-]{1,200}")
+            deny = ea.get("deny_prefixes", [])
+            for x in extra:
+                if not isinstance(x, str) or not re.fullmatch(pat, x):
+                    raise ToolError(f"extra argument {x!r} does not match {pat}")
+                if any(x.startswith(d) for d in deny):
+                    raise ToolError(f"extra argument {x!r} is not allowed")
+            argv += extra
+        # Default working dir is an empty dir outside every workspace: many tools load
+        # config from ./ (OpenOCD reads ./openocd.cfg, gdb ./.gdbinit, make ./Makefile).
+        # Opt in per tool with cwd = "{workspace}" or "{cwd}" only if the tool is safe there.
+        default_cwd = str(self.safe_cwd)
+        run_cwd = re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), ""), t.get("cwd", default_cwd))
+        return t, argv, run_cwd
+
+    @property
+    def safe_cwd(self) -> Path:
+        p = self.prof.state / "tool-cwd"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def needs_confirm(self, t: dict) -> bool:
+        return bool(t.get("confirm", self.prof.d.get("confirm_host_tools", False)))
+
+    def confirm(self, tname: str, argv: list[str], timeout: int) -> bool:
+        """Ask the human on the host. macOS dialog; anything else -> deny."""
+        if sys.platform != "darwin" or not shutil.which("osascript"):
+            self.log({"tool": tname, "confirm": "denied", "reason": "no dialog available (non-macOS)"})
+            return False
+        msg = (f"Sandbox {self.prof.sandbox} wants to run on this Mac:\n\n"
+               + shlex.join(argv)[:900])
+        # argv is passed as an AppleScript run argument, never spliced into the script.
+        script = ["-e", "on run argv",
+                  "-e", "display dialog (item 1 of argv) with title \"agentbox host tool\" "
+                        "buttons {\"Deny\", \"Allow\"} default button \"Deny\" cancel button \"Deny\" "
+                        "with icon caution giving up after " + str(int(timeout)),
+                  "-e", "return button returned of result",
+                  "-e", "end run"]
+        try:
+            r = subprocess.run(["osascript", *script, msg], capture_output=True, text=True,
+                               timeout=timeout + 10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0 and r.stdout.strip() == "Allow"
+
+    def run(self, tname, params, extra, cwd):
+        t, argv, run_cwd = self.build(tname, params, extra, cwd)
+        self.check_rate(tname, t)
+        env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+               "HOME": str(HOME), "LANG": os.environ.get("LANG", "en_US.UTF-8")}
+        env.update({k: _expand_literal(str(v)) for k, v in t.get("env", {}).items()})
+        lock = self.locks.setdefault(t.get("lock", tname), threading.Lock())
+        timeout = int(t.get("timeout", 60))
+        if self.needs_confirm(t):
+            with self.confirm_lock:          # one dialog at a time
+                ok = self.confirm(tname, argv, int(t.get("confirm_timeout", 120)))
+            self.log({"tool": tname, "argv": argv, "confirm": "allowed" if ok else "denied"})
+            if not ok:
+                raise ToolError("denied by the user on the host (or no answer)")
+        t0 = time.time()
+        with lock:
+            try:
+                p = subprocess.run(argv, cwd=run_cwd, env=env, capture_output=True,
+                                   timeout=timeout, stdin=subprocess.DEVNULL)
+                rc, out, err = p.returncode, p.stdout, p.stderr
+            except subprocess.TimeoutExpired as e:
+                rc, out, err = 124, e.stdout or b"", (e.stderr or b"") + f"\n[agentbox] timed out after {timeout}s".encode()
+            except OSError as e:
+                rc, out, err = 127, b"", str(e).encode()
+        res = {
+            "tool": tname, "argv": argv, "exit_code": rc, "seconds": round(time.time() - t0, 2),
+            "stdout": out[-self.MAX_OUT:].decode(errors="replace"),
+            "stderr": err[-self.MAX_OUT:].decode(errors="replace"),
+            "truncated": len(out) > self.MAX_OUT or len(err) > self.MAX_OUT,
+        }
+        self.log({"tool": tname, "argv": argv, "cwd": run_cwd, "exit_code": rc, "seconds": res["seconds"]})
+        return res
+
+    def log(self, rec):
+        rec["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def describe(self):
+        return {n: {"description": t.get("description", ""),
+                    "params": t.get("params", {}),
+                    "extra_args": bool(t.get("extra_args")),
+                    "timeout": int(t.get("timeout", 60))} for n, t in self.tools.items()}
+
+    # ---- HTTP
+    def handler(self):
+        bridge = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            server_version = "agentbox-bridge"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _authed(self):
+                tok = self.headers.get("X-Agentbox-Token", "")
+                if not hmac.compare_digest(tok, bridge.token):
+                    bridge.log({"denied": self.path, "reason": "bad token"})
+                    self._send(401, {"error": "bad or missing token"})
+                    return False
+                return True
+
+            def do_GET(self):
+                if not self._authed():
+                    return
+                if self.path == "/ping":
+                    return self._send(200, {"ok": True, "profile": bridge.prof.name})
+                if self.path == "/tools":
+                    return self._send(200, bridge.describe())
+                self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                if not self._authed():
+                    return
+                if self.path != "/run":
+                    return self._send(404, {"error": "not found"})
+                n = int(self.headers.get("Content-Length", "0"))
+                if n > 65536:
+                    return self._send(413, {"error": "request too large"})
+                try:
+                    req = json.loads(self.rfile.read(n) or b"{}")
+                    res = bridge.run(req.get("tool", ""), req.get("params") or {},
+                                     req.get("args") or [], req.get("cwd", ""))
+                    self._send(200, res)
+                except ToolError as e:
+                    bridge.log({"rejected": req.get("tool") if isinstance(req, dict) else None, "reason": str(e)})
+                    self._send(400, {"error": str(e)})
+                except (ValueError, AttributeError) as e:
+                    self._send(400, {"error": f"bad request: {e}"})
+        return H
+
+    def serve(self):
+        port = self.prof.port
+        servers = []
+
+        class V6(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        for cls, addr in ((http.server.ThreadingHTTPServer, "127.0.0.1"), (V6, "::1")):
+            try:
+                servers.append(cls((addr, port), self.handler()))
+            except OSError as e:
+                if addr == "127.0.0.1":
+                    die(f"cannot bind 127.0.0.1:{port}: {e}")
+        for s in servers[1:]:
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+        info(f"bridge for '{self.prof.name}' on localhost:{port} - tools: {', '.join(self.tools)}")
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        try:
+            servers[0].serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+def bridge_pid(prof: Profile) -> int | None:
+    pf = prof.state / "bridge.pid"
+    if not pf.exists():
+        return None
+    try:
+        pid = int(pf.read_text().strip())
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True).stdout
+        if "agentbox" in cmd and "bridge" in cmd:
+            return pid
+    except (ValueError, OSError):
+        pass
+    pf.unlink(missing_ok=True)
+    return None
+
+
+def start_bridge(prof: Profile):
+    if not prof.tool_names or bridge_pid(prof):
+        return
+    prof.state.mkdir(parents=True, exist_ok=True)
+    Bridge(prof)  # preflight in the foreground so errors are visible
+    log = open(prof.state / "bridge.out", "a")
+    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bridge", prof.name],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                         start_new_session=True, env={k: v for k, v in os.environ.items()
+                                                      if k in ("PATH", "HOME", "LANG", "USER", "AGENTBOX_CONFIG_DIR")})
+    (prof.state / "bridge.pid").write_text(str(p.pid))
+    time.sleep(0.5)
+    if p.poll() is not None:
+        die(f"bridge exited immediately - see {prof.state / 'bridge.out'}")
+    info(f"host-tool bridge running (pid {p.pid}, localhost:{prof.port})")
+
+
+def stop_bridge(prof: Profile):
+    pid = bridge_pid(prof)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        info(f"stopped bridge (pid {pid})")
+    (prof.state / "bridge.pid").unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------- commands
+def set_secrets(prof: Profile):
+    for s in prof.d["secrets"]:
+        if isinstance(s, str):
+            s = {"service": s}
+        if s.get("custom"):
+            host, envn = s.get("host"), s.get("env")
+            if not host or not envn:
+                die("custom secret needs host and env")
+            # Hand sbx the SOURCE (op:// ref or a command it runs on the host), never the
+            # value: values on argv are visible to `ps`, and agentbox never needs to see them.
+            if s.get("ref"):
+                src = ["--ref", s["ref"]]
+            elif s.get("command"):
+                src = ["--command", s["command"]]
+            else:
+                die(f"custom secret {envn}: set `ref = \"op://...\"` or `command = \"...\"` "
+                    "(e.g. command = \"security find-generic-password -s junie -w\" for the macOS keychain)")
+            info(f"custom secret {envn} -> {host} (sandbox-scoped, resolved on the host by sbx)")
+            sbx(prof.cfg, "secret", "set-custom", "--sandbox", prof.sandbox,
+                "--host", host, "--env", envn, *src)
+            continue
+        svc = s.get("service")
+        if not svc:
+            die(f"secret entry without service: {s}")
+        args = ["secret", "set", svc, "--sandbox", prof.sandbox]
+        if s.get("ref"):
+            args += ["--ref", s["ref"]]
+        elif s.get("command"):
+            args += ["--command", s["command"]]
+        info(f"secret '{svc}' (sandbox-scoped)")
+        sbx(prof.cfg, *args)
+
+
+def remove_secrets(prof: Profile):
+    for s in prof.d["secrets"]:
+        if isinstance(s, str):
+            s = {"service": s}
+        if s.get("service") and not s.get("custom"):
+            sbx(prof.cfg, "secret", "rm", s["service"], "--sandbox", prof.sandbox, check=False, capture=True)
+
+
+def ensure_sandbox(prof: Profile):
+    """Create the sandbox if needed (without attaching) and start the bridge."""
+    cfg = prof.cfg
+    for r in prof.roots:
+        if not r.exists():
+            die(f"workspace {r} does not exist")
+    if prof.tool_names and prof.d["mode"] == "clone":
+        die("host tools need mode = \"direct\": in clone mode the code lives only inside the VM")
+    token = get_token(prof)
+    kit_dir, digest = render_local_kit(prof, token)
+    digest_file = prof.state / "kit.digest"
+
+    if sandbox_exists(prof):
+        if digest_file.exists() and digest_file.read_text() != digest:
+            info("profile/config changed since this sandbox was created; kits apply at creation only."
+                 f" Run `agentbox fresh {prof.name}` to rebuild.")
+        start_bridge(prof)
+    else:
+        kits = [str(p) for p in prof.kit_paths()] + [kit_dir]
+        create = ["create", "--name", prof.sandbox]
+        if prof.d["mode"] == "clone":
+            create.append("--clone")
+        if prof.d.get("template"):
+            create += ["--template", prof.d["template"]]
+        for k in kits:
+            create += ["--kit", k]
+        create.append(prof.agent_ref())
+        create.append(str(prof.primary))
+        for p, ro in prof.extras:
+            create.append(f"{p}:ro" if ro else str(p))
+        write_snapshot(prof)
+        start_bridge(prof)
+        info(f"creating sandbox {prof.sandbox}")
+        sbx(cfg, *create)
+        digest_file.write_text(digest)
+        set_secrets(prof)
+        for p in prof.d["publish"]:
+            sbx(cfg, "ports", prof.sandbox, "--publish", p, check=False)
+
+
+def cmd_up(prof: Profile, args) -> int:
+    cfg = prof.cfg
+    ensure_sandbox(prof)
+    run = ["run", prof.sandbox]
+    agent_args = list(args.agent_args or prof.d["agent_args"])
+    if agent_args:
+        run += ["--", *agent_args]
+    r = sbx(cfg, *run, check=False)
+    print(f"\nSession ended (sandbox {prof.sandbox} still exists).\n"
+          f"  review host-side risk:  agentbox audit {prof.name}\n"
+          f"  pause:                  agentbox stop {prof.name}\n"
+          f"  destroy everything:     agentbox down {prof.name}")
+    return r.returncode
+
+
+def find_vscode(cfg: Config) -> str:
+    c = cfg.settings["vscode"]
+    found = shutil.which(c) or (c if Path(c).is_file() else None)
+    if found:
+        return found
+    for p in VSCODE_APP_CLIS:
+        if Path(p).is_file():
+            return p
+    die(f"VS Code CLI '{c}' not found. In VS Code run 'Shell Command: Install code command in PATH',"
+        " or set `vscode = \"/path/to/code\"` in [settings]")
+
+
+def ssh_config_has_sbx() -> bool:
+    f = HOME / ".ssh" / "config"
+    return f.exists() and "docker sandboxes (managed)" in f.read_text(errors="replace")
+
+
+def cmd_code(prof: Profile, args) -> int:
+    cfg = prof.cfg
+    code = find_vscode(cfg)
+    host = f"{prof.sandbox}.sbx"
+    if not shutil.which("ssh"):
+        die("ssh client not found")
+    folder = xp(args.path) if args.path else prof.primary
+    if prof.d["mode"] == "direct" and not any(is_within(folder, r) for r in prof.roots):
+        die(f"{folder} isn't one of this sandbox's workspaces: {', '.join(map(str, prof.roots))}")
+    if not ssh_config_has_sbx():
+        info("configuring SSH for *.sbx hosts (sbx setup ssh)")
+        sbx(cfg, "setup", "ssh")
+
+    # Our ~/.ssh/config could still forward the agent (e.g. `Host *` + ForwardAgent yes);
+    # VS Code Remote-SSH honours that. Refuse rather than leak the SSH agent in.
+    eff = subprocess.run(["ssh", "-G", host], capture_output=True, text=True).stdout.lower()
+    if "\nforwardagent yes" in "\n" + eff and not cfg.settings["forward_ssh_agent"]:
+        die(f"your SSH config forwards the agent to {host}. Add this ABOVE any `Host *` block in ~/.ssh/config:\n\n"
+            "    Host *.sbx\n        ForwardAgent no\n")
+
+    if not prof.d.get("vscode"):
+        info(f"profile '{prof.name}' doesn't set `vscode = true`, so VS Code's server download and"
+             " Marketplace may be blocked. Either set it and `agentbox fresh`, or set"
+             " \"remote.SSH.localServerDownload\": \"always\" in VS Code to copy the server from your Mac.")
+
+    ensure_sandbox(prof)
+
+    info(f"checking SSH to {host}")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=60", host, "true"],
+                       env=sbx_env(cfg), capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"`ssh {host} true` failed:\n{r.stderr.strip()}\n"
+            f"Is the sandbox running? Try `agentbox up {prof.name}` (or `sbx ls`), then re-run."
+            " For host-key errors: delete the 'docker sandboxes (managed)' block in ~/.ssh/config and run `sbx setup ssh`.")
+
+    info(f"opening {folder} in VS Code on {host}")
+    subprocess.run([code, "--remote", f"ssh-remote+{host}", str(folder)], env=sbx_env(cfg), check=False)
+    print(f"Terminals, tasks, debuggers and extensions in that window run inside {prof.sandbox}.\n"
+          f"Run `agentbox audit {prof.name}` before using these files in a local (non-remote) window.")
+    return 0
+
+
+def cmd_down(prof: Profile, args) -> int:
+    if (prof.state / "snapshot.json").exists():
+        cmd_audit(prof)
+        print()
+    stop_bridge(prof)
+    if sandbox_exists(prof):
+        sbx(prof.cfg, "rm", prof.sandbox, check=False)
+    remove_secrets(prof)
+    if not args.keep_state and prof.state.exists():
+        shutil.rmtree(prof.state)
+    info(f"{prof.sandbox} removed")
+    return 0
+
+
+def cmd_status(cfg: Config) -> int:
+    sbx(cfg, "ls", check=False)
+    print()
+    for n in cfg.profile_names():
+        try:
+            prof = cfg.profile(n)
+        except SystemExit:
+            continue
+        pid = bridge_pid(prof) if prof.state.exists() else None
+        tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
+        print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}")
+    return 0
+
+
+def cmd_doctor(cfg: Config, name: str | None) -> int:
+    ok = True
+
+    def chk(cond, msg, hint=""):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + msg + ("" if cond else f"\n         -> {hint}"))
+        ok &= bool(cond)
+
+    print("host")
+    v = sbx(cfg, "version", check=False, capture=True)
+    chk(v.returncode == 0, f"sbx present: {(v.stdout or '').strip().splitlines()[0] if v.stdout else '?'}",
+        "brew trust docker/tap && brew install docker/tap/sbx && sbx login")
+    print(f"  info config: {CONFIG_FILE}")
+    if cfg.settings["forward_ssh_agent"]:
+        print("  warn forward_ssh_agent = true: the agent can use your SSH keys (push, ssh to servers)")
+    names = [name] if name else cfg.profile_names()
+    for n in names:
+        prof = cfg.profile(n)
+        print(f"\nprofile {n} ({prof.sandbox})")
+        for r in prof.roots:
+            chk(r.exists(), f"workspace {r}", "fix the path in agentbox.toml")
+            chk(not is_within(CONFIG_FILE.resolve(), r), "config is outside the workspace",
+                "move agentbox.toml out of the workspace")
+            if (r / ".git").exists():
+                # read config with Python only - never run git against an agent-writable repo
+                findings = risky_git_config(r)
+                if findings:
+                    print(f"  warn {r}: git config entries that can run commands (check them before using git on the host):")
+                    for f in findings:
+                        print(f"         {f}")
+                print(f"  info {r}: hooks in .git/hooks run on the host when you commit; a global"
+                      " core.hooksPath helps, but a repo-level core.hooksPath overrides it - `agentbox audit` flags that")
+        for k in prof.kit_paths():
+            rv = sbx(cfg, "kit", "validate", "--offline", k, check=False, capture=True)
+            if rv.returncode != 0:
+                rv = sbx(cfg, "kit", "validate", k, check=False, capture=True)
+            chk(rv.returncode == 0, f"kit {k.name} validates", (rv.stderr or rv.stdout or "").strip()[:400])
+        kit_dir, _ = render_local_kit(prof, get_token(prof))
+        rv = sbx(cfg, "kit", "validate", "--offline", kit_dir, check=False, capture=True)
+        if rv.returncode != 0:
+            rv = sbx(cfg, "kit", "validate", kit_dir, check=False, capture=True)
+        chk(rv.returncode == 0, "generated kit validates", (rv.stderr or rv.stdout or "").strip()[:400])
+        if prof.tool_names:
+            try:
+                Bridge(prof)
+                chk(True, f"host tools preflight: {', '.join(prof.tool_names)}")
+            except SystemExit:
+                chk(False, "host tools preflight", "see message above")
+        if sandbox_exists(prof):
+            probe = ("echo SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset}; "
+                     "env | grep -iE '(key|token|secret|passw)' | grep -v HOSTTOOLS_TOKEN | sed 's/=.*/=<set>/'; "
+                     "command -v hosttool >/dev/null && hosttool ping || echo hosttool=absent")
+            r = sbx(cfg, "exec", prof.sandbox, "sh", "-c", probe, check=False, capture=True)
+            out = r.stdout or ""
+            print("  inside sandbox:\n    " + "\n    ".join(out.strip().splitlines()))
+            if not cfg.settings["forward_ssh_agent"]:
+                chk("SSH_AUTH_SOCK=unset" in out, "no SSH agent forwarded",
+                    "restart the sbx daemon from a shell without SSH_AUTH_SOCK: `env -u SSH_AUTH_SOCK sbx daemon stop; env -u SSH_AUTH_SOCK sbx daemon start`")
+            if prof.tool_names:
+                chk('"ok": true' in out or "pong" in out, "hosttool reaches the bridge",
+                    f"is the bridge up? `agentbox up {n}`; check `sbx policy log` for localhost:{prof.port}")
+        else:
+            print("  (sandbox not created yet - in-sandbox checks skipped)")
+    print("\n" + ("all good" if ok else "problems found"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agentbox", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("up"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
+    for c in ("shell", "tools", "audit", "stop", "bridge"):
+        sub.add_parser(c).add_argument("profile")
+    p = sub.add_parser("down"); p.add_argument("profile"); p.add_argument("--keep-state", action="store_true")
+    p = sub.add_parser("fresh"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
+    p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
+    sub.add_parser("status")
+    p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?")
+    a = ap.parse_args()
+
+    os.umask(0o077)          # everything agentbox creates (token, kit, logs) is owner-only
+    cfg = Config()
+    secure_state(cfg)
+    if a.cmd == "status":
+        sys.exit(cmd_status(cfg))
+    if a.cmd == "doctor":
+        sys.exit(cmd_doctor(cfg, a.profile))
+    prof = cfg.profile(a.profile)
+    if a.cmd == "up":
+        sys.exit(cmd_up(prof, a))
+    if a.cmd == "fresh":
+        a.keep_state = False
+        cmd_down(prof, a)
+        sys.exit(cmd_up(cfg.profile(a.profile), a))
+    if a.cmd == "down":
+        sys.exit(cmd_down(prof, a))
+    if a.cmd == "code":
+        sys.exit(cmd_code(prof, a))
+    if a.cmd == "audit":
+        sys.exit(cmd_audit(prof))
+    if a.cmd == "shell":
+        start_bridge(prof)
+        sys.exit(sbx(cfg, "exec", "-it", prof.sandbox, "bash", check=False).returncode)
+    if a.cmd == "stop":
+        stop_bridge(prof)
+        sys.exit(sbx(cfg, "stop", prof.sandbox, check=False).returncode)
+    if a.cmd == "tools":
+        print(tool_summary(cfg, prof.tool_names) or "(no host tools)")
+        sys.exit(0)
+    if a.cmd == "bridge":
+        Bridge(prof).serve()
+
+
+if __name__ == "__main__":
+    main()
