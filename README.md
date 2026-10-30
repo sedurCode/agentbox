@@ -443,6 +443,13 @@ until you `git fetch sandbox-ab-<profile>` and merge. Safest for untrusted repos
 | Protected | host filesystem outside mounts; host Docker; LAN, private IPs and host localhost (except the bridge port); other sandboxes; API keys/OAuth tokens (proxy-injected); SSH keys; git push rights; egress to non-allowed hosts |
 | Not protected | anything in a rw mount (incl. `.git/`); data sent to allowed hosts (an agent can upload your code to any host you allow — keep allow-lists short); what host tools do with agent-supplied files; tokens you choose to put in the VM (Junie login, `env`) |
 
+Text that comes out of the VM is agent-controlled, so agentbox never prints it raw: file names and git
+config values in `audit`, `logs` (rendered and `--raw`), `doctor`'s in-sandbox lines, and `sbx` stderr
+echoed in errors all go through one `safe_text()` that turns control characters (ESC, CR, BEL, DEL, the
+C1 range, line-separator and bidi-override characters) into visible `\xNN` / `\uNNNN` escapes. Otherwise
+an escape sequence in a file name or log line could rewrite your screen or write your clipboard (OSC 52).
+`--json` output is already escaped by the JSON encoder. Tab and newline are kept.
+
 ## 8. Troubleshooting
 
 - **Something blocked** → `sbx policy log`; add the host to the profile's `allow`, then

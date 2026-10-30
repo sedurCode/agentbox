@@ -129,13 +129,26 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NO_SANDBOX = 0, 1, 2, 3
 EXIT_TIMEOUT, EXIT_LOST = 4, 5          # `wait`: --timeout expired / the job's process is gone
 
 
+# Text that came out of the VM (file names, git config values, agent output, sbx stderr) is
+# agent-controlled. Printed raw on the host terminal, an escape sequence could rewrite the
+# screen, set the title, or write the clipboard (OSC 52). safe_text() makes it visible instead.
+UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def safe_text(s) -> str:
+    """Escape C0 controls (except \\t and \\n, so ESC and CR too), DEL, C1 controls and the
+    line-separator / bidi-override characters as \\xNN / \\uNNNN."""
+    return UNSAFE_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}" if ord(m.group()) < 256
+                            else f"\\u{ord(m.group()):04x}", str(s))
+
+
 def die(msg: str, code: int = EXIT_FAIL):
-    print(f"agentbox: {msg}", file=sys.stderr)
+    print(f"agentbox: {safe_text(msg)}", file=sys.stderr)
     sys.exit(code)
 
 
 def info(msg: str):
-    print(f"agentbox: {msg}", file=sys.stderr)
+    print(f"agentbox: {safe_text(msg)}", file=sys.stderr)
 
 
 def xp(p: str | Path) -> Path:
@@ -289,7 +302,7 @@ def sbx(cfg: Config, *args, check=True, capture=False, stdin=None):
     if cfg.settings["verbose"]:
         info("+ " + redact(cmd))
     try:
-        return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True,
+        return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True, errors="replace",
                               capture_output=capture, input=stdin)
     except FileNotFoundError:
         die(f"'{cfg.settings['sbx']}' not found - brew trust docker/tap && brew install docker/tap/sbx")
@@ -697,7 +710,7 @@ def cmd_audit(prof: Profile) -> int:
             before = set(old_git.get(root, []))
             print(f"\n  !! {root}: git config settings that can run commands or redirect git:")
             for f in findings:
-                print(f"     {'NEW ' if f not in before else '    '}{f}")
+                print(f"     {'NEW ' if f not in before else '    '}{safe_text(f)}")
             danger = danger or any(f not in before for f in findings)
     if danger:
         print("\n  !! DO NOT run git (status, diff, commit, push...) on the host in that repo until you've"
@@ -710,15 +723,15 @@ def cmd_audit(prof: Profile) -> int:
         if added or removed or changed:
             print(f"\n  {root}")
             for k in added:
-                print(f"    + {k}")
+                print(f"    + {safe_text(k)}")
             for k in changed:
-                print(f"    ~ {k}")
+                print(f"    ~ {safe_text(k)}")
             for k in removed:
-                print(f"    - {k}")
+                print(f"    - {safe_text(k)}")
             flagged += len(added) + len(changed) + len(removed)
         hooks = [k for k in files if k.startswith(".git/hooks/")]
         if hooks:
-            print(f"  NOTE {root}: active git hooks present: {', '.join(hooks)}")
+            print(f"  NOTE {root}: active git hooks present: {safe_text(', '.join(hooks))}")
         if (Path(root) / ".git").exists():
             out = sandbox_git_status(prof, root)
             if out is None:
@@ -1344,6 +1357,7 @@ def cmd_down(prof: Profile, args) -> int:
 # its own command line. The prompt travels on stdin only, never on an argv.
 JOB_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 JOB_DIR = '"$HOME/.agentbox/jobs/{id}"'
 HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resumes a session
     "claude": {"cmd": ["claude", "-p", "--output-format", "stream-json", "--verbose",
@@ -1364,18 +1378,21 @@ def check_job_id(job_id: str) -> str:
 
 
 def probe_script(job_id: str) -> str:
-    """sh run in the VM: print the job's state files and the live process's cmdline. Also
-    caches the session id (from the stream's first session_id) into the job dir."""
+    """sh run in the VM: print the live process's cmdline and the job's state files, and cache the
+    session id (from the stream's first session_id) into the job dir. ORDER MATTERS: look at the
+    process first and the files after. The wrapper writes exit_code before it exits, so a process
+    seen dead already has its exit_code on disk; reading the files first would call a job that
+    finishes mid-probe "lost" (and a lost job is cached for good)."""
     d = JOB_DIR.format(id=check_job_id(job_id))
     return (
         f'd={d}; echo "D $d"; [ -d "$d" ] || {{ echo MISSING; exit 0; }}; '
+        'p=$(cat "$d/pid" 2>/dev/null); case $p in *[!0-9]*|"") p=;; esac; '
+        '[ -n "$p" ] && [ -r "/proc/$p/cmdline" ] && echo "CMD $(tr \'\\0\' \' \' < "/proc/$p/cmdline")"; '
         'if [ ! -s "$d/session_id" ]; then grep -m1 -o \'"session_id":"[^"]*"\' "$d/output.jsonl" 2>/dev/null '
         '| head -n1 | sed \'s/.*"session_id":"\\([^"]*\\)".*/\\1/\' > "$d/session_id.tmp"; '
         '[ -s "$d/session_id.tmp" ] && mv "$d/session_id.tmp" "$d/session_id" || rm -f "$d/session_id.tmp"; fi; '
-        'for f in pid exit_code started_at finished_at session_id; do '
-        '[ -f "$d/$f" ] && echo "F $f $(head -c 80 "$d/$f" | tr -d \'\\n\')"; done; '
-        'p=$(cat "$d/pid" 2>/dev/null); case $p in *[!0-9]*|"") p=;; esac; '
-        '[ -n "$p" ] && [ -r "/proc/$p/cmdline" ] && echo "CMD $(tr \'\\0\' \' \' < "/proc/$p/cmdline")"; true')
+        'for f in pid started_at finished_at session_id exit_code; do '
+        '[ -f "$d/$f" ] && echo "F $f $(head -c 80 "$d/$f" | tr -d \'\\n\')"; done; true')
 
 
 def hold_script(job_id: str) -> str:
@@ -1447,7 +1464,11 @@ def job_summary(job_id: str, state: str, files: dict) -> dict:
     return {"id": job_id, "state": state,
             "exit_code": (int(code) if code and code.lstrip("-").isdigit() else 1) if state == "finished" else None,
             "session_id": sid if sid and SESSION_ID_RE.match(sid) else None,
-            "started_at": files.get("started_at") or None, "finished_at": files.get("finished_at") or None}
+            "started_at": _timestamp(files.get("started_at")), "finished_at": _timestamp(files.get("finished_at"))}
+
+
+def _timestamp(value) -> str | None:
+    return value if isinstance(value, str) and TIMESTAMP_RE.match(value) else None
 
 
 def probe_job(prof: Profile, job_id: str) -> dict | None:
@@ -1509,27 +1530,31 @@ def _squash(text, width: int = 200) -> str:
 
 
 def render_stream_line(line: str) -> str | None:
-    """One human line for a stream-json event (assistant text, tool calls, init, result)."""
+    """One human line for a stream-json event (assistant text, tool calls, init, result).
+    Everything in it is agent-controlled, so the result is passed through safe_text()."""
     try:
         ev = json.loads(line)
     except ValueError:
-        return f"? {_squash(line)}" if line.strip() else None
+        return safe_text(f"? {_squash(line)}") if line.strip() else None
     if not isinstance(ev, dict):
         return None
     kind = ev.get("type")
     if kind == "system" and ev.get("subtype") == "init":
-        return f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}"
+        return safe_text(f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}")
     if kind == "assistant":
         parts = []
         content = (ev.get("message") or {}).get("content")
         for block in content if isinstance(content, list) else []:
-            if block.get("type") == "text" and block.get("text", "").strip():
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and str(block.get("text", "")).strip():
                 parts.append(f"assistant: {_squash(block['text'])}")
             elif block.get("type") == "tool_use":
-                parts.append(f"tool: {block.get('name', '?')} {_squash(json.dumps(block.get('input', {})), 120)}")
-        return "\n".join(parts) or None
+                parts.append(f"tool: {_squash(block.get('name', '?'), 60)} "
+                             f"{_squash(json.dumps(block.get('input', {})), 120)}")
+        return safe_text("\n".join(parts)) or None
     if kind == "result":
-        return f"[result] {ev.get('subtype', '?')}: {_squash(ev.get('result', ''))}".rstrip(": ")
+        return safe_text(f"[result] {ev.get('subtype', '?')}: {_squash(ev.get('result', ''))}".rstrip(": "))
     return None
 
 
@@ -1678,7 +1703,7 @@ def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
         lines = fetch_new_lines(prof, job_id, have, getattr(args, "start", False))
         have += len(lines)
         for ln in lines:
-            shown = ln if args.raw else render_stream_line(ln)
+            shown = safe_text(ln) if args.raw else render_stream_line(ln)
             if shown:
                 print(shown, flush=True)
         if not follow:
@@ -1791,7 +1816,7 @@ def cmd_status(cfg: Config, as_json: bool = False) -> int:
         pid = bridge_pid(prof) if prof.state.exists() else None
         tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
         job = job_info(prof)
-        jobs = f" job={job['id']} {job['state']}" if job["state"] != "none" else ""
+        jobs = f" job={safe_text(job['id'])} {job['state']}" if job["state"] != "none" else ""
         print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}{jobs}")
     return EXIT_OK
 
@@ -1876,7 +1901,7 @@ class Report:
 
     def say(self, text: str = ""):
         if not self.as_json:
-            print(text)
+            print(safe_text(text))
 
     def add(self, status: str, msg: str, hint: str = "", details=(), data=None):
         item = {"profile": self.scope, "status": status, "message": msg}

@@ -41,9 +41,18 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ab.classify_job(probe(files={"pid": "4x"}, cmdline=f"sh {self.wrapper}")), "lost")
 
     def test_summary_validates_values(self):
-        s = ab.job_summary(JOB, "finished", {"exit_code": "3", "session_id": "bad id!", "started_at": "t0"})
-        self.assertEqual((s["exit_code"], s["session_id"], s["started_at"]), (3, None, "t0"))
+        s = ab.job_summary(JOB, "finished", {"exit_code": "3", "session_id": "bad id!", "started_at": "2026-01-01T00:00:00Z",
+                                             "finished_at": "yesterday"})
+        self.assertEqual((s["exit_code"], s["session_id"], s["started_at"], s["finished_at"]),
+                         (3, None, "2026-01-01T00:00:00Z", None))
         self.assertIsNone(ab.job_summary(JOB, "running", {"exit_code": "3"})["exit_code"])
+
+    def test_probe_looks_at_the_process_before_the_files(self):
+        # A job that finishes mid-probe must read as finished, never lost: exit_code is written
+        # before the process exits, so the files have to be read AFTER the process check.
+        script = ab.probe_script(JOB)
+        self.assertLess(script.index("/proc/$p/cmdline"), script.index("for f in pid"))
+        self.assertLess(script.index("for f in pid"), script.index("exit_code"))
 
     def test_job_ids_are_validated(self):
         with self.assertRaises(SystemExit):

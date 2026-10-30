@@ -210,6 +210,7 @@ class LocalVM:
             return done()
         if args[0] == "exec" and args[-3:-1] == ("sh", "-c"):
             with mock.patch.object(subprocess, "Popen", REAL_POPEN):
-                r = REAL_RUN(["sh", "-c", args[-1]], env=self.env, input=stdin, capture_output=True, text=True)
+                r = REAL_RUN(["sh", "-c", args[-1]], env=self.env, input=stdin, capture_output=True, text=True,
+                             errors="replace")
             return done(r.returncode, r.stdout, r.stderr)
         raise AssertionError(f"unexpected sbx call: {args!r}")
