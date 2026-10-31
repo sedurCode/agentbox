@@ -54,5 +54,14 @@ class RenderLocalKitTests(AgentboxTestCase):
         self.assertNotEqual(d1, d2)
 
 
+class ShippedKitTests(unittest.TestCase):
+    def test_claude_team_env_after_model(self):
+        from helpers import ROOT
+        spec = (ROOT / "kits" / "claude-team" / "spec.yaml").read_text()
+        env = spec.split("environment:\n  variables:\n")[1].split("\n\n")[0].splitlines()
+        self.assertEqual(env[0].strip(), 'ANTHROPIC_MODEL: "opusplan"')
+        self.assertTrue(env[1].strip().startswith('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"'))
+
+
 if __name__ == "__main__":
     unittest.main()

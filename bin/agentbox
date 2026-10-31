@@ -1257,7 +1257,7 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
 def cmd_up(prof: Profile, args) -> int:
     cfg = prof.cfg
     ensure_sandbox(prof)
-    run = ["run", prof.sandbox]
+    run = ["run", "--name", prof.sandbox]
     agent_args = list(args.agent_args or prof.d["agent_args"])
     if agent_args:
         run += ["--", *agent_args]
@@ -1405,8 +1405,11 @@ def hold_script(job_id: str) -> str:
 
 
 def kill_script(job_id: str) -> str:
-    """sh run in the VM: signal the job's wrapper (and its process group) - the ONLY place a job
-    pid read from a file is signalled. The pid file is agent-writable, so never trust it: it must
+    """sh run in the VM: signal the job's wrapper and what it started - the ONLY place a job pid
+    read from a file is signalled. With setsid the wrapper leads its own process group and the whole
+    group gets the signal; without it (no `setsid` in the VM) there is no such group, so the
+    wrapper's direct children are signalled first (pkill -P, or /proc/*/stat if pkill is absent)
+    and then the wrapper. The pid file is agent-writable, so never trust it: it must
     be digits, > 1 (PID 1 is the VM's init: TERM to it takes the whole sandbox down), not this
     shell or its parent, and /proc/<pid>/cmdline must contain THIS job's wrap.sh path."""
     d = JOB_DIR.format(id=check_job_id(job_id))
@@ -1415,7 +1418,12 @@ def kill_script(job_id: str) -> str:
             '[ "$p" -gt 1 ] 2>/dev/null || exit 0; '
             '[ "$p" -ne "$$" ] && [ "$p" -ne "$PPID" ] || exit 0; '
             'grep -qa -- "$w" "/proc/$p/cmdline" 2>/dev/null || exit 0; '
-            'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; true')
+            'if kill -TERM -- "-$p" 2>/dev/null; then :; else '
+            'if command -v pkill >/dev/null 2>&1; then pkill -TERM -P "$p" 2>/dev/null; '
+            'else for s in /proc/[0-9]*/stat; do read -r l < "$s" 2>/dev/null || continue; '
+            'set -- ${l##*) }; [ "$2" = "$p" ] || continue; c=${s#/proc/}; c=${c%/stat}; '
+            '[ "$c" -gt 1 ] 2>/dev/null && kill -TERM "$c" 2>/dev/null; done; fi; '
+            'kill -TERM "$p" 2>/dev/null; fi; true')
 
 
 def parse_probe(out: str) -> dict:
@@ -1684,15 +1692,16 @@ def require_running(prof: Profile, start: bool = False):
         + (" (pass --start to boot it)" if vm == "stopped" else ""), EXIT_NO_SANDBOX)
 
 
-def fetch_new_lines(prof: Profile, job_id: str, have: int, start: bool = False) -> list[str]:
-    """Complete lines of output.jsonl after the first `have` ones."""
+def fetch_new_lines(prof: Profile, job_id: str, have: int, start: bool = False, final: bool = False) -> list[str]:
+    """Complete lines of output.jsonl after the first `have` ones. A last line without its newline
+    is still being written, unless the job is over (`final`): then it is the real end of the output."""
     require_running(prof, start)
     d = JOB_DIR.format(id=job_id)
     r = vm_exec(prof, f'tail -n +{have + 1} {d}/output.jsonl 2>/dev/null')
     if r.returncode != 0:
         die(f"could not read the job output (exit {r.returncode}) - is {prof.sandbox} running?")
-    text = r.stdout or ""
-    return text.split("\n")[:-1]          # a trailing partial line is picked up next time
+    *lines, partial = (r.stdout or "").split("\n")
+    return lines + [partial] if final and partial else lines
 
 
 def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
@@ -1700,8 +1709,8 @@ def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
     follow = args.follow if follow is None else follow
     have, delays = 0, poll_delays(1.0, 10.0)
     while True:
-        j = job_info(prof, job_id) if follow else None
-        lines = fetch_new_lines(prof, job_id, have, getattr(args, "start", False))
+        j = job_info(prof, job_id)          # sampled BEFORE the read, so a finished job's tail is complete
+        lines = fetch_new_lines(prof, job_id, have, getattr(args, "start", False), final=j["state"] != "running")
         have += len(lines)
         for ln in lines:
             shown = safe_text(ln) if args.raw else render_stream_line(ln)
@@ -1777,7 +1786,7 @@ def cmd_resume(prof: Profile, args) -> int:
     if not SESSION_ID_RE.match(sid):          # belt and braces: the id comes from an agent-writable file
         die(f"refusing to resume: malformed session id for job {job_id}")
     # `--resume=<id>` (claude accepts it) so the id can never be read as a separate option
-    return sbx(prof.cfg, "run", prof.sandbox, "--", f"{spec['resume']}={sid}", check=False).returncode
+    return sbx(prof.cfg, "run", "--name", prof.sandbox, "--", f"{spec['resume']}={sid}", check=False).returncode
 
 
 def emit_json(obj):

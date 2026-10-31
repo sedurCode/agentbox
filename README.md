@@ -91,7 +91,7 @@ Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing one
 |---|---|
 | `embedded-arm` | arm-none-eabi GCC/newlib, CMake, Ninja, gdb-multiarch, cppcheck, clang-format |
 | `junie` | JetBrains Junie CLI as an agent (`agent = "junie"`) |
-| `claude-team` | Claude model routing, **Claude profiles only**: `ANTHROPIC_MODEL=opusplan` (Opus when planning, Sonnet when executing) plus user-level subagents `reader` (Haiku, read-only lookup), `worker` (Sonnet, scoped edits and tests) and `architect` (Opus, read-only design/review), and delegation instructions. Use as `kits = [..., "claude-team"]` |
+| `claude-team` | Claude model routing, **Claude profiles only**: `ANTHROPIC_MODEL=opusplan` (Opus when planning, Sonnet when executing), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry/error reporting; blocked by the allow-list anyway), plus user-level subagents `reader` (Haiku, read-only lookup), `worker` (Sonnet, scoped edits and tests) and `architect` (Opus, read-only design/review), and delegation instructions. Use as `kits = [..., "claude-team"]` |
 | `python-node` | Python 3 with venv/pip, Node and git, plus the Ubuntu/Debian package hosts needed to install them |
 
 **Keep the config and kits out of every workspace.** A kit in the repo is agent-writable,
@@ -181,7 +181,7 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   connection reset/refused) with exponential backoff (1, 2, 4, 8 s; five attempts). A failed
   `create` is not repeated blindly: agentbox first checks whether the sandbox now exists.
 - **`down` / `fresh`** refuse while a job is running; `--force` kills it (the wrapper's process
-  group, after checking the pid is really this job's wrapper) and removes the sandbox anyway.
+  group, or its children and then the wrapper if there is no `setsid`, after checking the pid is really this job's wrapper) and removes the sandbox anyway.
 
 Exit codes for `wait` (and the final status of a foreground `run`): the **job's own exit code**
 (claude: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still

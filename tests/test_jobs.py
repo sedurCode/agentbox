@@ -221,7 +221,7 @@ class RunTests(JobCase):
                                lambda s, cfg, *a, **k: (runs.append(a), subprocess.CompletedProcess(a, 0, "", ""))[1]
                                if a[0] == "run" else orig(s, cfg, *a, **k)):
             self.assertEqual(ab.cmd_resume(self.prof, self.args()), 0)
-            self.assertEqual(runs[0][-2:], ("--", "--resume=sess-12345678"))
+            self.assertEqual(runs[0], ("run", "--name", "ab-p", "--", "--resume=sess-12345678"))
             for evil in ("--settings", "-p"):                      # an agent-written session_id file / host record
                 (self.vm.jobdir(job) / "session_id").write_text(evil)
                 rec = ab.job_record(self.prof)
@@ -328,6 +328,31 @@ class LogsTests(JobCase):
         self.assertEqual(len(raw.splitlines()), 3)
         self.assertTrue(all(json.loads(l) for l in raw.splitlines()))
 
+    def append(self, job, text):
+        with open(self.vm.jobdir(job) / "output.jsonl", "a") as f:
+            f.write(text)
+
+    def test_finished_job_prints_a_last_line_without_a_newline(self):
+        job = self.start()
+        self.finish(job)
+        self.append(job, '{"type":"assistant","message":{"content":[{"type":"text","text":"the very last words"}]}}')
+        for follow in (False, True):
+            code, out = self.run_logs(follow=follow)
+            self.assertIn("assistant: the very last words", out, follow)
+        _, raw = self.run_logs(raw=True)
+        self.assertTrue(raw.splitlines()[-1].endswith('last words"}]}}'))
+
+    def test_running_job_does_not_print_a_half_written_line(self):
+        self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
+        job = self.start()
+        end = time.time() + 10
+        while "[init]" not in (self.run_logs()[1]) and time.time() < end:
+            REAL_SLEEP(0.05)
+        self.append(job, '{"type":"assistant","message":{"content":[{"type":"text","text":"half wri')
+        code, out = self.run_logs()
+        self.assertIn("[init]", out)
+        self.assertNotIn("half wri", out)
+
     def test_follow_ends_with_the_job(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "1"
         self.start()
@@ -367,6 +392,20 @@ class StatusDownTests(JobCase):
         self.assertEqual(code, 0)
         self.assertIn("killing running job", err)
         self.assertTrue(any(c[0] == "rm" for c in self.vm.calls))
+
+
+class UpTests(JobCase):
+    def test_up_uses_run_name_not_the_deprecated_positional(self):
+        import contextlib
+        import io
+        runs = []
+        orig = type(self.vm).__call__
+        with mock.patch.object(type(self.vm), "__call__",
+                               lambda s, cfg, *a, **k: (runs.append(a), subprocess.CompletedProcess(a, 0, "", ""))[1]
+                               if a[0] == "run" else orig(s, cfg, *a, **k)), contextlib.redirect_stdout(io.StringIO()):
+            ab.cmd_up(self.prof, argparse.Namespace(agent_args=[]))
+            ab.cmd_up(self.prof, argparse.Namespace(agent_args=["--resume", "x"]))
+        self.assertEqual(runs, [("run", "--name", "ab-p"), ("run", "--name", "ab-p", "--", "--resume", "x")])
 
 
 class KeepAliveTests(JobCase):
@@ -419,16 +458,20 @@ class KillSafetyTests(JobCase):
         self.real_pid = (self.vm.jobdir(self.job) / "pid").read_text().strip()
         self.log = self.tmp / "kills.log"
 
-    def run_kill(self, pid_text=None, own_pid=False):
-        """Run kill_script with `kill` shadowed by a function that only records the call: nothing
-        is ever signalled in this test, whatever the validation decides."""
+    def run_kill(self, pid_text=None, own_pid=False, no_group=False, shadow_pkill=False, path=None):
+        """Run kill_script with `kill` (and optionally `pkill`) shadowed by functions that only record
+        the call: nothing is ever signalled in this test, whatever the validation decides.
+        no_group: `kill -- -PID` fails, as when the wrapper isn't a process group leader."""
         from helpers import REAL_POPEN, REAL_RUN
         self.log.write_text("")
         d = f'd="$HOME/.agentbox/jobs/{self.job}"; '
         pre = d + ('echo $$ > "$d/pid"; ' if own_pid else f'printf %s "{pid_text}" > "$d/pid"; ')
-        script = pre + f'kill() {{ echo "$*" >> "{self.log}"; }}; ' + ab.kill_script(self.job)
+        pre += f'kill() {{ echo "$*" >> "{self.log}"; ' + ('[ "$2" = -- ] && return 1; ' if no_group else '') + '}; '
+        if shadow_pkill:
+            pre += f'pkill() {{ echo "pkill $*" >> "{self.log}"; }}; '
+        env = {**self.vm.env, **({"PATH": path} if path else {})}
         with mock.patch.object(subprocess, "Popen", REAL_POPEN):
-            REAL_RUN(["sh", "-c", script], env=self.vm.env, capture_output=True, timeout=20)
+            REAL_RUN(["/bin/sh", "-c", pre + ab.kill_script(self.job)], env=env, capture_output=True, timeout=20)
         (self.vm.jobdir(self.job) / "pid").write_text(self.real_pid)     # leave the real pid for cleanup
         return self.log.read_text()
 
@@ -446,6 +489,42 @@ class KillSafetyTests(JobCase):
 
     def test_signals_the_real_wrapper_group(self):
         self.assertEqual(self.run_kill(self.real_pid).split(), ["-TERM", "--", f"-{self.real_pid}"])
+
+    def children_of(self, pid):
+        kids = []
+        for stat in __import__("pathlib").Path("/proc").glob("[0-9]*/stat"):
+            try:
+                line = stat.read_text()
+            except OSError:
+                continue
+            if line.rsplit(") ", 1)[-1].split()[1] == str(pid):
+                kids.append(int(stat.parent.name))
+        return kids
+
+    def test_without_a_process_group_children_are_signalled_before_the_wrapper(self):
+        # pkill available: -P <wrapper>, then the wrapper itself
+        got = self.run_kill(self.real_pid, no_group=True, shadow_pkill=True).splitlines()
+        self.assertEqual(got, [f"-TERM -- -{self.real_pid}", f"pkill -TERM -P {self.real_pid}", f"-TERM {self.real_pid}"])
+
+    def test_without_a_process_group_or_pkill_it_reads_proc(self):
+        import os
+        import tempfile
+        kids = self.children_of(int(self.real_pid))
+        self.assertTrue(kids, "the fake agent should be a direct child of the wrapper")
+        with tempfile.TemporaryDirectory() as bindir:                   # PATH with cat + grep but no pkill
+            for tool in ("cat", "grep"):
+                os.symlink(__import__("shutil").which(tool), os.path.join(bindir, tool))
+            got = self.run_kill(self.real_pid, no_group=True, path=bindir).splitlines()
+        self.assertEqual(got[0], f"-TERM -- -{self.real_pid}")
+        self.assertEqual(got[-1], f"-TERM {self.real_pid}")             # the wrapper last
+        self.assertEqual(sorted(int(l.split()[1]) for l in got[1:-1]), sorted(kids))   # exactly its children
+
+    def test_a_process_group_kill_needs_no_extra_signals(self):
+        self.assertEqual(self.run_kill(self.real_pid, shadow_pkill=True).splitlines(), [f"-TERM -- -{self.real_pid}"])
+
+    def test_refusals_hold_on_the_fallback_path_too(self):
+        for text in ("0", "1", "-1", ""):
+            self.assertEqual(self.run_kill(text, no_group=True, shadow_pkill=True), "", repr(text))
 
     def test_force_down_uses_the_validated_killer(self):
         code, _, err = self.run_main("down", "p", "--force")
