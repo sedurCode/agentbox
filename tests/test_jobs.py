@@ -152,6 +152,22 @@ class StreamTests(unittest.TestCase):
         self.assertLessEqual(len(ab.render_stream_line(ev)), 200 + len("assistant: "))
 
 
+class SessionIdTests(unittest.TestCase):
+    BAD = ["--settings", "-p", "-resume-12345", "--dangerously-skip-permissions", "-" * 8, "abc", "a" * 81,
+           "ok-id-12 3", "ok;id-1234", "ok\nid-1234", ""]
+
+    def test_regex_rejects_option_lookalikes_and_junk(self):
+        for sid in self.BAD:
+            self.assertFalse(ab.SESSION_ID_RE.match(sid), repr(sid))
+        for sid in ("sess-12345678", "0b1c2d3e-4f50-6789-abcd-ef0123456789", "A1_b2-c3d4"):
+            self.assertTrue(ab.SESSION_ID_RE.match(sid), sid)
+
+    def test_every_entry_point_applies_it(self):
+        for sid in self.BAD:
+            self.assertIsNone(ab.session_id_from_stream(json.dumps({"type": "system", "session_id": sid})), repr(sid))
+            self.assertIsNone(ab.job_summary(JOB, "finished", {"session_id": sid})["session_id"], repr(sid))
+
+
 class JobCase(AgentboxTestCase):
     def setUp(self):
         super().setUp()
@@ -196,6 +212,26 @@ class JobCase(AgentboxTestCase):
 
 
 class RunTests(JobCase):
+    def test_resume_passes_the_id_as_one_equals_argument_and_refuses_evil_ids(self):
+        job = self.start()
+        self.finish(job)
+        runs = []
+        orig = type(self.vm).__call__
+        with mock.patch.object(type(self.vm), "__call__",
+                               lambda s, cfg, *a, **k: (runs.append(a), subprocess.CompletedProcess(a, 0, "", ""))[1]
+                               if a[0] == "run" else orig(s, cfg, *a, **k)):
+            self.assertEqual(ab.cmd_resume(self.prof, self.args()), 0)
+            self.assertEqual(runs[0][-2:], ("--", "--resume=sess-12345678"))
+            for evil in ("--settings", "-p"):                      # an agent-written session_id file / host record
+                (self.vm.jobdir(job) / "session_id").write_text(evil)
+                rec = ab.job_record(self.prof)
+                rec["session_id"] = evil
+                ab.save_job_record(self.prof, rec)
+                runs.clear()
+                with self.assertRaises(SystemExit):
+                    ab.cmd_resume(self.prof, self.args())
+                self.assertEqual(runs, [], evil)
+
     def test_prompt_never_on_any_argv_and_file_is_private(self):
         job = self.start()
         for call in self.vm.calls:

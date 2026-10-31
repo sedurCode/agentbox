@@ -1356,7 +1356,7 @@ def cmd_down(prof: Profile, args) -> int:
 # derived from those files plus /proc/<pid>/cmdline - never from `pgrep -f`, which matches
 # its own command line. The prompt travels on stdin only, never on an argv.
 JOB_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$")   # never starts with '-': it ends up in an argv
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 JOB_DIR = '"$HOME/.agentbox/jobs/{id}"'
 HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resumes a session
@@ -1771,7 +1771,11 @@ def cmd_resume(prof: Profile, args) -> int:
     if not j["session_id"]:
         die(f"no session id recorded for job {job_id} (did the agent start?)")
     ensure_sandbox(prof)
-    return sbx(prof.cfg, "run", prof.sandbox, "--", spec["resume"], j["session_id"], check=False).returncode
+    sid = j["session_id"]
+    if not SESSION_ID_RE.match(sid):          # belt and braces: the id comes from an agent-writable file
+        die(f"refusing to resume: malformed session id for job {job_id}")
+    # `--resume=<id>` (claude accepts it) so the id can never be read as a separate option
+    return sbx(prof.cfg, "run", prof.sandbox, "--", f"{spec['resume']}={sid}", check=False).returncode
 
 
 def emit_json(obj):

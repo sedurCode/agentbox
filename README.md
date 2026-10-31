@@ -135,7 +135,7 @@ agentbox run h750 --prompt-file task.md --detach     # prints the job id, return
 agentbox wait h750 --timeout 3600                    # block; exit status = the job's exit status
 agentbox logs h750 -f                                # follow, one human line per event
 agentbox logs h750 --raw                             # the raw stream-json lines
-agentbox resume h750                                 # interactive `claude --resume <session id>`
+agentbox resume h750                                 # interactive `claude --resume=<session id>`
 agentbox run h750 --prompt-file task.md              # without --detach: run, then follow logs, then exit with the job's status
 agentbox run h750 --prompt-file - --agent-args --model opus < task.md
 ```
@@ -158,6 +158,8 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   reused pid doesn't count); otherwise `lost`. Processes are never found with `pgrep -f`, which
   matches its own command line. A **VM reboot, `stop`, or `down` loses a running job**: its state
   becomes `lost` (the files may remain after a reboot; the process doesn't).
+- **Session ids** are validated (`[A-Za-z0-9][A-Za-z0-9_-]{7,79}`, so never an option-looking `-...`) wherever they
+  are read from the VM, and passed as the single argument `--resume=<id>`.
 - **Why `resume`, not `--continue`:** `claude --continue` doesn't find a `-p` session; `--resume <id>`
   does, and agentbox records the id. `resume` refuses while the job is still running, and for agents
   without a resume flag.
