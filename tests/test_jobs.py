@@ -194,7 +194,7 @@ class JobCase(AgentboxTestCase):
 
     def args(self, **kw):
         base = dict(prompt=PROMPT, prompt_file=None, detach=True, agent_args=[], job=None, timeout=None,
-                    follow=False, raw=False)
+                    follow=False, raw=False, keepalive=False)
         return argparse.Namespace(**{**base, **kw})
 
     def start(self, **kw):
@@ -241,7 +241,18 @@ class RunTests(JobCase):
         d = self.vm.jobdir(job)
         self.assertEqual((d / "prompt.md").read_text(), PROMPT)
         self.assertEqual(oct((d / "prompt.md").stat().st_mode & 0o777), "0o600")
+        self.assertEqual(self.keepalive, [])                       # the keep-alive is opt-in
+
+    def test_keepalive_only_when_asked(self):
+        self.finish(self.start())
+        self.assertEqual(self.keepalive, [])
+        self.finish(self.start(keepalive=True))                    # --keepalive
         self.assertEqual(self.keepalive, ["p"])
+        (self.cfg_dir / "agentbox.toml").write_text((self.cfg_dir / "agentbox.toml").read_text()
+                                                    .replace('[profiles.p]\n', '[profiles.p]\nkeepalive = true\n', 1))
+        self.prof = ab.Config().profile("p")                       # keepalive = true in the profile
+        self.finish(self.start())
+        self.assertEqual(self.keepalive, ["p", "p"])
 
     def test_job_files_and_session_id(self):
         job = self.start()

@@ -81,6 +81,7 @@ the important keys:
 | `allow` / `deny` | sandbox-scoped egress rules (merged with `[defaults]`; deny wins) |
 | `env` | plain env vars for the VM (not for secrets) |
 | `secrets` | sandbox-scoped credentials, see §4 |
+| `keepalive` | `false` (default). `true`: `agentbox run` also holds an exec session open while a job runs (see *Headless jobs*) |
 | `host_tools`, `host_tools_port` | which `[tools.*]` this sandbox may call, and a unique port per profile |
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
 
@@ -163,13 +164,14 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
 - **Why `resume`, not `--continue`:** `claude --continue` doesn't find a `-p` session; `--resume <id>`
   does, and agentbox records the id. `resume` refuses while the job is still running, and for agents
   without a resume flag.
-- **Keep-alive.** While a job runs, `agentbox run` starts a host-side `agentbox keepalive <profile>`
-  process (pid in the state dir) that holds an `sbx exec` session open in the VM and re-opens it
-  if it drops; it ends when the job does, and `stop`/`down` stop it. This exists because a VM with
-  no attached session may be stopped by sbx.
-  **TODO:** confirm whether sbx has an idle/auto-stop setting or a keep-alive flag (nothing in this
-  repo or agentbox's own `sbx` calls documents one, and `sbx` couldn't be run while writing this).
-  If it does, use that and drop the keep-alive.
+- **Keep-alive (optional, off by default).** `sbx` has no idle or auto-stop setting (`sbx settings ls` has
+  none, and the VM stops seen while this was being built were caused by a test signalling PID 1, not by
+  `sbx`), and `sbx exec` starts a stopped sandbox, so jobs don't need one. It exists only as a precaution
+  against session-bound stops that haven't been observed: `agentbox run --keepalive`, or `keepalive = true`
+  in the profile, starts a host-side `agentbox keepalive <profile>` process (pid in the state dir) that holds
+  an `sbx exec` session open in the VM and re-opens it if it drops. It first checks `sbx ls --json` and exits
+  if the sandbox isn't running (its own `exec` would otherwise boot it), ends when the job does, and
+  `stop`/`down` stop it.
 - **Stopped sandboxes are never booted by accident.** `sbx exec` starts a stopped sandbox, so agentbox
   first asks `sbx ls --json`. If the sandbox isn't running, `status`, `wait`, the keep-alive and `audit`'s
   `git status` treat the job as `lost` (cached in `job.json`, so later calls make no `sbx` call at all) and
