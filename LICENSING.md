@@ -14,7 +14,7 @@ that modified version available to those users under the same licence.
 ## 2. Commercial licence
 
 If you do not want to be bound by the AGPLv3 obligations, a commercial licence that
-removes them is available from SEDAudio Ltd. To obtain one, contact: `<contact>`
+removes them is available from SEDAudio Ltd. To obtain one, contact: SEDAudio Ltd, [support@sedaudio.co.uk](mailto:support@sedaudio.co.uk)
 
 ## Contributions
 
