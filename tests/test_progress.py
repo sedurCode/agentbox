@@ -117,6 +117,94 @@ class PlanParseTests(unittest.TestCase):
         self.assertIn("\\x1b", note)
 
 
+class JobProgressScriptTests(AgentboxTestCase):
+    def setUp(self):
+        super().setUp()
+        self.jd = self.tmp / "jd"
+        self.jd.mkdir()
+        self.env = {**os.environ, "AGENTBOX_JOB_DIR": str(self.jd)}
+
+    def jp(self, *args, env=None):
+        return sh(JOBPROGRESS, *args, env=env or self.env)
+
+    def tsv(self):
+        return (self.jd / "progress.tsv").read_text()
+
+    def test_plan_start_done_note(self):
+        self.assertEqual(self.jp("plan", "one", 'two "quoted" \\ back').returncode, 0)
+        self.assertEqual(self.tsv(), 'pending\tone\npending\ttwo "quoted" \\ back\n')
+        self.assertEqual(self.jp("start", "2").returncode, 0)
+        self.assertEqual(self.jp("note", "halfway there").returncode, 0)
+        self.assertEqual(self.jp("done", "1").returncode, 0)
+        self.assertEqual(self.tsv(), 'done\tone\nactive\ttwo "quoted" \\ back\nnote\thalfway there\n')
+        self.assertEqual(self.jp("note", "").returncode, 0)                        # clears it
+        self.assertNotIn("note", self.tsv())
+        self.jp("note", "kept")
+        self.jp("plan", "new plan")                                                # a new plan keeps the note
+        self.assertEqual(self.tsv(), "pending\tnew plan\nnote\tkept\n")
+        steps, note = ab.parse_plan(self.tsv().splitlines())
+        self.assertEqual((len(steps), note), (1, "kept"))
+
+    def test_validation(self):
+        self.assertEqual(self.jp("start", "1").returncode, 2)                      # no plan yet
+        self.jp("plan", "a", "b")
+        before = self.tsv()
+        bad = [("plan",), ("plan", ""), ("plan", *["s"] * 51), ("plan", "x" * 201), ("plan", "tab\there"),
+               ("plan", "line\nbreak"), ("plan", "esc\x1b[2J"), ("start",), ("start", "0"), ("start", "3"),
+               ("start", "-1"), ("start", "1x"), ("start", ""), ("start", "01"), ("done", "9"), ("done", "1", "2"),
+               ("note", "x" * 301), ("note", "a\tb"), ("note",), ("frobnicate",), ()]
+        for argv in bad:
+            r = self.jp(*argv)
+            self.assertEqual(r.returncode, 2, (argv, r.stderr))
+            self.assertTrue(r.stderr.startswith("jobprogress:"), argv)
+        self.assertEqual(self.tsv(), before)                                       # nothing half-applied
+        self.assertEqual(self.jp("plan", *["s"] * 50).returncode, 0)               # the limits themselves are fine
+        self.assertEqual(self.jp("plan", "x" * 200).returncode, 0)
+        self.assertEqual(self.jp("note", "n" * 300).returncode, 0)
+
+    def test_needs_a_job_dir(self):
+        env = {k: v for k, v in self.env.items() if k != "AGENTBOX_JOB_DIR"}
+        self.assertEqual(self.jp("plan", "a", env=env).returncode, 2)
+        self.assertEqual(self.jp("plan", "a", env={**env, "AGENTBOX_JOB_DIR": str(self.jd / "nope")}).returncode, 2)
+
+    def test_write_is_atomic_and_leaves_nothing_behind(self):
+        self.assertIn('mv "$tmp" "$f"', JOBPROGRESS.read_text())                   # temp file + rename
+        self.jp("plan", "a", "b")
+        self.jp("start", "1")
+        self.assertEqual(sorted(p.name for p in self.jd.iterdir()), ["progress.tsv"])   # no tmp, no lock
+
+    def test_failed_command_does_not_touch_the_file(self):
+        self.jp("plan", "a")
+        (self.jd / "progress.tsv").chmod(0o444)
+        before = self.tsv()
+        self.jp("note", "x" * 301)
+        self.assertEqual(self.tsv(), before)
+
+    def test_a_stale_lock_does_not_block_forever(self):
+        (self.jd / "progress.lock").mkdir()
+        with mock.patch.dict(os.environ):
+            r = self.jp("plan", "a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_install_sh_installs_every_share_file(self):
+        script = (ab.SHARE_DIR.parent / "install.sh").read_text()
+        for f in (p for p in ab.SHARE_DIR.iterdir() if p.is_file()):
+            self.assertIn(f'share/{f.name}"', script, f"install.sh does not copy share/{f.name}")
+
+    def test_wrapper_puts_the_job_dir_at_the_end_of_path(self):
+        (self.jd / "prompt.md").write_text("p")
+        for n in ("wrap.sh", "jobprogress"):
+            (self.jd / n).write_text((ab.SHARE_DIR / ("jobwrap" if n == "wrap.sh" else n)).read_text())
+        env = {k: v for k, v in self.env.items() if k != "AGENTBOX_JOB_DIR"}
+        r = sh(self.jd / "wrap.sh", self.jd, self.tmp, "sh", "-c", 'echo "$AGENTBOX_JOB_DIR"; echo "$PATH"; jobprogress plan x',
+               env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = (self.jd / "output.jsonl").read_text().splitlines()
+        self.assertEqual(out[0], str(self.jd))
+        self.assertTrue(out[1].endswith(":" + str(self.jd)))
+        self.assertEqual(self.tsv(), "pending\tx\n")
+
+
 class ProgressCase(JobCase):
     def setUp(self):
         super().setUp()
@@ -245,6 +333,25 @@ class SignalTests(ProgressCase):
     def view_after_start(self):
         self.run_job()
         return self.view()
+
+
+class RunInstallTests(ProgressCase):
+    def test_reporter_and_paragraph_are_installed_by_default(self):
+        job = self.run_job()
+        d = self.vm.jobdir(job)
+        self.assertTrue((d / "jobprogress").read_text().startswith("#!/bin/sh"))
+        self.assertEqual(oct((d / "jobprogress").stat().st_mode & 0o777), "0o700")
+        prompt = (d / "prompt.md").read_text()
+        self.assertTrue(prompt.startswith("Progress reporting: before you start"))
+        self.assertTrue(prompt.endswith("\n\n" + "SECRET-PROMPT-TEXT summarise the repo"))
+        for call in self.vm.calls:                                    # stdin only, never argv
+            self.assertNotIn("Progress reporting", " ".join(map(str, call)))
+
+    def test_no_progress_changes_nothing(self):
+        job = self.run_job(no_progress=True)
+        d = self.vm.jobdir(job)
+        self.assertFalse((d / "jobprogress").exists())
+        self.assertEqual((d / "prompt.md").read_text(), "SECRET-PROMPT-TEXT summarise the repo")
 
 
 class AgentPlanTests(ProgressCase):

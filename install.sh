@@ -26,6 +26,7 @@ echo "found $PY"
 mkdir -p "$DEST/bin" "$DEST/share" "$BIN" "$CFG/kits" "$CFG/gdb"
 cp "$SRC/share/hosttool" "$DEST/share/hosttool"
 cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
+cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"

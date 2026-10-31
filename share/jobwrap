@@ -6,8 +6,14 @@
 #   sh wrap.sh JOBDIR WORKDIR CMD [ARGS...]
 # The prompt is read from JOBDIR/prompt.md on stdin, never from an argument. Writes
 # pid, started_at, output.jsonl, stderr.log, finished_at and (last, atomically) exit_code.
+# If JOBDIR/jobprogress exists (the agent's progress reporter) the job dir goes on the END of the
+# agent's PATH and AGENTBOX_JOB_DIR names it.
 jd=$1; wd=$2; shift 2
 umask 077
+if [ -f "$jd/jobprogress" ]; then
+  chmod 700 "$jd/jobprogress"
+  AGENTBOX_JOB_DIR=$jd; PATH="$PATH:$jd"; export AGENTBOX_JOB_DIR PATH
+fi
 echo $$ > "$jd/pid"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$jd/started_at"
 if cd "$wd"; then

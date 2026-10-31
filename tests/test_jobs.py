@@ -236,10 +236,10 @@ class RunTests(JobCase):
         job = self.start()
         for call in self.vm.calls:
             self.assertNotIn("SECRET-PROMPT-TEXT", " ".join(map(str, call)))
-        self.assertIn(PROMPT, self.vm.stdins)                       # it went in on stdin
+        self.assertTrue(any(i and i.endswith(PROMPT) for i in self.vm.stdins))   # it went in on stdin
         self.finish(job)
         d = self.vm.jobdir(job)
-        self.assertEqual((d / "prompt.md").read_text(), PROMPT)
+        self.assertEqual((d / "prompt.md").read_text(), ab.PROGRESS_PROMPT + "\n\n" + PROMPT)
         self.assertEqual(oct((d / "prompt.md").stat().st_mode & 0o777), "0o600")
         self.assertEqual(self.keepalive, ["p"])                    # the keep-alive is on by default
 

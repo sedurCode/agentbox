@@ -2267,6 +2267,11 @@ def cmd_logs(prof: Profile, args, follow: bool | None = None) -> int:
         time.sleep(next(delays))
 
 
+PROGRESS_PROMPT = ('Progress reporting: before you start, record your plan with `jobprogress plan "<step>" ...` '
+                   '(3 to 12 steps); run `jobprogress start <n>` and `jobprogress done <n>` as you go, and '
+                   '`jobprogress note "<status>"` for anything the user should know. Keep it accurate: the user watches it.')
+
+
 def cmd_run(prof: Profile, args) -> int:
     agent = prof.d["agent"]
     spec = HEADLESS_AGENTS.get(agent)
@@ -2283,6 +2288,7 @@ def cmd_run(prof: Profile, args) -> int:
         die("empty prompt", EXIT_USAGE)
     if len(prompt) > 1_000_000:
         die("prompt is over 1 MB", EXIT_USAGE)
+    report = not getattr(args, "no_progress", False)
     expect = getattr(args, "expect_commits", None)
     if expect is not None and not 1 <= expect <= 10000:
         die("--expect-commits must be between 1 and 10000", EXIT_USAGE)
@@ -2291,8 +2297,10 @@ def cmd_run(prof: Profile, args) -> int:
         die(f"job {current} is still running in {prof.sandbox}; `agentbox wait {prof.name}` for it first")
     ensure_sandbox(prof, retry=True)
     job_id = new_job_id()
-    vm_write(prof, job_id, "prompt.md", prompt)
+    vm_write(prof, job_id, "prompt.md", (PROGRESS_PROMPT + "\n\n" if report else "") + prompt)
     vm_write(prof, job_id, "wrap.sh", (SHARE_DIR / "jobwrap").read_text())
+    if report:
+        vm_write(prof, job_id, "jobprogress", (SHARE_DIR / "jobprogress").read_text())
     sync_skills(prof, background=False)             # the exec above started the VM, if it was stopped
     cmd = [*spec["cmd"], *(args.agent_args or [])]
     d = JOB_DIR.format(id=job_id)
@@ -3059,6 +3067,8 @@ def main():
     g.add_argument("--prompt", metavar="TEXT", help="prompt text (visible in your host's process list; prefer --prompt-file)")
     p.add_argument("--detach", action="store_true", help="start the job and return")
     p.add_argument("--expect-commits", type=int, metavar="N", help="show 'commits k/N' in `progress`")
+    p.add_argument("--no-progress", action="store_true",
+                   help="do not give the agent the jobprogress reporter or the prompt paragraph about it")
     p.add_argument("--keepalive", action=argparse.BooleanOptionalAction, default=None,
                    help="hold an exec session open while the job runs (default: on; sbx stops idle sandboxes)")
     p.add_argument("--agent-args", nargs=argparse.REMAINDER, default=[], help="extra agent arguments (rest of the line)")

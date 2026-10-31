@@ -1,0 +1,91 @@
+#!/bin/sh
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
+# agentbox job progress, run INSIDE the sandbox by the agent (the job dir is on its PATH):
+#   jobprogress plan "step one" "step two" ...   replace the plan, every step pending (1-50 steps)
+#   jobprogress start <n>                        step n is in progress
+#   jobprogress done <n>                         step n is completed
+#   jobprogress note "text"                      short free-text status, the last one wins ("" clears it)
+# State is $AGENTBOX_JOB_DIR/progress.tsv: one line per entry, "<kind><TAB><text>", kind =
+# pending | active | done (one per step, in order) or note. It is written to a temp file and
+# moved into place, so a reader never sees half a file. Steps: at most 200 bytes, notes 300;
+# no control characters. The host treats the file as untrusted agent output.
+LC_ALL=C; export LC_ALL
+T=$(printf '\t')
+die() { echo "jobprogress: $*" >&2; exit 2; }
+
+[ -n "$AGENTBOX_JOB_DIR" ] && [ -d "$AGENTBOX_JOB_DIR" ] || die "AGENTBOX_JOB_DIR is not set (run inside an agentbox job)"
+f=$AGENTBOX_JOB_DIR/progress.tsv
+cmd=$1; [ $# -gt 0 ] && shift
+
+check_text() {      # $1 = text, $2 = max bytes, $3 = what
+  [ "${#1}" -le "$2" ] || die "$3 is over $2 characters"
+  clean=$(printf %s "$1" | tr -d '\000-\037\177')
+  [ "$clean" = "$1" ] || die "$3 must not contain control characters (tabs, newlines, escapes)"
+}
+check_n() {         # $1 = n, $2 = number of steps
+  case $1 in ""|*[!0-9]*|0*) die "step must be a positive integer";; esac
+  [ "$1" -le "$2" ] || die "step $1 is not in the plan ($2 steps)"
+}
+
+lock=$AGENTBOX_JOB_DIR/progress.lock
+i=0
+until mkdir "$lock" 2>/dev/null; do
+  i=$((i + 1))
+  if [ "$i" -gt 50 ]; then rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null; break; fi   # stale lock
+  sleep 0.1 2>/dev/null || sleep 1
+done
+tmp=$f.tmp.$$
+trap 'rm -f "$tmp"; rmdir "$lock" 2>/dev/null' EXIT
+
+note=; steps=0
+if [ -f "$f" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      note"$T"*) note=${line#note"$T"};;
+      pending"$T"*|active"$T"*|done"$T"*) steps=$((steps + 1));;
+    esac
+  done < "$f"
+fi
+
+case $cmd in
+  plan)
+    [ $# -ge 1 ] || die "plan needs at least one step"
+    [ $# -le 50 ] || die "a plan has at most 50 steps"
+    for s in "$@"; do
+      [ -n "$s" ] || die "a step must not be empty"
+      check_text "$s" 200 "a step"
+    done
+    { for s in "$@"; do printf 'pending\t%s\n' "$s"; done
+      [ -z "$note" ] || printf 'note\t%s\n' "$note"; } > "$tmp"
+    ;;
+  start|done)
+    [ $# -eq 1 ] || die "$cmd needs one step number"
+    [ "$steps" -gt 0 ] || die "no plan yet: run jobprogress plan first"
+    check_n "$1" "$steps"
+    new=active; [ "$cmd" = done ] && new=done
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      case $line in
+        pending"$T"*|active"$T"*|done"$T"*)
+          n=$((n + 1))
+          if [ "$n" -eq "$1" ]; then printf '%s\t%s\n' "$new" "${line#*"$T"}"; else printf '%s\n' "$line"; fi;;
+        note"$T"*) ;;
+      esac
+    done < "$f" > "$tmp"
+    [ -z "$note" ] || printf 'note\t%s\n' "$note" >> "$tmp"
+    ;;
+  note)
+    [ $# -eq 1 ] || die "note needs one text argument"
+    check_text "$1" 300 "a note"
+    { if [ -f "$f" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          case $line in pending"$T"*|active"$T"*|done"$T"*) printf '%s\n' "$line";; esac
+        done < "$f"
+      fi
+      [ -z "$1" ] || printf 'note\t%s\n' "$1"; } > "$tmp"
+    ;;
+  *) die "usage: jobprogress plan STEP... | start N | done N | note TEXT";;
+esac
+mv "$tmp" "$f" || die "could not write $f"
