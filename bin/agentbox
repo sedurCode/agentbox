@@ -61,7 +61,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import tomllib
 
@@ -319,7 +319,7 @@ class Profile:
 
     def skill_links(self) -> list[tuple[str, str]]:
         """(skill, VM path of its folder) for every skill of every set; the mount keeps the host path."""
-        return [(sk, f"{ss.path}/{sk}") for ss in self.skillsets for sk in ss.skills]
+        return [(sk, f"{ss.path}/{ss.folders[sk]}") for ss in self.skillsets for sk in ss.skills]
 
 
 def resolve_kit(ref: str) -> Path:
@@ -333,17 +333,22 @@ def resolve_kit(ref: str) -> Path:
 
 
 # ------------------------------------------------------------- skill sets
-# A skill set is a HOST folder with one subfolder per agent skill, mounted read-only into the
-# sandbox and symlinked into ~/.claude/skills. Skills are instructions the agent follows, so a
-# set the agent could write to would let one sandbox plant instructions for every other one.
+# A skill set is ONE git work tree on the HOST (a fork of a skills repo), mounted read-only as a
+# whole into the sandbox. `include` picks the folders that are skills; those are symlinked into
+# ~/.claude/skills. Skills are instructions the agent follows, so a set the agent could write to
+# would let one sandbox plant instructions for every other one. Nothing is copied.
 # Everything below reads the folder with Python only (lstat, os.walk without following links).
 class SkillSet:
     def __init__(self, name: str, path: Path | None = None, description: str = ""):
         self.name, self.path, self.description = name, path, description
-        self.skills: list[str] = []
-        self.commit: str | None = None      # 40 hex, "unknown", or None when the folder is not a git work tree
+        self.skills: list[str] = []             # skill names (last component of the folder)
+        self.folders: dict[str, str] = {}       # skill name -> folder relative to the set root
+        self.include: list[str] | None = None   # None = every immediate subfolder is a skill
+        self.ref: str | None = None             # the pinned commit (40 hex), if any
+        self.commit: str | None = None          # 40 hex, "unknown", or None when the folder is not a git work tree
+        self.branch: str | None = None          # checked-out branch; None = detached or not a git work tree
         self.problems: list[str] = []
-        self.allow_scripts = False
+        self.allow_scripts: bool | list[str] = False
 
 
 def skillset_path(spec: dict) -> Path | None:
@@ -351,24 +356,32 @@ def skillset_path(spec: dict) -> Path | None:
     return xp(raw) if isinstance(raw, str) and raw.strip() else None
 
 
-def all_workspace_roots(cfg: Config) -> list[Path]:
-    """Every workspace of every profile (disabled ones too), read leniently from the raw config."""
+def writable_workspace_roots(cfg: Config) -> list[Path]:
+    """Every host folder the agent can WRITE, from every profile (disabled ones too), read leniently
+    from the raw config: a direct-mode primary workspace and any extra without :ro. A clone-mode
+    primary does not count (sbx mounts the source read-only; the agent works on its own clone)."""
     roots = []
-    tables = [cfg.raw.get("defaults", {})] + list(cfg.raw.get("profiles", {}).values())
+    defaults = cfg.raw.get("defaults", {})
+    tables = [defaults] + list(cfg.raw.get("profiles", {}).values())
     for t in tables:
         if not isinstance(t, dict):
             continue
-        if isinstance(t.get("workspace"), str):
+        mode = t.get("mode", defaults.get("mode", "direct") if isinstance(defaults, dict) else "direct")
+        if isinstance(t.get("workspace"), str) and mode != "clone":
             roots.append(xp(t["workspace"]))
-        roots += [parse_workspace_spec(x)[0] for x in t.get("extra_workspaces", []) if isinstance(x, str)]
+        for x in t.get("extra_workspaces", []):
+            if isinstance(x, str):
+                p, ro = parse_workspace_spec(x)
+                if not ro:
+                    roots.append(p)
     return roots
 
 
 def skillset_location_problems(cfg: Config, path: Path) -> list[str]:
-    """Where a skill set may live. `path` is resolved. Overlap is checked both ways: a workspace
-    inside the set is as writable by the agent as a set inside a workspace."""
+    """Where a skill set may live. `path` is resolved. Overlap is checked both ways: a writable
+    workspace inside the set is as writable by the agent as a set inside a writable workspace."""
     problems = []
-    for r in all_workspace_roots(cfg):
+    for r in writable_workspace_roots(cfg):
         if is_within(path, r) or is_within(r, path):
             problems.append(f"overlaps workspace {r} (agent-writable)")
     if is_within(path, CONFIG_DIR.resolve()):
@@ -386,39 +399,75 @@ def _hex40(s: str) -> bool:
     return re.fullmatch(r"[0-9a-f]{40}", s) is not None
 
 
-def git_commit_of(root: Path) -> str | None:
-    """HEAD commit of a git work tree, read as text - never runs git. None = not a git repo."""
+def git_head_of(root: Path) -> tuple[str | None, str | None]:
+    """(commit, branch) of a git work tree's HEAD, read as text - never runs git.
+    (None, None) = not a git repo. commit is "unknown" when HEAD cannot be resolved;
+    branch is None for a detached HEAD."""
     g = root / ".git"
     if g.is_symlink():
-        return None
+        return None, None
     gd = git_dir_of(root)
     if gd is None:
-        return None
+        return None, None
+    branch = None
     try:
         head = (gd / "HEAD").read_text().strip()
         if _hex40(head):
-            return head
+            return head, None
         m = re.fullmatch(r"ref:\s*(refs/[A-Za-z0-9._/-]+)", head)
         if m and ".." not in m.group(1):
             ref, common = m.group(1), gd
+            branch = ref.removeprefix("refs/heads/")
             if (gd / "commondir").is_file():                 # linked worktree: refs live in the main git dir
                 common = (gd / (gd / "commondir").read_text().strip()).resolve()
             for base in (gd, common):
                 f = base / ref
                 if f.is_file() and not f.is_symlink() and _hex40(f.read_text().strip()):
-                    return f.read_text().strip()
+                    return f.read_text().strip(), branch
             if (common / "packed-refs").is_file():
                 for line in (common / "packed-refs").read_text().splitlines():
                     parts = line.split()
                     if len(parts) == 2 and parts[1] == ref and _hex40(parts[0]):
-                        return parts[0]
+                        return parts[0], branch
     except (OSError, ValueError):
         pass
-    return "unknown"
+    return "unknown", branch
+
+
+def git_commit_of(root: Path) -> str | None:
+    return git_head_of(root)[0]
 
 
 def _capped(names: list[str], limit: int = 20) -> str:
     return ", ".join(names[:limit]) + (f" ... and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def check_include_path(root: Path, raw) -> tuple[str | None, str]:
+    """(normalised relative path, "") or (None, why not) for one `include` entry: relative, no "..",
+    every component an existing real directory (lstat, so a symlink at ANY level is refused)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "include entries must be non-empty strings"
+    rel = PurePosixPath(raw)
+    if rel.is_absolute():
+        return None, f"include path '{raw}' must be relative to the set"
+    if ".." in rel.parts:
+        return None, f"include path '{raw}' must not contain '..'"
+    if not rel.parts:
+        return None, f"include path '{raw}' names the set itself, not a folder in it"
+    cur = root
+    for part in rel.parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except (OSError, ValueError):
+            return None, f"include path '{raw}' does not exist"
+        if stat.S_ISLNK(st.st_mode):
+            return None, f"include path '{raw}' goes through a symlink ({cur.relative_to(root)})"
+        if not stat.S_ISDIR(st.st_mode):
+            return None, f"include path '{raw}' is not a directory"
+    if not is_within(cur.resolve(), root):
+        return None, f"include path '{raw}' resolves outside the set"
+    return rel.as_posix(), ""
 
 
 def inspect_skillset(cfg: Config, name: str) -> SkillSet:
@@ -430,10 +479,18 @@ def inspect_skillset(cfg: Config, name: str) -> SkillSet:
     if not isinstance(raw, str) or not raw.strip():
         ss.problems.append("needs `path = \"...\"`")
         return ss
-    if not isinstance(spec.get("allow_scripts", False), bool):
-        ss.problems.append("allow_scripts must be true or false")
+    scripts = spec.get("allow_scripts", False)
+    if isinstance(scripts, bool) or (isinstance(scripts, list) and all(isinstance(x, str) for x in scripts)):
+        ss.allow_scripts = scripts
+    else:
+        ss.problems.append("allow_scripts must be true, false or a list of included paths")
         return ss
-    ss.allow_scripts = spec.get("allow_scripts", False)
+    ref = spec.get("ref")
+    if ref is not None:
+        if isinstance(ref, str) and _hex40(ref.lower()):
+            ss.ref = ref.lower()
+        else:
+            ss.problems.append("ref must be a full commit: 40 hex characters")
     lit = Path(os.path.expandvars(os.path.expanduser(raw)))
     ss.path = lit
     if not lit.is_absolute():
@@ -448,37 +505,78 @@ def inspect_skillset(cfg: Config, name: str) -> SkillSet:
         return ss
     ss.path = path = lit.resolve()
     ss.problems += skillset_location_problems(cfg, path)
-    ss.commit = git_commit_of(path)
+    ss.commit, ss.branch = git_head_of(path)
+    if ss.ref and ss.commit != ss.ref:
+        ss.problems.append(f"HEAD is {ss.commit or 'not a git work tree'} but ref pins {ss.ref}: check out the"
+                           " pinned commit, or review the changes and update `ref`")
 
+    folders = _select_skill_folders(spec, ss, path)          # {skill name: relative folder}
     links, bad_text = [], []
-    for entry in sorted(os.listdir(path)):
-        full = path / entry
-        st = os.lstat(full)
-        if stat.S_ISLNK(st.st_mode):
-            links.append(entry)
-        elif entry.startswith(".") or not stat.S_ISDIR(st.st_mode):
-            continue                                        # .git, SOURCES.json, README.md ...: not skills
-        elif entry == "LICENSES":
-            links += _walk_set(full, path, True, bad_text, [])
+    for skill, rel in folders.items():
+        specials: list[str] = []
+        covered = ss.allow_scripts if isinstance(ss.allow_scripts, bool) else rel in ss.allow_scripts
+        links += _walk_set(path / rel, path, covered, bad_text, specials)
+        if specials:
+            ss.problems.append(f"special files (not regular files): {_capped(specials)}")
+        if not SKILL_NAME_RE.match(skill):
+            ss.problems.append(f"folder '{rel}': a skill name must match {SKILL_NAME_RE.pattern}")
+        elif skill in BUILTIN_SKILLS:
+            ss.problems.append(f"skill '{skill}' would shadow a built-in Claude Code skill")
+        elif not (path / rel / "SKILL.md").is_file() or (path / rel / "SKILL.md").is_symlink():
+            ss.problems.append(f"skill '{skill}' has no SKILL.md")
         else:
-            specials: list[str] = []
-            links += _walk_set(full, path, ss.allow_scripts, bad_text, specials)
-            if specials:
-                ss.problems.append(f"special files (not regular files): {_capped(specials)}")
-            if not SKILL_NAME_RE.match(entry):
-                ss.problems.append(f"folder '{entry}': a skill name must match {SKILL_NAME_RE.pattern}")
-            elif entry in BUILTIN_SKILLS:
-                ss.problems.append(f"skill '{entry}' would shadow a built-in Claude Code skill")
-            elif not (full / "SKILL.md").is_file() or (full / "SKILL.md").is_symlink():
-                ss.problems.append(f"skill '{entry}' has no SKILL.md")
-            else:
-                ss.skills.append(entry)
+            ss.skills.append(skill)
+            ss.folders[skill] = rel
+    links += _top_level_links(path) if ss.include is None else []
     if links:
         ss.problems.append(f"symlinks are not allowed: {_capped(links)}")
     if bad_text:
         ss.problems.append("files that are not plain text (allowed: .md .txt .json .yaml .yml LICENSE*, none executable;"
-                           f" set allow_scripts = true to accept others): {_capped(bad_text)}")
+                           f" set allow_scripts to accept others): {_capped(bad_text)}")
     return ss
+
+
+def _select_skill_folders(spec: dict, ss: SkillSet, path: Path) -> dict[str, str]:
+    """{skill name: folder relative to the set} - the `include` list, or every immediate subfolder
+    when there is none. Problems go to ss.problems. Files outside these folders are never looked at."""
+    inc = spec.get("include")
+    allow = ss.allow_scripts
+    if inc is None:
+        if isinstance(allow, list):
+            ss.problems.append("allow_scripts as a list names included paths, but there is no `include`")
+        out = {}
+        for entry in sorted(os.listdir(path)):
+            st = os.lstat(path / entry)
+            if stat.S_ISDIR(st.st_mode) and not entry.startswith("."):      # .git etc. are not skills
+                out[entry] = entry
+        return out
+    if not isinstance(inc, list) or not inc or not all(isinstance(x, str) for x in inc):
+        ss.problems.append("include must be a non-empty list of relative folder paths")
+        return {}
+    ss.include, out = [], {}
+    for raw in inc:
+        rel, why = check_include_path(path, raw)
+        if rel is None:
+            ss.problems.append(why)
+            continue
+        ss.include.append(rel)
+        leaf = PurePosixPath(rel).name
+        if leaf in out:
+            ss.problems.append(f"include has two folders named '{leaf}': {out[leaf]} and {rel}")
+        else:
+            out[leaf] = rel
+    if isinstance(allow, list):
+        norm = [PurePosixPath(x).as_posix() for x in allow]
+        for raw, n in zip(allow, norm):
+            if n not in ss.include:
+                ss.problems.append(f"allow_scripts names '{raw}', which is not in include")
+        ss.allow_scripts = norm
+    return out
+
+
+def _top_level_links(path: Path) -> list[str]:
+    """Symlinks directly in a flat set (a set without `include` has no business holding any)."""
+    return [e for e in sorted(os.listdir(path)) if stat.S_ISLNK(os.lstat(path / e).st_mode)]
 
 
 def _walk_set(top: Path, root: Path, allow_other: bool, bad_text: list, specials: list) -> list[str]:
@@ -500,6 +598,50 @@ def _walk_set(top: Path, root: Path, allow_other: bool, bad_text: list, specials
                                       or not (n.lower().endswith(SKILL_TEXT_SUFFIXES) or n.startswith("LICENSE"))):
                 bad_text.append(rel)
     return links
+
+
+SKILL_HEADS_FILE = "skills.heads"      # in the profile's state dir: each set's HEAD when the sandbox was created
+
+
+def recorded_skill_heads(prof: Profile) -> dict:
+    try:
+        v = json.loads((prof.state / SKILL_HEADS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def record_skill_heads(prof: Profile):
+    (prof.state / SKILL_HEADS_FILE).write_text(
+        json.dumps({ss.name: {"commit": ss.commit, "branch": ss.branch} for ss in prof.skillsets}))
+
+
+def skill_drift(prof: Profile, ss: SkillSet) -> tuple[str, list[str]]:
+    """(state, warnings). state: pinned | mismatch (ref set) or unchanged | changed | unrecorded.
+    A pinned set cannot drift: a HEAD that is not `ref` is a refusal, not a warning."""
+    if ss.ref:
+        return ("pinned" if ss.commit == ss.ref else "mismatch"), []
+    rec = recorded_skill_heads(prof).get(ss.name)
+    if not isinstance(rec, dict):
+        return "unrecorded", []
+    warns, old, new = [], rec.get("commit"), ss.commit
+    live = "The mount is live, so running sandboxes already see the new content."
+    if old != new:
+        w = f"skill set {ss.name}: HEAD of {ss.path} was {old} when the sandbox was created and is now {new}. {live}"
+        if isinstance(old, str) and isinstance(new, str) and _hex40(old) and _hex40(new):
+            paths = ss.include if ss.include is not None else ["."]
+            w += f" Review: git -C {shlex.quote(str(ss.path))} diff {old} {new} -- {' '.join(map(shlex.quote, paths))}"
+        warns.append(w)
+    if rec.get("branch") != ss.branch:
+        warns.append(f"skill set {ss.name}: the checked-out branch of {ss.path} was {rec.get('branch') or '(detached)'}"
+                     f" when the sandbox was created and is now {ss.branch or '(detached)'}. {live}")
+    return ("changed" if warns else "unchanged"), warns
+
+
+def warn_skill_drift(prof: Profile):
+    for ss in prof.skillsets:
+        for w in skill_drift(prof, ss)[1]:
+            info("WARNING: " + w)
 
 
 # ----------------------------------------------------- agentbox skills vendor
@@ -1101,7 +1243,8 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
         p.write_text(content)
     # `skills` only counts once used, so sandboxes made before skill sets existed don't look changed
     shaped = {k: v for k, v in prof.d.items() if k != "skills" or v}
-    skill_defs = json.dumps([[n, cfg.skillsets[n]] for n in prof.d["skills"]], sort_keys=True, default=str)
+    # only the path is baked in at creation (the mount); ref/include/allow_scripts apply live, no fresh needed
+    skill_defs = json.dumps([[n, cfg.skillsets[n].get("path")] for n in prof.d["skills"]], sort_keys=True, default=str)
     digest = hashlib.sha256((text + json.dumps(files, sort_keys=True) + json.dumps(shaped, sort_keys=True, default=str)
                              + (skill_defs if prof.d["skills"] else "")).encode()).hexdigest()
     return str(kit_dir), digest
@@ -1870,6 +2013,7 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
                 msg += (" The skill set paths changed: a new mount only exists after a fresh"
                         " (links to skills that are already mounted apply on the next `up`).")
             info(msg)
+        warn_skill_drift(prof)
         start_bridge(prof)
     else:
         kits = [str(p) for p in prof.kit_paths()] + [kit_dir]
@@ -1895,6 +2039,7 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
             sbx(cfg, *create)
         digest_file.write_text(digest)
         (prof.state / "skills.mounts").write_text(json.dumps(list(map(str, prof.skill_mounts()))))
+        record_skill_heads(prof)
         set_secrets(prof)
         for p in prof.d["publish"]:
             sbx(cfg, "ports", prof.sandbox, "--publish", p, check=False)
@@ -2600,7 +2745,8 @@ def profile_status(prof: Profile, states=_FETCH) -> dict:
 def skills_status(prof: Profile) -> list[dict]:
     rows = []
     for ss in prof.skillsets:
-        row = {"set": ss.name, "path": str(ss.path) if ss.path else None, "skills": list(ss.skills), "commit": ss.commit}
+        row = {"set": ss.name, "path": str(ss.path) if ss.path else None, "ref": ss.ref, "commit": ss.commit,
+               "branch": ss.branch, "skills": list(ss.skills), "drift": skill_drift(prof, ss)[0]}
         if ss.problems:
             row["problems"] = list(ss.problems)
         rows.append(row)
@@ -2779,8 +2925,16 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
                 rep.note("info", f"{r}: hooks in .git/hooks run on the host when you commit; a global"
                          " core.hooksPath helps, but a repo-level core.hooksPath overrides it - `agentbox audit` flags that")
         for ss in prof.skillsets:
-            where = f"{ss.path} - {len(ss.skills)} skill(s), " + (f"commit {ss.commit}" if ss.commit else "not a git repo")
-            rep.note("info", f"skill set {ss.name}: {where}", data={"set": ss.name, "skills": ss.skills})
+            state, drift = skill_drift(prof, ss)
+            where = (f"{ss.path} - {len(ss.skills)} skill(s): {_capped(ss.skills)}; ref {ss.ref or 'none'}; "
+                     + (f"HEAD {ss.commit} on {ss.branch or 'a detached HEAD'}" if ss.commit else "not a git repo")
+                     + f"; drift: {state}")
+            rep.note("info", f"skill set {ss.name}: {where}",
+                     data={"set": ss.name, "path": str(ss.path), "ref": ss.ref, "commit": ss.commit,
+                           "branch": ss.branch, "skills": ss.skills, "drift": state})
+            for w in drift:
+                rep.note("warn", w, "if you did not mean to change it: check the old commit/branch out again;"
+                         " pin it with `ref`")
             for problem in ss.problems:
                 chk(False, f"skill set {ss.name}: {problem}", "fix the folder or [skillsets.%s] in agentbox.toml" % ss.name)
         for problem in prof.skill_problems():

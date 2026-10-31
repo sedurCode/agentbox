@@ -29,17 +29,21 @@ deny = [
 ]
 
 # ---------------------------------------------------------------------------
-# Skill sets: host folders of agent skills (<path>/<skill>/SKILL.md), mounted READ-ONLY and
-# linked into ~/.claude/skills. Keep them outside every workspace, the config dir and ~/.claude.
-# Fill one from a pinned commit with:
-#   agentbox skills vendor github:OWNER/REPO@<40-hex SHA> --only a,b --into ~/agent-skills/core
-# [skillsets.core]
-# path = "~/agent-skills/core"       # required: one subfolder per skill, each with a SKILL.md
-# allow_scripts = false              # default false: refuse a set with non-text files
-# description = "reviewed team skills"
+# Skill sets: ONE git repo on the host (e.g. a fork of mattpocock/skills), mounted READ-ONLY as a
+# whole; a profile picks skills by path. Nothing is copied. Keep it out of every WRITABLE workspace
+# (direct-mode workspace, extra without :ro), the config dir and ~/.claude. The mount is live:
+# `ref` refuses to mount unless the repo's HEAD is exactly the commit you reviewed.
+# [skillsets.pocock]
+# path = "~/gits/skills"                      # a git work tree; mounted read-only as a whole
+# ref = "a496f5513d4a4cf889bc48e189e579f4b0bdf6aa"   # optional pin: refuse to mount unless HEAD is exactly this
+# include = ["skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox"]
+# allow_scripts = ["skills/engineering/diagnosing-bugs"]   # true | false | list of included paths (default false)
 #
-# Profiles pick sets with `skills = [...]`; [defaults] skills are merged in. Changing which
-# sets a profile mounts needs `agentbox fresh <profile>`.
+# [profiles.voicedev]
+# skills = ["pocock"]                         # merged with [defaults]
+#
+# Update: git fetch upstream; git diff main upstream/main -- <included paths>; merge; update `ref`.
+# No `fresh` needed for that; a new set or a changed `path` does need `agentbox fresh <profile>`.
 
 # ---------------------------------------------------------------------------
 # Profiles: one sandbox each.  agentbox up <profile>
@@ -56,7 +60,7 @@ extra_workspaces = [
   "~/src/stm32-common:ro",           # read-only reference code
 ]
 kits = ["embedded-arm"]              # toolchain inside the sandbox
-# skills = ["core"]                  # [skillsets.core] above, mounted read-only
+# skills = ["pocock"]                # [skillsets.pocock] above, mounted read-only
 # kits = ["embedded-arm", "claude-team"]   # + opusplan main loop and reader/worker/architect subagents (Claude profiles only)
 # kits = ["embedded-arm", "python-node"]   # + Python 3 / venv / pip, Node, git
 allow = [

@@ -194,7 +194,8 @@ class TextOnlyTests(VendorCase):
 
     def test_the_result_passes_the_skill_set_rules(self):
         self.vendor(good_members(self.EXTRA), only="alpha,group/beta")
-        cfg = self.write_config(f'[skillsets.core]\npath = "{self.into}"\n[profiles.p]\nworkspace = "{self.ws}"\n')
+        cfg = self.write_config(f'[skillsets.core]\npath = "{self.into}"\ninclude = ["alpha", "beta"]\n'
+                                f'[profiles.p]\nworkspace = "{self.ws}"\n')
         ss = ab.inspect_skillset(cfg, "core")
         self.assertEqual(ss.problems, [])
         self.assertEqual(ss.skills, ["alpha", "beta"])          # SOURCES.json and LICENSES/ are not skills

@@ -78,7 +78,7 @@ the important keys:
 | `extra_workspaces` | more mounts, append `:ro` for read-only |
 | `mode` | `direct` (default) or `clone` — agent gets its own git clone, host tree untouched; you `git fetch sandbox-ab-<profile>` to review. Host tools need `direct`. |
 | `kits` | kit names under `~/.config/agentbox/kits/` or paths |
-| `skills` | names of `[skillsets.*]` (host folders of agent skills, mounted read-only and linked into `~/.claude/skills`), merged with `[defaults]` — see *Skill sets* below |
+| `skills` | names of `[skillsets.*]` (a git repo of agent skills, mounted read-only, skills picked by path and linked into `~/.claude/skills`), merged with `[defaults]` — see *Skill sets* below |
 | `allow` / `deny` | sandbox-scoped egress rules (merged with `[defaults]`; deny wins) |
 | `env` | plain env vars for the VM (not for secrets) |
 | `secrets` | sandbox-scoped credentials, see §4 |
@@ -107,22 +107,38 @@ agentbox doctor            # validates kits, host tools, paths
 
 ### Skill sets
 
-A skill set is a **host folder** with one subfolder per agent skill (`<name>/SKILL.md` plus whatever it
-references). Profiles pick sets by name; agentbox mounts each one read-only and links its skills into the
-agent's skill directory, so several sandboxes can share one reviewed set.
+A skill set is **one git repo on the host** — typically your fork of a skills repo, e.g. a fork of
+`mattpocock/skills` at `~/gits/skills`, laid out as `skills/<bucket>/<skill>/SKILL.md`. agentbox mounts the
+whole work tree **read-only** into the sandboxes that want it, and a profile picks the skills it wants **by
+path**. Nothing is copied or vendored: the repo is the single source, and git is how you review and update it.
 
 ```toml
-[skillsets.core]
-path = "~/agent-skills/core"     # required: one subfolder per skill
-allow_scripts = false            # default false: refuse a set with non-text files
-description = "reviewed team skills"
+[skillsets.pocock]
+path = "~/gits/skills"                      # a git work tree; mounted read-only as a whole
+ref = "a496f5513d4a4cf889bc48e189e579f4b0bdf6aa"   # optional pin: refuse to mount unless HEAD is exactly this
+include = ["skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox"]
+allow_scripts = ["skills/engineering/diagnosing-bugs"]   # true | false | list of included paths (default false)
+description = "my fork of mattpocock/skills"
 
 [defaults]
-skills = ["core"]                # merged with the profile's own list, like allow / deny / kits
+skills = ["pocock"]              # merged with the profile's own list, like allow / deny / kits
 
-[profiles.h750]
-skills = ["embedded"]
+[profiles.voicedev]
+skills = ["pocock"]
 ```
+
+- `include` is a list of relative paths, each a folder holding a `SKILL.md`. The skill's name is the folder's
+  last path component (`skills/engineering/tdd` → `tdd`). When `include` is present, **only** those folders are
+  skills, and only they are checked. Without `include`, every immediate subfolder is a skill, so a flat folder
+  of skills still works.
+- `allow_scripts` is `true`, `false` (default) or a list of included paths whose folders may hold non-text
+  files and executables. A path in the list that is not in `include` is an error.
+- `ref` is the commit you have reviewed (full 40-hex hash). **Pinning is recommended.**
+
+**Files outside the included folders are not checked.** The repo's own `AGENTS.md -> CLAUDE.md` symlink,
+`scripts/*.sh`, `package.json`, `.github/`, `.claude-plugin/` and every skill you did not include are mounted
+(the mount is the whole work tree) and the agent can read them as text, but they are never linked as skills and
+never fail the set. Do not keep anything secret in the repo.
 
 **Rules.** They are checked when the config is loaded for a command that mounts (`up`, `fresh`, `code`,
 `shell`, `run`, `resume`), by `doctor` (as `FAIL`s) and again right before every mount. A skill is an
@@ -132,20 +148,50 @@ agent controls:
 | rule | why |
 |---|---|
 | `path` exists, is a directory and is not a symlink | what you reviewed is what gets mounted; a link could be re-pointed |
-| its resolved path overlaps **no workspace of any profile** (either direction), is not inside the config dir, does not contain the config file, the kits dir or the state dir, and has nothing to do with `~/.claude` | an agent-writable skill set would let one sandbox plant instructions for every other one; the config/kits/state hold your permissions; `~/.claude` holds your own settings and credentials |
-| each immediate subfolder is a skill: it has a `SKILL.md`, a name matching `^[a-z0-9][a-z0-9-]{0,63}$`, and a name that is neither a Claude Code built-in (`code-review`, `security-review`, `simplify`, `init`, `claude-api`, `run`, `loop`, `schedule`, `update-config`, `keybindings-help`, `fewer-permission-prompts`, `statusline-setup`) nor present in another set of the same profile | a skill must not shadow a built-in or silently replace another set's skill |
-| no symlinks anywhere in the set | a link can point at anything the VM can reach |
-| text only unless `allow_scripts = true`: every file is `.md`, `.txt`, `.json`, `.yaml`/`.yml` or `LICENSE*`, none is executable, and there are no FIFOs or devices | skills that can't carry code can only persuade, not run |
+| its resolved path overlaps **nothing the agent can write on the host** (either direction): a `mode = "direct"` workspace, or an `extra_workspaces` entry without `:ro` in either mode. A clone-mode workspace (the agent works on its own clone; the source is mounted read-only) and `:ro` extras don't count. It is also not inside the config dir, does not contain the config file, the kits dir or the state dir, and has nothing to do with `~/.claude` | an agent-writable skill set would let one sandbox plant instructions for every other one; the config/kits/state hold your permissions; `~/.claude` holds your own settings and credentials |
+| each `include` path is relative, has no `..`, goes through no symlink at any level (every component is `lstat`ed) and resolves inside the set; two paths may not end in the same name | the include list can't reach outside the repo, and a skill name is unambiguous |
+| each skill has a `SKILL.md`, a name matching `^[a-z0-9][a-z0-9-]{0,63}$`, and a name that is neither a Claude Code built-in (`code-review`, `security-review`, `simplify`, `init`, `claude-api`, `run`, `loop`, `schedule`, `update-config`, `keybindings-help`, `fewer-permission-prompts`, `statusline-setup`) nor present in another set of the same profile | a skill must not shadow a built-in or silently replace another set's skill |
+| no symlinks inside a skill folder | a link can point at anything the VM can reach |
+| text only unless `allow_scripts` covers the skill: every file is `.md`, `.txt`, `.json`, `.yaml`/`.yml` or `LICENSE*`, none is executable, and there are no FIFOs or devices (those are refused even when scripts are allowed) | skills that can't carry code can only persuade, not run |
+| `ref`, if set, equals the work tree's HEAD | the mount is live: this is what keeps a different checkout from reaching the agent |
 
-Ignored at the top level of a set: dot entries (`.git`...), plain files (`SOURCES.json`, a README) and
-`LICENSES/` (which `vendor` writes). They are mounted, since the whole folder is, but are not skills.
-`doctor` and `status --json` show each set's path, its skills and its git commit — read from `.git/HEAD`
-and the refs as text; agentbox never runs git on the host for this.
+(Without `include`, the immediate subfolders are checked the same way; dot entries such as `.git` and plain
+top-level files such as `LICENSE*` or a README are ignored, and a symlink at the top level is refused.)
+
+### Pinning, drift and updates
+
+The mount is **live**. If you check out another branch in `~/gits/skills` — a review branch, say — every
+running sandbox sees that content immediately. That is what `ref` is for. HEAD is read as text from `.git`
+(agentbox never runs git on the host).
+
+- **With `ref`:** if HEAD is not exactly that commit, `up`, `fresh`, `run` and the other mounting commands
+  refuse, and `doctor` reports a `FAIL`, printing both commits. Nothing is created or linked.
+- **Without `ref`:** each set's HEAD commit and branch are recorded in the profile's state when the sandbox is
+  created. On `up`, `run` and `doctor`, if the commit or the checked-out branch has changed since, agentbox
+  prints a `WARNING` that running sandboxes already see the new content, with both commits and the review
+  command `git -C <path> diff <old> <new> -- <included paths>`. `agentbox fresh` records the new state.
+
+`doctor` and `status --json` show per set: path, `ref` (if any), HEAD commit, branch, the included skills and
+the drift state (`pinned`, `mismatch`, `unchanged`, `changed`, `unrecorded`).
+
+**Updating** is a git flow in the skills repo:
+
+```bash
+git -C ~/gits/skills fetch upstream
+git -C ~/gits/skills diff main upstream/main -- skills/engineering/tdd skills/productivity/grilling skills/local/sandbox
+git -C ~/gits/skills merge upstream/main       # after reading the diff
+git -C ~/gits/skills rev-parse HEAD            # put this in `ref`
+```
+
+Edit `ref` in `agentbox.toml`. `agentbox fresh` is **not** needed — the mount is live and `ref`, `include`
+and `allow_scripts` are not part of the creation-time kit digest (a changed `path` is, and needs one) — but
+until you update `ref` the check refuses to create or link, so a merge you haven't acknowledged cannot reach a
+new sandbox. Commands that run `up` link new `include` entries on the next run.
 
 **How linking works.** Each set is added to `sbx create` as `<path>:ro`, which mounts it read-only at the
 *same absolute path* as on the host (direct and clone mode). Then one idempotent `sh` script runs in the VM
-and makes `~/.claude/skills/<skill>` a symlink to `<set path>/<skill>`. It runs after create and on every
-`up`, `run`, `code`, `shell` and `resume`, but only against a **running** sandbox — it never boots one.
+and makes `~/.claude/skills/<skill>` a symlink to `<set path>/<included path>`. It runs after create and on
+every `up`, `run`, `code`, `shell` and `resume`, but only against a **running** sandbox — it never boots one.
 When the sandbox is stopped (typically the first `up`), a background thread waits until `sbx run` or
 `sbx exec` has started it and then links, logging to `<state>/skills.out` instead of your terminal; start
 the agent again if it had already read its skill directory.
@@ -154,10 +200,8 @@ the agent again if it had already read its skill directory.
   removes those whose skill is no longer configured. Real folders and other symlinks — skills the agent
   writes itself — are never touched. That file is agent-writable, so a name from it is only used if it is
   a plain skill name *and* the entry is a symlink.
-- Changing `skills` changes the kit digest, so the usual "profile changed, run `agentbox fresh`" message
-  appears. Linking alone applies without a fresh, but a **new mount** (a new set or a changed `path`)
-  needs one, and the message says so when the paths changed. A skill whose folder isn't mounted yet is
-  reported as "not linked", not linked dangling.
+- A **new mount** (a new set or a changed `path`) needs `agentbox fresh`, and the message says so when the
+  paths changed. A skill whose folder isn't mounted yet is reported as "not linked", not linked dangling.
 - The generated kit's instructions name the mounted sets and tell the agent they are read-only.
 
 **`agentbox skills vendor`** fills a set folder from a *pinned* GitHub commit (host side, no sandbox):

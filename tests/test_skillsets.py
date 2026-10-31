@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -70,9 +72,9 @@ class RuleTests(SkillCase):
         (self.sets / "core" / "alpha" / "ref").mkdir()
         (self.sets / "core" / "alpha" / "ref" / "notes.txt").write_text("x")
         (self.sets / "core" / "alpha" / "LICENSE").write_text("MIT")
-        (self.sets / "core" / "SOURCES.json").write_text("{}")
-        (self.sets / "core" / "LICENSES").mkdir()
-        (self.sets / "core" / "LICENSES" / "o-r.txt").write_text("MIT")
+        (self.sets / "core" / "LICENSE").write_text("MIT")       # top-level files are never looked at
+        (self.sets / "core" / "package.json").write_text("{}")
+        (self.sets / "core" / "run.sh").write_text("echo")
         ss = self.inspect()
         self.assertEqual((ss.problems, ss.skills, ss.commit), ([], ["alpha", "beta"], None))
         self.assertEqual(ss.path, (self.sets / "core").resolve())
@@ -90,7 +92,7 @@ class RuleTests(SkillCase):
         self.assertIn("must be absolute", self.problems(sets={"core": 'path = "relative/dir"'}))
         self.assertIn("allow_scripts must be", self.problems(sets={"core": f'path = "{real}"\nallow_scripts = "yes"'}))
 
-    def test_set_inside_or_around_a_workspace_of_any_profile(self):
+    def test_set_inside_or_around_a_writable_workspace_of_any_profile(self):
         inside = self.make_set(where=self.ws / "skills")
         self.assertIn("overlaps workspace", self.problems(sets={"core": f'path = "{inside}"'}))
         other = self.tmp / "other-ws"
@@ -104,10 +106,54 @@ class RuleTests(SkillCase):
             [profiles.q]
             enabled = false
             workspace = "{other}"
-            extra_workspaces = ["{around / 'alpha'}:ro"]
+            extra_workspaces = ["{around / 'alpha'}"]
         ''')
         self.assertIn("overlaps workspace", " ".join(ab.inspect_skillset(cfg, "core").problems))
         self.assertEqual(ab.inspect_skillset(self.config(), "core").problems, [])
+
+    def overlap(self, ws_toml, set_path=None):
+        set_path = set_path or self.make_set(where=self.tmp / "repo")
+        cfg = self.write_config(f'''
+            [skillsets.core]
+            path = "{set_path}"
+            [profiles.p]
+            workspace = "{self.ws}"
+            {ws_toml}
+        ''')
+        return " ".join(ab.inspect_skillset(cfg, "core").problems)
+
+    def test_clone_mode_workspace_and_read_only_extras_do_not_count(self):
+        repo = self.make_set(where=self.tmp / "repo")
+        self.assertEqual(self.overlap('', repo), "")
+        cfg = self.write_config(f'''
+            [skillsets.core]
+            path = "{repo}"
+            [profiles.cl]
+            workspace = "{repo}"
+            mode = "clone"
+            [profiles.ro]
+            workspace = "{self.ws}"
+            extra_workspaces = ["{repo}:ro", "{repo / 'alpha'}:ro"]
+        ''')
+        self.assertEqual(ab.inspect_skillset(cfg, "core").problems, [])
+        cfg = self.write_config(f'''
+            [defaults]
+            mode = "clone"
+            [skillsets.core]
+            path = "{repo}"
+            [profiles.cl]
+            workspace = "{repo}"
+        ''')
+        self.assertEqual(ab.inspect_skillset(cfg, "core").problems, [])         # mode inherited from [defaults]
+
+    def test_direct_mode_workspace_and_writable_extras_are_refused(self):
+        repo = self.make_set(where=self.tmp / "repo")
+        for body in (f'workspace = "{repo}"', f'workspace = "{repo}"\nmode = "direct"'):
+            cfg = self.write_config(f'[skillsets.core]\npath = "{repo}"\n[profiles.d]\n{body}\n')
+            self.assertIn("overlaps workspace", " ".join(ab.inspect_skillset(cfg, "core").problems))
+        for extra in (f'"{repo}"', f'"{repo}:rw"'):
+            for mode in ("direct", "clone"):          # an extra is writable in either mode
+                self.assertIn("overlaps workspace", self.overlap(f'mode = "{mode}"\nextra_workspaces = [{extra}]', repo))
 
     def test_config_kits_state_and_claude_dir(self):
         cases = {
@@ -152,12 +198,10 @@ class RuleTests(SkillCase):
         (root / "alpha" / "deep" / "ln").symlink_to("/etc/passwd")
         (root / "alpha" / "dirlink").symlink_to(self.tmp)
         (root / "toplink").symlink_to(self.tmp)
-        (root / "LICENSES").mkdir()
-        (root / "LICENSES" / "x.txt").symlink_to("/etc/hostname")
         (root / ".hidden-link").symlink_to(self.tmp)
         for extra in ("", "\nallow_scripts = true"):
             got = self.problems(sets={"core": f'path = "{root}"{extra}'})
-            for name in ("alpha/deep/ln", "alpha/dirlink", "toplink", "LICENSES/x.txt", ".hidden-link"):
+            for name in ("alpha/deep/ln", "alpha/dirlink", "toplink", ".hidden-link"):
                 self.assertIn(name, got)
 
     def test_text_only_and_executable_bit(self):
@@ -246,6 +290,304 @@ class CommitTests(SkillCase):
         self.assertIsNotNone(ab.git_commit_of(self.sets / "core"))
 
 
+class RepoCase(SkillCase):
+    """A repo-shaped set: skills/<bucket>/<skill>/SKILL.md plus things that are not skills."""
+
+    def make_repo(self, where=None):
+        root = where or (self.tmp / "repo")
+        for rel in ("skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox",
+                    "skills/engineering/diagnosing-bugs"):
+            (root / rel).mkdir(parents=True, exist_ok=True)
+            (root / rel / "SKILL.md").write_text("# s\n")
+        (root / "skills" / "engineering" / "diagnosing-bugs" / "scripts").mkdir(exist_ok=True)
+        (root / "skills" / "engineering" / "diagnosing-bugs" / "scripts" / "run.sh").write_text("echo")
+        (root / "scripts").mkdir(exist_ok=True)
+        (root / "scripts" / "link.sh").write_text("#!/bin/sh")
+        (root / "scripts" / "link.sh").chmod(0o755)
+        (root / "CLAUDE.md").write_text("x")
+        if not (root / "AGENTS.md").is_symlink():
+            (root / "AGENTS.md").symlink_to("CLAUDE.md")
+        (root / "package.json").write_text("{}")
+        (root / ".github").mkdir(exist_ok=True)
+        (root / ".github" / "ci.yml").write_text("x")
+        (root / ".claude-plugin").mkdir(exist_ok=True)
+        (root / ".claude-plugin" / "plugin.json").write_bytes(b"\x00")
+        return root
+
+    INC = '["skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox"]'
+
+    def repo_set(self, extra="", include=None):
+        root = self.make_repo()
+        inc = self.INC if include is None else include
+        return ab.inspect_skillset(self.config({"core": f'path = "{root}"\ninclude = {inc}\n{extra}'}), "core")
+
+
+class IncludeTests(RepoCase):
+    def test_only_included_folders_are_skills_and_the_rest_is_not_checked(self):
+        ss = self.repo_set()
+        self.assertEqual(ss.problems, [])          # symlink, script, binary and .github are outside the include
+        self.assertEqual(ss.skills, ["tdd", "grilling", "sandbox"])
+        self.assertEqual(ss.folders["tdd"], "skills/engineering/tdd")
+        self.assertEqual(ss.include, ["skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox"])
+
+    def test_without_include_the_repo_root_is_flat_and_fails_on_its_layout(self):
+        root = self.make_repo()
+        got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{root}"'}), "core").problems)
+        self.assertIn("'skills' has no SKILL.md", got)
+        self.assertIn("symlinks are not allowed: AGENTS.md", got)
+
+    def test_included_folders_get_every_rule(self):
+        root = self.make_repo()
+        tdd = root / "skills" / "engineering" / "tdd"
+        (tdd / "ln").symlink_to("/etc")
+        (tdd / "tool.py").write_text("print(1)")
+        os.mkfifo(tdd / "pipe.md")
+        (root / "skills" / "local" / "sandbox" / "SKILL.md").unlink()
+        got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{root}"\ninclude = {self.INC}'}), "core").problems)
+        for want in ("skills/engineering/tdd/ln", "skills/engineering/tdd/tool.py", "skills/engineering/tdd/pipe.md",
+                     "'sandbox' has no SKILL.md"):
+            self.assertIn(want, got)
+
+    def test_name_rule_and_builtin_clash_use_the_last_component(self):
+        root = self.make_repo()
+        for rel in ("skills/x/Bad_Name", "skills/x/simplify"):
+            (root / rel).mkdir(parents=True)
+            (root / rel / "SKILL.md").write_text("x")
+        got = " ".join(ab.inspect_skillset(
+            self.config({"core": f'path = "{root}"\ninclude = ["skills/x/Bad_Name", "skills/x/simplify"]'}), "core").problems)
+        self.assertIn("a skill name must match", got)
+        self.assertIn("'simplify' would shadow a built-in", got)
+
+    def test_two_paths_with_the_same_last_component_are_an_error(self):
+        root = self.make_repo()
+        (root / "skills" / "local" / "tdd").mkdir()
+        (root / "skills" / "local" / "tdd" / "SKILL.md").write_text("x")
+        got = " ".join(ab.inspect_skillset(self.config(
+            {"core": f'path = "{root}"\ninclude = ["skills/engineering/tdd", "skills/local/tdd"]'}), "core").problems)
+        self.assertIn("two folders named 'tdd'", got)
+
+    def test_bad_include_paths(self):
+        root = self.make_repo()
+        (root / "linked").symlink_to(root / "skills")
+        (root / "skills" / "engineering" / "deep").symlink_to(root / "skills" / "local")
+        (root / "afile").write_text("x")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "SKILL.md").write_text("x")
+        cases = {
+            str(outside): "must be relative",
+            "/skills/engineering/tdd": "must be relative",
+            "../outside": "must not contain",
+            "skills/../skills/engineering/tdd": "must not contain",
+            "linked/engineering/tdd": "goes through a symlink",
+            "skills/engineering/deep/sandbox": "goes through a symlink",
+            "skills/engineering/deep": "goes through a symlink",
+            "skills/nope": "does not exist",
+            "afile": "is not a directory",
+            ".": "names the set itself",
+            "": "non-empty",
+        }
+        for inc, want in cases.items():
+            got = " ".join(ab.inspect_skillset(self.config(
+                {"core": f'path = "{root}"\ninclude = [{json.dumps(inc)}]'}), "core").problems)
+            self.assertIn(want, got, inc)
+        for bad in ('"skills/engineering/tdd"', "[]", "[1]"):
+            got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{root}"\ninclude = {bad}'}), "core").problems)
+            self.assertIn("include must be", got, bad)
+
+    def test_trailing_slash_and_dot_components_are_normalised(self):
+        ss = self.repo_set(include='["skills/./engineering/tdd/"]')
+        self.assertEqual((ss.problems, ss.include), ([], ["skills/engineering/tdd"]))
+
+    def test_links_point_at_the_folder_inside_the_mount(self):
+        root = self.make_repo()
+        cfg = self.config({"core": f'path = "{root}"\ninclude = {self.INC}'}, 'skills = ["core"]')
+        links = dict(cfg.profile("p").skill_links())
+        self.assertEqual(links["tdd"], f"{root}/skills/engineering/tdd")
+        self.assertEqual(links["sandbox"], f"{root}/skills/local/sandbox")
+
+
+class AllowScriptsTests(RepoCase):
+    DB = "skills/engineering/diagnosing-bugs"
+
+    def inc(self):
+        return f'["skills/engineering/tdd", "{self.DB}"]'
+
+    def test_false_by_default_true_and_list(self):
+        self.assertIn(f"{self.DB}/scripts/run.sh", " ".join(self.repo_set(include=self.inc()).problems))
+        self.assertEqual(self.repo_set("allow_scripts = true", self.inc()).problems, [])
+        ss = self.repo_set(f'allow_scripts = ["{self.DB}"]', self.inc())
+        self.assertEqual(ss.problems, [])
+
+    def test_list_covers_only_the_listed_paths(self):
+        root = self.make_repo()
+        (root / "skills" / "engineering" / "tdd" / "x.py").write_text("1")
+        cfg = self.config({"core": f'path = "{root}"\ninclude = {self.inc()}\nallow_scripts = ["{self.DB}"]'})
+        got = " ".join(ab.inspect_skillset(cfg, "core").problems)
+        self.assertIn("tdd/x.py", got)
+        self.assertNotIn("run.sh", got)
+
+    def test_a_path_that_is_not_included_is_an_error(self):
+        got = " ".join(self.repo_set('allow_scripts = ["skills/local/sandbox"]', self.inc()).problems)
+        self.assertIn("'skills/local/sandbox', which is not in include", got)
+        flat = self.make_set()
+        got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{flat}"\nallow_scripts = ["alpha"]'}), "core").problems)
+        self.assertIn("no `include`", got)
+
+    def test_symlinks_and_fifos_stay_refused_even_when_covered(self):
+        root = self.make_repo()
+        tdd = root / "skills" / "engineering" / "tdd"
+        (tdd / "ln").symlink_to("/etc")
+        os.mkfifo(tdd / "pipe")
+        cfg = self.config({"core": f'path = "{root}"\ninclude = ["skills/engineering/tdd"]\n'
+                                   'allow_scripts = ["skills/engineering/tdd"]'})
+        got = " ".join(ab.inspect_skillset(cfg, "core").problems)
+        self.assertIn("tdd/ln", got)
+        self.assertIn("tdd/pipe", got)
+
+
+class RefTests(RepoCase):
+    OTHER = "f" * 40
+
+    def git_repo(self, head=HEX, branch="main"):
+        root = self.make_repo()
+        g = root / ".git"
+        (g / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        (g / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+        (g / "refs" / "heads" / branch).write_text(head + "\n")
+        return root
+
+    def inspect_repo(self, root, ref=None):
+        extra = f'\nref = "{ref}"' if ref is not None else ""
+        return ab.inspect_skillset(self.config({"core": f'path = "{root}"\ninclude = {self.INC}{extra}'}), "core")
+
+    def test_head_and_branch_are_read_without_git(self):
+        ss = self.inspect_repo(self.git_repo())
+        self.assertEqual((ss.commit, ss.branch, ss.ref, ss.problems), (HEX, "main", None, []))
+        (self.tmp / "repo" / ".git" / "HEAD").write_text(HEX + "\n")
+        self.assertEqual(self.inspect_repo(self.tmp / "repo").branch, None)
+
+    def test_matching_ref_passes_and_is_case_insensitive(self):
+        root = self.git_repo()
+        self.assertEqual(self.inspect_repo(root, HEX).problems, [])
+        self.assertEqual(self.inspect_repo(root, HEX.upper()).ref, HEX)
+
+    def test_mismatch_prints_both_commits(self):
+        got = " ".join(self.inspect_repo(self.git_repo(), self.OTHER).problems)
+        self.assertIn(f"HEAD is {HEX}", got)
+        self.assertIn(f"ref pins {self.OTHER}", got)
+
+    def test_ref_on_a_folder_that_is_not_a_work_tree_is_refused(self):
+        self.assertIn("HEAD is not a git work tree", " ".join(self.inspect_repo(self.make_repo(), HEX).problems))
+
+    def test_ref_must_be_40_hex(self):
+        root = self.git_repo()
+        for bad in ("main", HEX[:12], HEX + "0", "g" * 40):
+            self.assertIn("ref must be a full commit", " ".join(self.inspect_repo(root, bad).problems), bad)
+        cfg = self.config({"core": f'path = "{root}"\ninclude = {self.INC}\nref = 5'})
+        self.assertIn("ref must be a full commit", " ".join(ab.inspect_skillset(cfg, "core").problems))
+
+    def test_create_and_link_refuse_on_mismatch(self):
+        root = self.git_repo()
+        cfg = self.config({"core": f'path = "{root}"\ninclude = {self.INC}\nref = "{self.OTHER}"'}, 'skills = ["core"]')
+        rec = Recorder()
+        with mock.patch.object(ab, "sbx", rec), \
+                mock.patch.object(ab, "sandbox_exists", lambda prof, retry=False: False):
+            with self.assertRaises(SystemExit):
+                ab.ensure_sandbox(cfg.profile("p"))
+            with self.assertRaises(SystemExit):
+                ab.sync_skills(cfg.profile("p"), background=False)
+        self.assertEqual(rec.calls, [])
+        code, _, err = self.run_main("up", "p")
+        self.assertEqual(code, 2)
+        self.assertIn(self.OTHER, err)
+        self.assertIn(HEX, err)
+
+
+class DriftTests(RepoCase):
+    NEW = "e" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "repo"
+        self.make_repo(self.root)
+        self.move(HEX, "main")
+
+    def move(self, commit, branch):
+        g = self.root / ".git"
+        (g / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        (g / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+        (g / "refs" / "heads" / branch).write_text(commit + "\n")
+
+    def prof(self, extra=""):
+        return self.config({"core": f'path = "{self.root}"\ninclude = {RepoCase.INC}\n{extra}'},
+                           'skills = ["core"]').profile("p")
+
+    def create(self, extra=""):
+        prof = self.prof(extra)
+        with mock.patch.object(ab, "sbx", Recorder()), \
+                mock.patch.object(ab, "sandbox_exists", lambda prof, retry=False: False):
+            ab.ensure_sandbox(prof)
+        return prof
+
+    def existing(self, extra=""):
+        prof = self.prof(extra)
+        err = io.StringIO()
+        with mock.patch.object(ab, "sbx", Recorder()), mock.patch.object(ab, "start_bridge", lambda p: None), \
+                mock.patch.object(ab, "sandbox_exists", lambda prof, retry=False: True), contextlib.redirect_stderr(err):
+            ab.ensure_sandbox(prof)
+        return err.getvalue()
+
+    def test_creation_records_head_and_branch(self):
+        prof = self.create()
+        self.assertEqual(json.loads((prof.state / "skills.heads").read_text()),
+                         {"core": {"commit": HEX, "branch": "main"}})
+
+    def test_no_change_no_warning(self):
+        self.create()
+        self.assertNotIn("WARNING", self.existing())
+
+    def test_new_commit_warns_with_both_commits_and_the_diff_hint(self):
+        self.create()
+        self.move(self.NEW, "main")
+        err = self.existing()
+        self.assertIn("WARNING", err)
+        self.assertIn("running sandboxes already see the new content", err)
+        self.assertIn(f"git -C {self.root} diff {HEX} {self.NEW} -- skills/engineering/tdd skills/productivity/grilling"
+                      " skills/local/sandbox", err)
+
+    def test_other_branch_warns_even_at_the_same_commit(self):
+        self.create()
+        self.move(HEX, "review")
+        err = self.existing()
+        self.assertIn("checked-out branch", err)
+        self.assertIn("was main", err)
+        self.assertIn("now review", err)
+
+    def test_pinned_set_never_warns_and_is_refused_instead(self):
+        self.create(f'ref = "{HEX}"')
+        self.assertNotIn("WARNING", self.existing(f'ref = "{HEX}"'))
+        self.move(self.NEW, "main")
+        with self.assertRaises(SystemExit):
+            self.existing(f'ref = "{HEX}"')
+
+    def test_sandbox_made_before_recording_does_not_warn(self):
+        prof = self.create()
+        (prof.state / "skills.heads").unlink()
+        self.move(self.NEW, "main")
+        self.assertNotIn("WARNING", self.existing())
+
+    def test_status_and_doctor_show_the_set_and_the_drift(self):
+        self.create()
+        self.move(self.NEW, "review")
+        prof = self.prof()
+        row = ab.skills_status(prof)[0]
+        self.assertEqual((row["ref"], row["commit"], row["branch"], row["drift"], row["skills"]),
+                         (None, self.NEW, "review", "changed", ["tdd", "grilling", "sandbox"]))
+        self.assertEqual(ab.skill_drift(self.prof(f'ref = "{self.NEW}"'), ab.inspect_skillset(
+            self.config({"core": f'path = "{self.root}"\ninclude = {RepoCase.INC}\nref = "{self.NEW}"'}), "core"))[0], "pinned")
+
+
 class KitTests(SkillCase):
     def test_instructions_name_the_sets_and_say_read_only(self):
         prof = self.config(profile_extra='skills = ["core"]').profile("p")
@@ -272,10 +614,11 @@ class KitTests(SkillCase):
         moved = ab.render_local_kit(
             self.config({"core": f'path = "{other}"'}, 'skills = ["core"]').profile("p"), "t")[1]
         self.assertNotEqual(with_skills, moved)
-        scripts = ab.render_local_kit(
-            self.config({"core": f'path = "{self.sets / "core"}"\nallow_scripts = true'}, 'skills = ["core"]').profile("p"),
-            "t")[1]
-        self.assertNotEqual(with_skills, scripts)
+        # ref / include / allow_scripts apply to the live mount: no `fresh` needed
+        live = ab.render_local_kit(
+            self.config({"core": f'path = "{self.sets / "core"}"\nallow_scripts = true\nref = "{HEX}"\n'
+                                 'include = ["alpha"]'}, 'skills = ["core"]').profile("p"), "t")[1]
+        self.assertEqual(with_skills, live)
 
 
 class Recorder:
@@ -549,7 +892,8 @@ class StatusDoctorTests(LinkCase):
         self.assertEqual(code, 0)
         row = json.loads(out)["profiles"][0]
         self.assertEqual(row["skills"], [{"set": "core", "path": str((self.sets / "core").resolve()),
-                                          "skills": ["alpha", "beta"], "commit": None}])
+                                          "ref": None, "commit": None, "branch": None,
+                                          "skills": ["alpha", "beta"], "drift": "unrecorded"}])
 
     def test_status_json_without_skills_is_an_empty_list(self):
         self.config()
@@ -581,7 +925,7 @@ class StatusDoctorTests(LinkCase):
         msgs = {c["message"]: c["status"] for c in doc["checks"]}
         self.assertEqual(code, 1)                                  # not linked yet
         self.assertEqual(msgs["skill alpha is not linked (not-linked)"], "fail")
-        self.assertTrue(any("2 skill(s), not a git repo" in m for m in msgs))
+        self.assertTrue(any("2 skill(s): alpha, beta; ref none; not a git repo; drift: unrecorded" in m for m in msgs))
         self.assertEqual(msgs[f"skill sets pass the safety rules: core"], "pass")
         ab.sync_skills(self.config(profile_extra='skills = ["core"]').profile("p"), background=False)
         code, doc, _ = self.doctor()
