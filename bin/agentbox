@@ -13,6 +13,7 @@ Docker Sandboxes (`sbx`).
     agentbox stop <profile>      stop the sandbox and the host-tool bridge
     agentbox down <profile>      audit, then delete sandbox, scoped secrets, state
     agentbox fresh <profile>     down + up (use after editing the profile)
+    agentbox provision <name>    guided setup of a new profile (--yes, --dry-run, --up)
     agentbox status              sandboxes and bridges (--json)
     agentbox doctor [<profile>]  sanity / security checks (--json)
     agentbox bridge <profile>    run the host-tool bridge in the foreground
@@ -3049,6 +3050,429 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
     return EXIT_OK if rep.ok else EXIT_FAIL
 
 
+# --------------------------------------------------------------- provision
+# `agentbox provision <name>`: a guided way to add a profile. It reads the workspace (files only: it
+# never runs anything from it, git included), suggests kits and allow-list entries with the reason
+# for each, shows the TOML it would add and appends it to the config. The user's file is never
+# rewritten: it is backed up, the block is appended, and the whole file is parsed again.
+HOST_RE = re.compile(r"^[A-Za-z0-9*][A-Za-z0-9.*-]{0,252}(:\d{1,5})?$")
+GITHUB_GIT_RE = re.compile(r"git\+https://(?:www\.)?github\.com", re.I)
+GIT_LOCKFILES = ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+                 "Pipfile.lock", "uv.lock", "pyproject.toml")
+GITHUB_HOSTS = ("github.com", "codeload.github.com", "objects.githubusercontent.com")
+MAX_INSTRUCTIONS = 20000
+CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def toml_str(s: str) -> str:
+    """A TOML basic string. json.dumps without ensure_ascii escapes quotes, backslashes and C0
+    controls with sequences TOML shares; DEL is the one control it leaves raw, and TOML forbids it."""
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("text that is not valid Unicode (undecodable bytes in a path?)")
+    return json.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def toml_list(items) -> str:
+    return "[" + ", ".join(toml_str(x) for x in items) + "]"
+
+
+def toml_comment(s: str) -> str:
+    return "# " + safe_text(s).replace("\n", " ")
+
+
+def _read_small(p: Path, limit: int = 1 << 20) -> str:
+    """Text of a regular file (never a symlink, FIFO or device), at most `limit` bytes; "" otherwise."""
+    try:
+        if not stat.S_ISREG(os.lstat(p).st_mode):
+            return ""
+        with open(p, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def kit_installed(name: str) -> bool:
+    return (KITS_DIR / name / "spec.yaml").is_file()
+
+
+def detect_workspace(ws: Path) -> dict:
+    """What the workspace looks like, from file names and text only. Values are fixed strings."""
+    try:
+        top = {e.name for e in os.scandir(ws)}
+    except OSError:
+        top = set()
+    py = [n for n in ("pyproject.toml", "setup.py") if n in top] + \
+         (["requirements*.txt"] if any(fnmatch.fnmatch(n, "requirements*.txt") for n in top) else [])
+    node = ["package.json"] if "package.json" in top else []
+    arm = [f"{n} mentions arm-none-eabi" for n in ("CMakeLists.txt", "Makefile", "makefile", "GNUmakefile")
+           if n in top and "arm-none-eabi" in _read_small(ws / n)]
+    if not arm:
+        seen = 0
+        skip = DEFAULT_SETTINGS["audit_skip_dirs"]
+        for dirpath, dirnames, filenames in os.walk(ws, followlinks=False):
+            depth = len(Path(dirpath).relative_to(ws).parts)
+            dirnames[:] = [d for d in dirnames if d != ".git" and not any(fnmatch.fnmatch(d, g) for g in skip)] \
+                if depth < 4 else []
+            seen += len(filenames)
+            if any(f.endswith(".ld") for f in filenames):
+                arm.append("linker script (*.ld) found")
+                break
+            if seen > 20000:
+                break
+    git_urls = []
+    for n in sorted(top):
+        if (n in GIT_LOCKFILES or fnmatch.fnmatch(n, "requirements*.txt")) and GITHUB_GIT_RE.search(_read_small(ws / n)):
+            git_urls.append("requirements*.txt" if n.startswith("requirements") else n)
+    return {"python": py, "node": node, "arm": arm, "git_urls": git_urls}
+
+
+def suggest_settings(found: dict, agent: str, defaults: dict) -> tuple[list, list]:
+    """([(kit, reason)], [(allow host, reason)]); kits that are not installed and entries [defaults]
+    already has are left out."""
+    kits, allow = [], []
+    have_k, have_a = set(defaults.get("kits", [])), set(defaults.get("allow", []))
+    if found["python"] or found["node"]:
+        kits.append(("python-node", ", ".join(found["python"] + found["node"]) + " found"))
+    if found["arm"]:
+        kits.append(("embedded-arm", found["arm"][0]))
+    if agent == "claude":
+        kits.append(("claude-team", "model routing and subagents for Claude profiles"))
+    kits = [(k, r) for k, r in kits if kit_installed(k) and k not in have_k]
+    if found["python"]:
+        allow += [("pypi.org", "Python packages (" + ", ".join(found["python"]) + ")"),
+                  ("files.pythonhosted.org", "Python package downloads")]
+    if found["node"]:
+        allow.append(("registry.npmjs.org", "Node packages (package.json)"))
+    if found["git_urls"]:
+        allow += [(h, "git+https GitHub URL in " + ", ".join(found["git_urls"])) for h in GITHUB_HOSTS]
+    return kits, [(h, r) for h, r in allow if h not in have_a]
+
+
+def agent_config_warnings(root: Path) -> list[str]:
+    """Files in a workspace that an agent in the sandbox loads or can change, and that run code or
+    steer an agent on the host. Read-only; the caller prints them with safe_text."""
+    out = []
+    for n in ("CLAUDE.md", "AGENTS.md"):
+        if os.path.lexists(root / n):
+            out.append(f"{n}: the agent loads it as instructions and can edit it")
+    cdir = root / ".claude"
+    try:
+        names = sorted(e.name for e in os.scandir(cdir) if fnmatch.fnmatch(e.name, "settings*.json"))
+    except OSError:
+        names = []
+    for n in names:
+        try:
+            data = json.loads(_read_small(cdir / n))
+        except (ValueError, RecursionError):
+            data = None
+        hooks = isinstance(data, dict) and bool(data.get("hooks"))
+        out.append(f".claude/{n}: " + ("DEFINES HOOKS (commands that run whenever Claude Code starts here, "
+                                      "also on your Mac)" if hooks else "no hooks")
+                   + (" - could not be parsed" if data is None else "") + "; the agent can edit it")
+    if os.path.lexists(root / ".mcp.json"):
+        out.append(".mcp.json: MCP servers are started as commands by the agent that loads it; the agent can edit it")
+    for n in ("tasks.json", "launch.json"):
+        if os.path.lexists(root / ".vscode" / n):
+            out.append(f".vscode/{n}: VS Code runs these on your Mac when you use them; the agent can edit it")
+    gd = git_dir_of(root)
+    try:
+        hooks = sorted(e.name for e in os.scandir(gd / "hooks") if e.is_file() and not e.name.endswith(".sample")) if gd else []
+    except OSError:
+        hooks = []
+    if hooks:
+        out.append(f".git/hooks: {_capped(hooks, 10)} - hooks run on the host when you commit")
+    risky = risky_git_config(root)
+    if risky:
+        extra = " (a repo-level core.hooksPath overrides any global one)" if any("hookspath" in r.lower() for r in risky) else ""
+        out.append("git config entries that can run commands" + extra + ": " + "; ".join(risky[:10]))
+    return out
+
+
+def workspace_problems(cfg: Config, p: Path) -> list[str]:
+    """Why a folder must not be mounted: it holds (or sits inside) what must stay out of the agent's reach."""
+    bad = []
+    for what, x in (("the agentbox config", CONFIG_FILE), ("the kits dir", KITS_DIR),
+                    ("the state dir", cfg.state_root), ("~/.claude", HOME / ".claude")):
+        if is_within(x.resolve(), p):
+            bad.append(f"contains {what} ({x})")
+    for what, x in (("the config dir", CONFIG_DIR), ("~/.claude", HOME / ".claude")):
+        if is_within(p, x.resolve()):
+            bad.append(f"is inside {what} ({x})")
+    return bad
+
+
+def profile_block(name: str, d: dict, notes: dict) -> str:
+    """The TOML to append. `d` holds only what to write; `notes` maps a key to its reason lines."""
+    lines = [toml_comment(f"added by `agentbox provision` on {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"),
+             f"[profiles.{name}]"]
+    for key in ("agent", "workspace", "mode"):
+        lines.append(f"{key} = {toml_str(d[key])}")
+    for key in ("extra_workspaces", "kits", "skills", "allow"):
+        if d.get(key):
+            lines += [toml_comment(n) for n in notes.get(key, [])]
+            lines.append(f"{key} = {toml_list(d[key])}")
+    if d.get("instructions"):
+        lines.append("instructions = '''\n" + d["instructions"] + "'''")
+    return "\n".join(lines) + "\n"
+
+
+def check_instructions(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    if "'''" in text:
+        raise ValueError("instructions must not contain ''' (it would end the TOML literal string)")
+    if CONTROL_CHARS.search(text):
+        raise ValueError("instructions must not contain control characters (other than newline and tab)")
+    if len(text) > MAX_INSTRUCTIONS:
+        raise ValueError(f"instructions are over {MAX_INSTRUCTIONS} characters")
+    return text
+
+
+def append_profile(name: str, block: str, expected: dict) -> Path:
+    """Back up the config (0600), append the block after a blank line, parse the whole file again and
+    check the new table says what we meant. Any failure restores the original bytes and dies."""
+    orig = CONFIG_FILE.read_bytes()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.bak-{stamp}")
+    for n in range(1, 100):
+        try:
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            backup = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.bak-{stamp}-{n}")
+    else:
+        die("could not create a backup file", EXIT_FAIL)
+    with os.fdopen(fd, "wb") as f:
+        f.write(orig)
+
+    def restore(why: str):
+        CONFIG_FILE.write_bytes(orig)
+        die(f"{why}; {CONFIG_FILE} restored from the backup {backup}")
+
+    sep = b"" if not orig or orig.endswith(b"\n") else b"\n"
+    with open(CONFIG_FILE, "ab") as f:
+        f.write(sep + b"\n" + block.encode("utf-8"))
+    try:
+        parsed = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        restore(f"the config no longer parses ({e})")
+    got = parsed.get("profiles", {}).get(name)
+    if not isinstance(got, dict) or any(got.get(k) != v for k, v in expected.items()):
+        restore("the new profile does not read back as intended")
+    return backup
+
+
+def cmd_provision(cfg: Config, args) -> int:
+    name, yes = args.name, args.yes
+
+    def fail(msg):
+        die(msg, EXIT_USAGE)
+
+    if not yes and not sys.stdin.isatty():
+        fail("no terminal to ask on: pass --yes to take the defaults (and flags for anything else)")
+
+    def pick(label, given, default, validate, flag):
+        """Value from the flag, the default (--yes) or the user; validate(text) -> value or ValueError."""
+        if given is not None or yes:
+            raw = given if given is not None else default
+            if raw is None:
+                fail(f"{label} is required: pass {flag}")
+            try:
+                return validate(raw)
+            except ValueError as e:
+                fail(f"{flag}: {e}")
+        while True:
+            try:
+                raw = input(f"{label}" + (f" [{default}]" if default not in (None, "") else "") + ": ").strip()
+            except EOFError:
+                fail("input ended")
+            raw = raw or (default if default is not None else "")
+            try:
+                return validate(raw)
+            except ValueError as e:
+                print(f"  {safe_text(e)}")
+
+    def say(text=""):
+        print(safe_text(text))
+
+    # --- name
+    if not NAME_RE.match(name):
+        fail(f"profile name '{safe_text(name)}' must match {NAME_RE.pattern}")
+    if name in cfg.raw.get("profiles", {}):
+        fail(f"profile '{name}' already exists in {CONFIG_FILE}")
+    sandbox = f"{cfg.settings['name_prefix']}-{name}"
+    states = sandbox_states(cfg)
+    if states is None:
+        info("WARNING: `sbx ls --json` failed: could not check for an existing sandbox of that name")
+    elif sandbox in states:
+        fail(f"a sandbox named {sandbox} already exists ({states[sandbox]}): pick another name, or `sbx rm {sandbox}`")
+    defaults = cfg.raw.get("defaults", {}) if isinstance(cfg.raw.get("defaults"), dict) else {}
+
+    # --- workspace
+    def v_workspace(raw):
+        p = xp(raw)
+        if not p.is_dir():
+            raise ValueError(f"{p} is not a folder")
+        bad = workspace_problems(cfg, p)
+        if bad:
+            raise ValueError(f"{p} " + "; ".join(bad))
+        toml_str(str(p))
+        return p
+    cwd = Path.cwd()
+    ws = pick("Workspace", args.workspace, str(cwd) if git_dir_of(cwd) is not None else None, v_workspace, "--workspace")
+
+    # --- agent
+    def v_agent(raw):
+        if raw not in BUILTIN_AGENTS and not kit_installed(raw):
+            raise ValueError(f"'{raw}' is neither a built-in agent nor a kit in {KITS_DIR}")
+        return raw
+    agent = pick("Agent (claude|copilot|codex|gemini|shell|<kit>)", args.agent, "claude", v_agent, "--agent")
+
+    # --- what the workspace looks like
+    found = detect_workspace(ws)
+    kit_sug, allow_sug = suggest_settings(found, agent, defaults)
+    warnings = [(r, w) for r in [ws] for w in agent_config_warnings(r)]
+
+    # --- mode
+    if args.mode is None and not yes:
+        say("\nHost tools (flashing, debugging on your Mac) need mode = direct; otherwise clone is safer.")
+        hosttools = input("Will this profile use host tools? [y/N]: ").strip().lower() in ("y", "yes")
+    else:
+        hosttools = False
+    def v_mode(m):
+        if m not in ("clone", "direct"):
+            raise ValueError("must be clone or direct")
+        return m
+    mode = pick("Mode (clone|direct)", args.mode, "direct" if hosttools else "clone", v_mode, "--mode")
+    if mode == "direct":
+        say("\nmode = direct: the agent edits your host tree and .git/ directly. A hook, build file or config it\n"
+            f"changes can run on your Mac later, so run `agentbox audit {name}` after every session.")
+
+    # --- lists
+    def _checked(validate, x, flag):
+        try:
+            return validate(x)
+        except ValueError as e:
+            fail(f"{flag}: {e}")
+
+    def pick_list(label, given, sug, validate, flag):
+        if given is not None:
+            return [_checked(validate, x, flag) for x in given]
+        for v, why in sug:
+            say(f"  suggest {v}: {why}")
+        default = [v for v, _ in sug]
+        if yes:
+            return default
+        raw = input(f"{label} (Enter = {', '.join(default) or 'none'}; 'none'; or comma-separated): ").strip()
+        if not raw:
+            return default
+        return [] if raw.lower() == "none" else [_checked(validate, x.strip(), flag) for x in raw.split(",") if x.strip()]
+
+    def v_kit(k):
+        if not kit_installed(k) and not (xp(k) / "spec.yaml").is_file():
+            raise ValueError(f"kit '{k}' not found in {KITS_DIR}")
+        return k
+
+    def v_host(h):
+        if not HOST_RE.match(h):
+            raise ValueError(f"'{h}' is not a host name")
+        return h
+
+    def v_skill(s):
+        if s not in cfg.skillsets:
+            raise ValueError(f"unknown skill set '{s}'. Known: {', '.join(cfg.skillsets) or '(none)'}")
+        return s
+
+    say("\nKits:")
+    kits = pick_list("Kits", args.kit, kit_sug, v_kit, "--kit")
+    say("\nNetwork (extra hosts the sandbox may reach):")
+    allow = pick_list("Allow", args.allow, allow_sug, v_host, "--allow")
+    skill_default = [x for x in defaults.get("skills", []) if isinstance(x, str)]
+    if args.skills is not None:
+        skills = [_checked(v_skill, x, "--skills") for x in args.skills]
+    elif yes or not cfg.skillsets:
+        skills = []
+    else:
+        say("\nSkill sets" + (f" ([defaults] already applies: {', '.join(skill_default)})" if skill_default else "") + ":")
+        for sname in cfg.skillsets:
+            say(f"  available {sname}: {len(inspect_skillset(cfg, sname).skills)} skill(s)")
+        raw = input("Skill sets (comma-separated, Enter = none): ").strip()
+        skills = [_checked(v_skill, x.strip(), "--skills") for x in raw.split(",") if x.strip()]
+
+    def v_extra(spec):
+        p, ro = parse_workspace_spec(spec)
+        if not p.is_dir():
+            raise ValueError(f"{p} is not a folder")
+        bad = workspace_problems(cfg, p)
+        if bad:
+            raise ValueError(f"{p} " + "; ".join(bad))
+        return f"{p}{':ro' if ro else ''}"
+    if args.extra is not None:
+        extras = [_checked(v_extra, x, "--extra") for x in args.extra]
+    elif yes:
+        extras = []
+    else:
+        raw = input("Extra folders (comma-separated; add :ro for read-only; Enter = none): ").strip()
+        extras = [_checked(v_extra, x.strip(), "--extra") for x in raw.split(",") if x.strip()]
+    for p, _ in (parse_workspace_spec(x) for x in extras):
+        warnings += [(p, w) for w in agent_config_warnings(p)]
+
+    if args.instructions is not None:
+        instr = _checked(check_instructions, args.instructions, "--instructions")
+    elif yes:
+        instr = ""
+    else:
+        instr = _checked(check_instructions, input("Instructions for the agent (one line, Enter = none): ").strip(), "--instructions")
+
+    # --- warnings, then the block
+    if warnings:
+        say("\nWARNING - files here that an agent in the sandbox loads or could change (not blocking):")
+        for root, w in warnings:
+            say(f"  {root}: {w}")
+    d = {"agent": agent, "workspace": str(ws), "mode": mode, "extra_workspaces": extras,
+         "kits": [k for k in kits if k not in defaults.get("kits", [])],
+         "skills": [s for s in skills if s not in skill_default],
+         "allow": [h for h in allow if h not in defaults.get("allow", [])], "instructions": instr}
+    notes = {"kits": [f"{k}: {r}" for k, r in kit_sug if k in d["kits"]],
+             "allow": [f"{h}: {r}" for h, r in allow_sug if h in d["allow"]]}
+    try:
+        block = profile_block(name, d, notes)
+    except ValueError as e:
+        fail(str(e))
+    say("\nThis profile will be added to " + str(CONFIG_FILE) + ":\n")
+    say(block)
+    say("host_tools are not set up here: add `host_tools` and `host_tools_port` by hand "
+        "(README, section 5 \"Host tools\"). No port was chosen.")
+    if args.dry_run:
+        say("\n--dry-run: nothing was changed.")
+        return EXIT_OK
+    if not yes and input("Add this profile? [y/N]: ").strip().lower() not in ("y", "yes"):
+        say("Nothing changed.")
+        return EXIT_OK
+
+    # --- write, re-read, build the Profile
+    expected = {k: v for k, v in d.items() if v not in ("", [])}
+    backup = append_profile(name, block, expected)
+    try:
+        cfg2 = Config()
+        prof = cfg2.profile(name)
+    except SystemExit:
+        CONFIG_FILE.write_bytes(backup.read_bytes())
+        die(f"the new profile does not pass the normal checks; {CONFIG_FILE} restored from {backup}")
+    say(f"\nAdded profile '{name}' (backup of the old config: {backup}).\n\nChecks (agentbox doctor {name}):")
+    rc = cmd_doctor(cfg2, name)
+    say(f"\nNext:\n  agentbox up {name}\n  agentbox run {name} --prompt-file task.md --detach")
+    if args.up:
+        if rc != 0:
+            info("not starting the sandbox: doctor found problems")
+            return rc
+        if prof.d["skills"]:
+            prof.require_skills()
+        return cmd_up(prof, argparse.Namespace(agent_args=[]))
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(prog="agentbox", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3087,6 +3511,14 @@ def main():
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
+    p = sub.add_parser("provision", help="guided setup of a new profile"); p.add_argument("name")
+    p.add_argument("--workspace"); p.add_argument("--agent"); p.add_argument("--mode", choices=("clone", "direct"))
+    for flag in ("kit", "skills", "allow", "extra"):
+        p.add_argument(f"--{flag}", action="append")
+    p.add_argument("--instructions")
+    p.add_argument("--yes", action="store_true", help="take every default, never prompt")
+    p.add_argument("--dry-run", action="store_true", help="print the TOML block, change nothing")
+    p.add_argument("--up", action="store_true", help="start the sandbox afterwards")
     a = ap.parse_args()
 
     os.umask(0o077)          # everything agentbox creates (token, kit, logs) is owner-only
@@ -3096,6 +3528,8 @@ def main():
         sys.exit(cmd_status(cfg, a.json))
     if a.cmd == "doctor":
         sys.exit(cmd_doctor(cfg, a.profile, a.json, a.start))
+    if a.cmd == "provision":
+        sys.exit(cmd_provision(cfg, a))
     prof = cfg.profile(a.profile)
     if a.cmd in ("up", "code", "fresh", "run", "resume") and not prof.enabled:
         die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`", EXIT_USAGE)
