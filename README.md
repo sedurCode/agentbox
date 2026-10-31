@@ -78,6 +78,7 @@ the important keys:
 | `extra_workspaces` | more mounts, append `:ro` for read-only |
 | `mode` | `direct` (default) or `clone` — agent gets its own git clone, host tree untouched; you `git fetch sandbox-ab-<profile>` to review. Host tools need `direct`. |
 | `kits` | kit names under `~/.config/agentbox/kits/` or paths |
+| `skills` | names of `[skillsets.*]` (host folders of agent skills, mounted read-only and linked into `~/.claude/skills`), merged with `[defaults]` — see *Skill sets* below |
 | `allow` / `deny` | sandbox-scoped egress rules (merged with `[defaults]`; deny wins) |
 | `env` | plain env vars for the VM (not for secrets) |
 | `secrets` | sandbox-scoped credentials, see §4 |
@@ -103,6 +104,95 @@ Then:
 ```bash
 agentbox doctor            # validates kits, host tools, paths
 ```
+
+### Skill sets
+
+A skill set is a **host folder** with one subfolder per agent skill (`<name>/SKILL.md` plus whatever it
+references). Profiles pick sets by name; agentbox mounts each one read-only and links its skills into the
+agent's skill directory, so several sandboxes can share one reviewed set.
+
+```toml
+[skillsets.core]
+path = "~/agent-skills/core"     # required: one subfolder per skill
+allow_scripts = false            # default false: refuse a set with non-text files
+description = "reviewed team skills"
+
+[defaults]
+skills = ["core"]                # merged with the profile's own list, like allow / deny / kits
+
+[profiles.h750]
+skills = ["embedded"]
+```
+
+**Rules.** They are checked when the config is loaded for a command that mounts (`up`, `fresh`, `code`,
+`shell`, `run`, `resume`), by `doctor` (as `FAIL`s) and again right before every mount. A skill is an
+instruction the agent follows, so each rule closes a way to smuggle instructions in or to widen what the
+agent controls:
+
+| rule | why |
+|---|---|
+| `path` exists, is a directory and is not a symlink | what you reviewed is what gets mounted; a link could be re-pointed |
+| its resolved path overlaps **no workspace of any profile** (either direction), is not inside the config dir, does not contain the config file, the kits dir or the state dir, and has nothing to do with `~/.claude` | an agent-writable skill set would let one sandbox plant instructions for every other one; the config/kits/state hold your permissions; `~/.claude` holds your own settings and credentials |
+| each immediate subfolder is a skill: it has a `SKILL.md`, a name matching `^[a-z0-9][a-z0-9-]{0,63}$`, and a name that is neither a Claude Code built-in (`code-review`, `security-review`, `simplify`, `init`, `claude-api`, `run`, `loop`, `schedule`, `update-config`, `keybindings-help`, `fewer-permission-prompts`, `statusline-setup`) nor present in another set of the same profile | a skill must not shadow a built-in or silently replace another set's skill |
+| no symlinks anywhere in the set | a link can point at anything the VM can reach |
+| text only unless `allow_scripts = true`: every file is `.md`, `.txt`, `.json`, `.yaml`/`.yml` or `LICENSE*`, none is executable, and there are no FIFOs or devices | skills that can't carry code can only persuade, not run |
+
+Ignored at the top level of a set: dot entries (`.git`...), plain files (`SOURCES.json`, a README) and
+`LICENSES/` (which `vendor` writes). They are mounted, since the whole folder is, but are not skills.
+`doctor` and `status --json` show each set's path, its skills and its git commit — read from `.git/HEAD`
+and the refs as text; agentbox never runs git on the host for this.
+
+**How linking works.** Each set is added to `sbx create` as `<path>:ro`, which mounts it read-only at the
+*same absolute path* as on the host (direct and clone mode). Then one idempotent `sh` script runs in the VM
+and makes `~/.claude/skills/<skill>` a symlink to `<set path>/<skill>`. It runs after create and on every
+`up`, `run`, `code`, `shell` and `resume`, but only against a **running** sandbox — it never boots one.
+When the sandbox is stopped (typically the first `up`), a background thread waits until `sbx run` or
+`sbx exec` has started it and then links, logging to `<state>/skills.out` instead of your terminal; start
+the agent again if it had already read its skill directory.
+
+- Links agentbox made are listed in `~/.claude/skills/.agentbox-links`. It replaces only those, and
+  removes those whose skill is no longer configured. Real folders and other symlinks — skills the agent
+  writes itself — are never touched. That file is agent-writable, so a name from it is only used if it is
+  a plain skill name *and* the entry is a symlink.
+- Changing `skills` changes the kit digest, so the usual "profile changed, run `agentbox fresh`" message
+  appears. Linking alone applies without a fresh, but a **new mount** (a new set or a changed `path`)
+  needs one, and the message says so when the paths changed. A skill whose folder isn't mounted yet is
+  reported as "not linked", not linked dangling.
+- The generated kit's instructions name the mounted sets and tell the agent they are read-only.
+
+**`agentbox skills vendor`** fills a set folder from a *pinned* GitHub commit (host side, no sandbox):
+
+```bash
+agentbox skills vendor github:OWNER/REPO@<40-hex SHA> --only a/b,c/d --into ~/agent-skills/core \
+    [--prefix skills/] [--text-only | --no-text-only] [--yes]
+```
+
+- The SHA must be 40 hex characters; branches and tags are refused, because the pin is the point.
+- It downloads `codeload.github.com/OWNER/REPO/tar.gz/SHA` with `urllib` (30 s timeout, 50 MB cap; no git,
+  nothing from the archive is executed) and reads it member by member. It refuses the whole archive for
+  absolute paths, `..`, backslashes, more than one top-level folder and any `.git` folder, and for
+  symlinks, hardlinks, devices or FIFOs inside a selected skill (the same kinds outside the selection are
+  never read, so they are ignored). The top folder is stripped; each `--only` path (relative to
+  `--prefix`) is one skill named after its last component, which must pass the name rules above.
+- `--text-only` (default) drops files that aren't `.md`, `.txt`, `.json`, `.yaml`/`.yml` or `LICENSE*`,
+  and executables, and lists what it dropped, so the result passes the set rules. `.gitattributes` and
+  `.gitmodules` are always dropped: git honours them in any folder, and you will run git in this one.
+- It writes `--into/<skill>/`. If that exists, you see a `difflib` diff and are asked to confirm (`--yes`
+  skips the question; no terminal means no). It also writes `--into/SOURCES.json` (per skill: repo, sha,
+  upstream path, sha256 per file, date) and copies the repo's `LICENSE`/`LICENSE.md` to
+  `--into/LICENSES/<owner>-<repo>.txt`.
+- Last it prints a read-only risk scan of what it wrote — URLs, curl/wget, pipes into `sh`, `npx` and
+  package installs, base64, eval, sudo, `rm -r`, `~/.ssh`, `.env`, keys and tokens, "ignore previous",
+  `gh pr/issue/api/auth`, `git push`, `--no-verify`, settings.json and hooks, and invisible or bidi
+  Unicode characters (shown as `\uXXXX`). It is a reading list: it never fails the command.
+
+**Updating a pinned set.** Run `vendor` again with the new SHA and the same `--only` and `--into`; read the
+diff it shows for each skill and the scan, answer `y` for the ones you accept, then commit in your skills
+folder (`git -C ~/agent-skills/core add -A && git commit`; `SOURCES.json` records the new SHA). Running
+sandboxes see the change at once through the mount; review before you accept it, not after.
+
+What this does *not* do: it doesn't make a skill's text trustworthy (read what you vendor), and it only
+knows Claude Code's skill directory.
 
 ## 3. Daily use
 
@@ -488,6 +578,7 @@ an escape sequence in a file name or log line could rewrite your screen or write
   sbx upgrades. The generated per-sandbox kit is rendered in one function
   (`render_local_kit`) if it needs adjusting.
 - **Changed the profile but nothing happened** → `agentbox fresh <profile>`.
+- **A skill isn't linked** → `agentbox doctor <profile>` says which and why (not mounted: needs `fresh`; name taken by a folder in the VM's `~/.claude/skills`; a rule violation in the set).
 - **Verbose** → `verbose = true` in `[settings]` prints every `sbx` command.
 
 ## Development

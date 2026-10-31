@@ -29,6 +29,19 @@ deny = [
 ]
 
 # ---------------------------------------------------------------------------
+# Skill sets: host folders of agent skills (<path>/<skill>/SKILL.md), mounted READ-ONLY and
+# linked into ~/.claude/skills. Keep them outside every workspace, the config dir and ~/.claude.
+# Fill one from a pinned commit with:
+#   agentbox skills vendor github:OWNER/REPO@<40-hex SHA> --only a,b --into ~/agent-skills/core
+# [skillsets.core]
+# path = "~/agent-skills/core"       # required: one subfolder per skill, each with a SKILL.md
+# allow_scripts = false              # default false: refuse a set with non-text files
+# description = "reviewed team skills"
+#
+# Profiles pick sets with `skills = [...]`; [defaults] skills are merged in. Changing which
+# sets a profile mounts needs `agentbox fresh <profile>`.
+
+# ---------------------------------------------------------------------------
 # Profiles: one sandbox each.  agentbox up <profile>
 #
 # The profiles below are TEMPLATES, so they carry `enabled = false`: doctor and status
@@ -43,6 +56,7 @@ extra_workspaces = [
   "~/src/stm32-common:ro",           # read-only reference code
 ]
 kits = ["embedded-arm"]              # toolchain inside the sandbox
+# skills = ["core"]                  # [skillsets.core] above, mounted read-only
 # kits = ["embedded-arm", "claude-team"]   # + opusplan main loop and reader/worker/architect subagents (Claude profiles only)
 # kits = ["embedded-arm", "python-node"]   # + Python 3 / venv / pip, Node, git
 allow = [
