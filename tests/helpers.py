@@ -174,6 +174,7 @@ class LocalVM:
 
     def __init__(self, case, exists=True, vm="running"):
         self.case, self.exists, self.vm, self.calls, self.stdins = case, exists, vm, [], []
+        self.rm_fails = False                  # sbx rm errors out and leaves the sandbox standing
         self.ls_fail = self.boot = False       # ls_fail: the daemon is unreachable; boot: exec may start a stopped VM
         self.home = case.tmp / "vmhome"
         self.home.mkdir()
@@ -213,6 +214,9 @@ class LocalVM:
                 raise AssertionError(f"exec into a {self.vm} sandbox would boot it: {args!r}")
             self.vm = "running"
         if args[0] == "rm":
+            if self.rm_fails:
+                return done(1, "", "error: stdin is not a terminal; use --force to skip confirmation")
+            self.exists = False
             return done()
         if args[0] == "exec" and args[-3:-1] == ("sh", "-c"):
             with mock.patch.object(subprocess, "Popen", REAL_POPEN):

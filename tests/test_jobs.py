@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 import subprocess
 import time
 import unittest
@@ -397,7 +398,8 @@ class StatusDownTests(JobCase):
     def test_down_refuses_while_a_job_runs_unless_forced(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         self.start()
-        code, _, err = self.run_main("down", "p")
+        with mock.patch.object(sys.stdin, "isatty", return_value=True):
+            code, _, err = self.run_main("down", "p")
         self.assertEqual(code, 1)
         self.assertIn("--force", err)
         self.assertFalse(any(c[0] == "rm" for c in self.vm.calls))
@@ -613,3 +615,91 @@ class HostPidTests(AgentboxTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownRemovalTests(JobCase):
+    """`down` and `fresh` must only report success, and drop state, once the sandbox is really gone."""
+
+    def setUp(self):
+        super().setUp()
+        self.secret_rm = []
+        self.prof = ab.Config().profile("p")
+        self.prof.state.mkdir(parents=True, exist_ok=True)
+        (self.prof.state / "kit.digest").write_text("abc")
+        for name, fn in (("remove_secrets", lambda prof: self.secret_rm.append(prof.name)),
+                         ("stop_bridge", lambda prof: self.touched.append("bridge")),
+                         ("stop_keepalive", lambda prof: self.touched.append("keepalive")),
+                         ("cmd_audit", lambda prof: self.touched.append("audit"))):
+            p = mock.patch.object(ab, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        (self.prof.state / "snapshot.json").write_text("{}")
+        self.tty(False)
+
+    touched = property(lambda self: self.__dict__.setdefault("_touched", []))
+
+    def tty(self, on):
+        p = mock.patch.object(sys.stdin, "isatty", return_value=on)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def rms(self):
+        return [c for c in self.vm.calls if c[0] == "rm"]
+
+    def test_no_tty_without_force_refuses_before_touching_anything(self):
+        code, _, err = self.run_main("down", "p")
+        self.assertEqual(code, ab.EXIT_USAGE)
+        self.assertIn("--force", err)
+        self.assertEqual((self.vm.calls, self.touched, self.secret_rm), ([], [], []))
+        self.assertTrue((self.prof.state / "kit.digest").exists())
+
+    def test_force_is_passed_to_sbx_rm(self):
+        code, _, err = self.run_main("down", "p", "--force")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rms(), [("rm", "--force", "ab-p")])
+        self.assertIn("ab-p removed", err)
+
+    def test_tty_without_force_lets_sbx_ask(self):
+        self.tty(True)
+        code, _, _ = self.run_main("down", "p")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rms(), [("rm", "ab-p")])
+
+    def test_success_removes_secrets_and_state(self):
+        code, _, err = self.run_main("down", "p", "--force")
+        self.assertEqual((code, self.secret_rm), (0, ["p"]))
+        self.assertFalse(self.prof.state.exists())
+
+    def test_failed_rm_keeps_state_and_secrets_and_exits_1(self):
+        self.vm.rm_fails = True
+        code, _, err = self.run_main("down", "p", "--force")
+        self.assertEqual(code, 1)
+        self.assertNotIn("removed", err)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(self.secret_rm, [])
+        self.assertTrue((self.prof.state / "kit.digest").exists())
+
+    def test_sbx_error_text_goes_through_safe_text(self):
+        self.vm.rm_fails = True
+        orig = type(self.vm).__call__
+        def call(s, cfg, *a, **k):
+            r = orig(s, cfg, *a, **k)
+            if a[0] == "rm":
+                r.stderr = "boom \x1b]52;c;AAAA\x07"
+            return r
+        with mock.patch.object(type(self.vm), "__call__", call):
+            _, _, err = self.run_main("down", "p", "--force")
+        self.assertNotIn("\x1b", err)
+        self.assertIn("\\x1b", err)
+
+    def test_fresh_refuses_without_tty_or_force_and_never_ups(self):
+        with mock.patch.object(ab, "cmd_up", side_effect=AssertionError("up ran")):
+            code, _, _ = self.run_main("fresh", "p")
+        self.assertEqual((code, self.vm.calls, self.touched), (ab.EXIT_USAGE, [], []))
+
+    def test_fresh_stops_when_down_fails(self):
+        self.vm.rm_fails = True
+        with mock.patch.object(ab, "cmd_up", side_effect=AssertionError("up ran")):
+            code, _, _ = self.run_main("fresh", "p", "--force")
+        self.assertEqual(code, 1)
+        self.assertTrue((self.prof.state / "kit.digest").exists())

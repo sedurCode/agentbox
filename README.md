@@ -275,7 +275,8 @@ agentbox shell h750        # bash inside the VM
 agentbox tools h750        # what the agent can run on the host
 agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation
 agentbox stop h750         # pause sandbox + bridge
-agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force kills a running job)
+agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force: also kills a running job, skips sbx's
+                            # confirmation - required without a TTY - and deletes the sandbox even if in use, e.g. an open VS Code session)
 agentbox fresh h750        # down + up — use after editing the profile (kits apply at creation)
 agentbox status
 ```

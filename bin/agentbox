@@ -1870,9 +1870,13 @@ def cmd_code(prof: Profile, args) -> int:
 
 
 def cmd_down(prof: Profile, args) -> int:
+    force = getattr(args, "force", False)
+    if not force and not sys.stdin.isatty():
+        die("sbx asks for confirmation before removing a sandbox and stdin is not a terminal;"
+            " pass --force to skip it", EXIT_USAGE)
     job = job_info(prof)
     if job["state"] == "running":
-        if not getattr(args, "force", False):
+        if not force:
             die(f"job {job['id']} is still running in {prof.sandbox}; removing the sandbox would kill it."
                 f" Wait for it (`agentbox wait {prof.name}`) or pass --force")
         info(f"--force: killing running job {job['id']}")
@@ -1883,7 +1887,11 @@ def cmd_down(prof: Profile, args) -> int:
     stop_bridge(prof)
     stop_keepalive(prof)
     if sandbox_exists(prof):
-        sbx(prof.cfg, "rm", prof.sandbox, check=False)
+        r = sbx(prof.cfg, "rm", *(["--force"] if force else []), prof.sandbox, check=False, capture=True)
+        if sandbox_exists(prof):        # sbx rm can fail (or be declined) and still leave a sandbox behind
+            detail = ((r.stderr or "") + (r.stdout or "")).strip()
+            die(f"`sbx rm` did not remove {prof.sandbox} (exit {r.returncode}); keeping its secrets and state."
+                + (f"\n{detail}" if detail else ""))
     remove_secrets(prof)
     if not args.keep_state and prof.state.exists():
         shutil.rmtree(prof.state)
@@ -3482,9 +3490,12 @@ def main():
         sub.add_parser(c).add_argument("profile")
     p = sub.add_parser("tools"); p.add_argument("profile"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("down"); p.add_argument("profile"); p.add_argument("--keep-state", action="store_true")
-    p.add_argument("--force", action="store_true", help="also kill a running headless job")
+    p.add_argument("--force", action="store_true", help="also kill a running headless job, skip sbx's"
+                   " confirmation and pass --force to `sbx rm`, which deletes the sandbox even if in use"
+                   " (an open VS Code / SSH session)")
     p = sub.add_parser("fresh"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
-    p.add_argument("--force", action="store_true", help="also kill a running headless job")
+    p.add_argument("--force", action="store_true", help="as for `down --force`: kill a running job, skip"
+                   " confirmation, delete the sandbox even if in use")
     p = sub.add_parser("run"); p.add_argument("profile")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--prompt-file", metavar="F", help="file holding the prompt ('-' = stdin)")
