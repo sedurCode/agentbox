@@ -83,6 +83,7 @@ the important keys:
 | `env` | plain env vars for the VM (not for secrets) |
 | `secrets` | sandbox-scoped credentials, see §4 |
 | `keepalive` | `true` (default). `false`: `agentbox run` doesn't hold an exec session open while a job runs, so sbx may stop the sandbox under a detached job (see *Headless jobs*) |
+| `stall_after` | `300` (seconds). A running job with no event for longer is shown as STALLED by `progress` and `status` (see *Watching a job*) |
 | `host_tools`, `host_tools_port` | which `[tools.*]` this sandbox may call, and a unique port per profile |
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
 
@@ -239,6 +240,7 @@ agentbox wait h750 --timeout 3600                    # block; exit status = the 
 agentbox logs h750 -f                                # follow, one human line per event
 agentbox logs h750 --raw                             # the raw stream-json lines
 agentbox resume h750                                 # interactive `claude --resume=<session id>`
+agentbox progress h750 [--watch]                     # how far along it is (see *Watching a job*)
 agentbox run h750 --prompt-file task.md              # without --detach: run, then follow logs, then exit with the job's status
 agentbox run h750 --prompt-file - --agent-args --model opus < task.md
 ```
@@ -252,7 +254,7 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   (the VM is the boundary, as for `up`), in the primary workspace, via `setsid nohup`, so the job
   survives the exec session that started it.
 - **Job directory** (inside the VM, `~/.agentbox/jobs/<id>/`, id like `20260101T120000Z-ab12cd`):
-  `prompt.md`, `wrap.sh` (the wrapper), `pid`, `started_at`, `output.jsonl` (the stream),
+  `prompt.md`, `wrap.sh` (the wrapper), `jobprogress` and `progress.tsv` (see *Watching a job*), `start_head`, `pid`, `started_at`, `output.jsonl` (the stream),
   `stderr.log`, `finished_at`, `exit_code` (written last, atomically, by the wrapper) and
   `session_id` (taken from the stream's init message). The host keeps only
   `~/.local/state/agentbox/ab-<profile>/job.json` (current job id, session id, and the result once seen).
@@ -292,6 +294,92 @@ Exit codes for `wait` (and the final status of a foreground `run`): the **job's 
 (claude: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still
 running; `5` = job lost. Codes 1-3 keep their meaning from the table above for agentbox's own
 errors, so a job that exits with 2-5 is ambiguous: read `status --json` (`job.exit_code`) if you need to tell.
+
+### Watching a job
+
+```bash
+agentbox progress h750                      # a few lines, once
+agentbox progress h750 --watch              # redraw until the job ends; exit status = the job's, like `wait`
+agentbox progress h750 --json               # the `job.progress` object of `status --json`
+agentbox run h750 --prompt-file task.md --detach --expect-commits 3
+```
+
+```
+job 20260101T120000Z-ab12cd  running  elapsed 12m04s  last activity 6s ago
+plan [########------------] 3/7  now: step 4: wire up the UART  (agent's plan, not verified)
+note: the linker script needed a fix  (agent's note)
+commits 1/3  turns 88  tool calls 61 (Bash 30, Read 14, Edit 9, Grep 5, Task 2)  cost ~$1.84 (estimate)
+tokens in 912  out 41200  cache read 3811000  cache write 210000
+```
+
+**Measured** (computed by agentbox, not by the agent):
+
+- *elapsed*, and the age of the last event in `output.jsonl` (from the events' own `timestamp`). A running
+  job with no event for more than `stall_after` seconds (profile key, default `300`) is **STALLED**.
+- *turns* (assistant messages), *tool calls* (`tool_use` blocks, top five by name) and *tokens*. stream-json
+  repeats a message id, and its usage, across content-block events, so every message id counts once.
+- *cost*: the exact `total_cost_usd` from the agent's final `result` once the job is over. While it runs,
+  an estimate from the token totals and the `PRICES` table in `bin/agentbox` (per model family: opus, sonnet,
+  haiku, fable), shown with `~` and "estimate". Those prices **need checking against current pricing**; a model
+  that isn't in the table gets no cost rather than a wrong one.
+- *commits*: `git rev-list --count <start>..HEAD` in the primary workspace, run inside the VM, where
+  `<start>` is the HEAD `run` recorded in the job dir (`start_head`) before launching the agent. With
+  `run --expect-commits N` it reads `commits k/N`. No git repo, or an unreadable `start_head`: no number.
+
+**Reported by the agent** (it can be wrong, stale or invented, and is labelled "agent's plan"): `run` puts
+one short paragraph at the start of the prompt (on stdin, as the rest) asking the agent to record a plan and
+keep it current with `jobprogress`, a small POSIX `sh` script in the job dir whose directory is on the end of
+the agent's `PATH` (`AGENTBOX_JOB_DIR` names it):
+
+```
+jobprogress plan "write the test" "make it pass" ...   # replace the plan; every step pending
+jobprogress start 2                                    # step 2 is in progress
+jobprogress done 2                                     # step 2 is completed
+jobprogress note "waiting for the flash tool"          # free text; the last one wins, "" clears it
+```
+
+Limits: at most 50 steps, 200 bytes per step, 300 per note, no control characters, a step number must be
+inside the plan; the command refuses anything else with exit 2. It writes `progress.tsv` in the job dir
+through a temp file and `mv`: one `<kind><TAB><text>` line per entry (`pending`, `active`, `done`, or
+`note`), so there is no JSON escaping in `sh`; agentbox builds the JSON. Because the agent can write
+that file directly (and the VM is its machine), agentbox treats it as untrusted: the VM returns at most 60 lines
+and 20 KB of it, the host drops malformed lines, caps steps (50) and text, and runs everything through
+`safe_text` (control and bidi characters print as `\x1b`, never raw). An agent can misreport its
+plan, finish it early, or skip it; use the measured lines to check. `run --no-progress` leaves out the
+prompt paragraph and the reporter. With no plan, `progress` shows only the measured lines.
+
+**How it is read.** `output.jsonl` is not re-read on every `--watch` tick: the host keeps, in the state
+dir, the byte offset already processed and the running totals, and each look fetches only newer bytes (whole
+lines only, in one `sbx exec` together with `progress.tsv` and the commit count). If the file gets shorter
+(the agent can write it) the totals are reset and recounted. When a job ends, its final values are cached in
+`job.json`, so `progress` and `status` on a finished job make no `sbx` call. A stopped or missing sandbox is
+never started: `progress` shows the cached values and says so ("sandbox stopped: showing cached values").
+`wait` and the keep-alive cache the final values as the job ends; if neither saw it (the sandbox stopped
+first) the last cached totals are shown.
+
+**`status`.** Each job line gets a suffix, `3/7 · 12m · 6s ago` (plan steps, elapsed, last event) or
+`STALLED 7m`. `status --json` adds `job.progress` (`null` when there is no job), from the same single
+`sbx ls --json`; a running job costs at most one extra exec, others none:
+
+```json
+"job": {"id": "20260101T120000Z-ab12cd", "state": "running", "...": "...",
+        "progress": {"elapsed_s": 724, "last_event_age_s": 6, "stalled": false,
+                     "turns": 88, "tool_calls": 61,
+                     "tools_top": [{"name": "Bash", "count": 30}, {"name": "Read", "count": 14}],
+                     "tokens": {"input": 912, "output": 41200, "cache_read": 3811000, "cache_creation": 210000,
+                                "total": 4063112},
+                     "cost_usd": 1.84, "cost_is_estimate": true,
+                     "commits": 1, "expect_commits": 3,
+                     "plan": {"steps": [{"text": "write the test", "status": "done"},
+                                        {"text": "make it pass", "status": "active"}],
+                              "current": 2, "done": 1, "total": 2},
+                     "note": "waiting for the flash tool", "stale": false}}
+```
+
+`plan` is `null` when the agent declared none, `plan.current` is the first `active` step (1-based) or
+`null`, a step's `status` is `pending`, `active` or `done`, `elapsed_s` is up to now (running) or up to
+`finished_at`, `last_event_age_s` is `null` unless the job is running, and `stale` is true when the values
+come from the host's cache because the sandbox could not be read.
 
 ### VS Code inside the sandbox
 
@@ -599,7 +687,7 @@ Tests use only the standard library and never call the real `sbx` (any attempt f
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher
+python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher && sh -n share/jobwrap && sh -n share/jobprogress
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same on Ubuntu and macOS with Python 3.11 and 3.14.

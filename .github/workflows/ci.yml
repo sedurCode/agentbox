@@ -27,3 +27,5 @@ jobs:
           python3 -m py_compile bin/agentbox share/hosttool
           bash -n install.sh
           sh -n share/agentbox-launcher
+          sh -n share/jobwrap
+          sh -n share/jobprogress
