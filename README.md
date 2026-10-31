@@ -46,13 +46,16 @@ the VM. agentbox adds the parts you asked for on top:
 
 ```bash
 brew trust docker/tap && brew install docker/tap/sbx && sbx login   # once; see Install
+brew install python                                   # agentbox needs Python 3.11+ (stdlib only)
+unzip agentbox.zip && cd agentbox && ./install.sh     # installs agentbox itself; see Install
 agentbox provision myproj --workspace ~/src/myproj    # guided; clone mode is suggested
 agentbox run myproj --prompt-file task.md --detach    # the brief goes in a file, never on a command line
 agentbox progress myproj --watch                      # until the job ends
 agentbox fetch myproj                                 # the agent's commits, into review/myproj
 git diff HEAD...review/myproj                         # review
 git merge --ff-only review/myproj                     # only if you are happy with it
-agentbox down myproj --force                          # when finished with the sandbox
+agentbox down myproj                                  # when finished; asks for confirmation (--force skips
+                                                      # that and deletes the sandbox even while it is in use: for scripts)
 ```
 
 ## 1. Install
@@ -783,7 +786,9 @@ result is one document: `profile`, `sandbox`, `remote`, `ref`, `branch`, `commit
 
 This is the one place agentbox runs git on the host. That is safe because in clone mode the host
 repo is mounted read-only, so the agent cannot have written its `.git/config`, and fetching from the
-sandbox remote runs nothing from the VM's config. The diff is run with `--no-ext-diff --no-textconv`.
+sandbox remote runs nothing from the VM's config. This holds only if no other profile mounts the same
+folder writable (as a direct-mode workspace, or an `extra_workspace` without `:ro`). If one does, an
+agent there could have changed `.git/config`, so run `agentbox audit` for that profile first. The diff is run with `--no-ext-diff --no-textconv`.
 The raw equivalent, while the sandbox is running, is
 `git fetch sandbox-ab-<profile> main:review/<profile>`.
 
@@ -832,7 +837,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher && sh -n share/jobwrap && sh -n share/jobprogress
 ```
 
-About 41 tests are skipped on macOS (41 in a simulated darwin run): they run the VM-side `sh` scripts
+41 tests are skipped on macOS: they run the VM-side `sh` scripts
 (the job wrapper, the probes, the kill script), which use Linux tools such as `setsid` and `/proc`. The
 Ubuntu CI job runs them. The `fetch` tests use real temporary git repos and need `git`.
 
