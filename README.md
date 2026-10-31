@@ -67,6 +67,65 @@ install. With none it prints "agentbox needs Python 3.11+ (brew install python)"
 
 ## 2. Configure
 
+### New profiles
+
+`agentbox provision <name>` adds a profile for you. It asks for each value you didn't pass as a
+flag, suggests settings from the workspace with the reason for each (it only reads files; it
+never runs anything from the workspace, git included), shows the TOML it will add and asks
+before writing.
+
+```text
+$ agentbox provision webapp
+Workspace [/Users/me/gits/webapp]:
+Agent (claude|copilot|codex|gemini|shell|<kit>) [claude]:
+
+WARNING - files here that an agent in the sandbox loads or could change (not blocking):
+  /Users/me/gits/webapp: CLAUDE.md: the agent loads it as instructions and can edit it
+
+Host tools (flashing, debugging on your Mac) need mode = direct; otherwise clone is safer.
+Will this profile use host tools? [y/N]:
+Mode (clone|direct) [clone]:
+
+Kits:
+  suggest python-node: pyproject.toml found
+  suggest claude-team: model routing and subagents for Claude profiles
+Kits (Enter = python-node, claude-team; 'none'; or comma-separated):
+
+Network (extra hosts the sandbox may reach):
+  suggest pypi.org: Python packages (pyproject.toml)
+  suggest files.pythonhosted.org: Python package downloads
+Allow (Enter = pypi.org, files.pythonhosted.org; 'none'; or comma-separated):
+...
+This profile will be added to /Users/me/.config/agentbox/agentbox.toml:
+
+[profiles.webapp]
+agent = "claude"
+workspace = "/Users/me/gits/webapp"
+mode = "clone"
+kits = ["python-node", "claude-team"]
+allow = ["pypi.org", "files.pythonhosted.org"]
+
+Add this profile? [y/N]: y
+Added profile 'webapp' (backup of the old config: ...agentbox.toml.bak-20260101T120000Z)
+Checks (agentbox doctor webapp): ...
+Next:
+  agentbox up webapp
+  agentbox run webapp --prompt-file task.md --detach
+```
+
+Flags: `--workspace`, `--agent`, `--mode clone|direct`, `--kit`, `--skills`, `--allow`,
+`--extra PATH[:ro]` (repeatable), `--instructions TEXT`. `--yes` takes every default and never
+prompts (without a terminal you must pass it); `--dry-run` prints the block and changes
+nothing; `--up` starts the sandbox afterwards.
+
+Your config is never rewritten: it is copied to `agentbox.toml.bak-<UTC time>` (0600), the block
+is appended after a blank line (your comments stay), and the whole file is parsed again. If that
+fails the backup is restored. `host_tools` are not set up here; add them by hand (§5) and don't
+reuse another profile's port. A `clone` default is suggested; `direct` means the agent edits your
+host tree and `.git/`, so run `agentbox audit` after sessions.
+
+### Profile keys
+
 Edit `~/.config/agentbox/agentbox.toml`. The example has an STM32H750 profile per agent;
 the important keys:
 
