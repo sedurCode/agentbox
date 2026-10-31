@@ -348,22 +348,33 @@ def sandbox_exists(prof: Profile, retry: bool = False) -> bool:
     return r.returncode == 0
 
 
-def sandbox_state(prof: Profile) -> str:
-    """"running" | "stopped" | "missing" | "unknown", from `sbx ls --json`. Unlike `sbx exec`
-    (which starts a stopped sandbox), asking has no side effects."""
-    r = sbx_retry(prof.cfg, "ls", "--json")
+def sandbox_states(cfg: Config) -> dict | None:
+    """{sandbox name: "running" | "stopped" | "unknown"} from one `sbx ls --json`, or None if the
+    call failed. Unlike `sbx exec` (which starts a stopped sandbox), asking has no side effects."""
+    r = sbx_retry(cfg, "ls", "--json")
     if r.returncode != 0:
-        return "unknown"
+        return None
     try:
         rows = json.loads(r.stdout or "[]")
     except ValueError:
-        return "unknown"
+        return None
     if not isinstance(rows, list):
+        return None
+    return {row["name"]: row["status"] if row.get("status") in ("running", "stopped") else "unknown"
+            for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)}
+
+
+_FETCH = object()      # "ask sbx" (None is taken: it means a listing that failed)
+
+
+def sandbox_state(prof: Profile, states=_FETCH) -> str:
+    """"running" | "stopped" | "missing" | "unknown". Pass the result of sandbox_states() to reuse
+    one listing across profiles."""
+    if states is _FETCH:
+        states = sandbox_states(prof.cfg)
+    if states is None:
         return "unknown"
-    for row in rows:
-        if isinstance(row, dict) and row.get("name") == prof.sandbox:
-            return row["status"] if row.get("status") in ("running", "stopped") else "unknown"
-    return "missing"
+    return states.get(prof.sandbox, "missing")
 
 
 # ----------------------------------------------------- generated kit (YAML)
@@ -1486,7 +1497,7 @@ def probe_job(prof: Profile, job_id: str) -> dict | None:
     return parse_probe(r.stdout or "") if r.returncode == 0 else None
 
 
-def job_info(prof: Profile, job_id: str | None = None) -> dict:
+def job_info(prof: Profile, job_id: str | None = None, states=_FETCH) -> dict:
     """Current state of a job (default: the profile's recorded one). Never boots a stopped VM,
     and makes no sbx call at all once the job is known to be finished or lost - neither comes back."""
     rec = job_record(prof)
@@ -1497,7 +1508,7 @@ def job_info(prof: Profile, job_id: str | None = None) -> dict:
     if mine and rec.get("state") in ("finished", "lost"):
         return {k: rec.get(k) for k in NO_JOB} | {"id": job_id}
     known = {k: rec.get(k) for k in ("session_id", "started_at", "finished_at")} if mine else {}
-    vm = sandbox_state(prof)
+    vm = sandbox_state(prof, states)
     if vm != "running":
         # The process died with the VM. "unknown" (daemon unreachable) isn't certain: don't cache it,
         # and flag it so `wait` can double-check.
@@ -1794,26 +1805,33 @@ def emit_json(obj):
     print(json.dumps(obj, indent=2, default=str))
 
 
-def profile_status(prof: Profile) -> dict:
+def profile_status(prof: Profile, states=_FETCH) -> dict:
+    """`states`: a sandbox_states() listing shared by every profile of one status run."""
+    if states is _FETCH:
+        states = sandbox_states(prof.cfg)
     if not prof.enabled:
         return {"name": prof.name, "valid": True, "enabled": False, "sandbox": prof.sandbox,
                 "agent": prof.d["agent"], "mode": prof.d["mode"], "job": dict(NO_JOB)}
     pid = bridge_pid(prof) if prof.state.exists() else None
+    job = public_job(job_info(prof, states=states))
+    if job["id"]:
+        job["vm"] = sandbox_state(prof, states)      # now, not as of the last probe (job_info caches)
     return {"name": prof.name, "valid": True, "enabled": True, "sandbox": prof.sandbox,
-            "job": public_job(job_info(prof)),
+            "job": job,
             "agent": prof.d["agent"], "mode": prof.d["mode"],
-            "sandbox_exists": sandbox_exists(prof),
+            "sandbox_exists": sandbox_exists(prof) if states is None else prof.sandbox in states,
             "host_tools": prof.tool_names,
             "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
             "bridge": {"running": pid is not None, "pid": pid}}
 
 
 def cmd_status(cfg: Config, as_json: bool = False) -> int:
+    states = sandbox_states(cfg)
     if as_json:
         rows = []
         for n in cfg.profile_names():
             try:
-                rows.append(profile_status(cfg.profile(n)))
+                rows.append(profile_status(cfg.profile(n), states))
             except SystemExit:               # message already on stderr
                 rows.append({"name": n, "valid": False})
         emit_json({"profiles": rows})
@@ -1830,7 +1848,7 @@ def cmd_status(cfg: Config, as_json: bool = False) -> int:
             continue
         pid = bridge_pid(prof) if prof.state.exists() else None
         tools = f"bridge pid {pid} on :{prof.port}" if pid else ("bridge stopped" if prof.tool_names else "no host tools")
-        job = job_info(prof)
+        job = job_info(prof, states=states)
         jobs = f" job={safe_text(job['id'])} {job['state']}" if job["state"] != "none" else ""
         print(f"{n:20s} sandbox={prof.sandbox:24s} agent={prof.d['agent']:10s} {tools}{jobs}")
     return EXIT_OK

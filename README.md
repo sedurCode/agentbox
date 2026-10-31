@@ -241,8 +241,8 @@ the message is on stderr and stdout is empty, so check the exit code before pars
 
 `agentbox status --json` (sandbox existence is probed with `sbx inspect`; disabled profiles aren't).
 `job.state` is `none`, `running`, `finished` or `lost` (see *Headless jobs*); `exit_code` is set only when
-finished. `job.vm` is the sandbox state (`running`, `stopped`, `missing`, `unknown`) when the job was last
-checked. `status` never boots a stopped sandbox: it asks `sbx ls --json`, and a job whose sandbox isn't
+finished. `job.vm` is the sandbox state **now** (`running`, `stopped`, `missing`, `unknown`), from one
+`sbx ls --json` per `status` run, even when the job's own state is cached. `status` never boots a stopped sandbox: it asks `sbx ls --json`, and a job whose sandbox isn't
 running is `lost` without any exec. A running sandbox with an unfinished job costs one `sbx exec`:
 
 ```json
@@ -331,6 +331,16 @@ a class and the length are printed. A value starting with a known real-token pre
 `glpat-`) is a **WARN** ("looks like a real credential"): check `sbx secret ls` for a global
 secret, the profile's `env`, and the sbx agent template. Anything else is "placeholder/unknown",
 which is what proxy-injected credentials should look like. `HOSTTOOLS_TOKEN` is skipped.
+
+The check goes by **format only**. sbx gives the VM realistic-looking stand-in values: on one host
+`GH_TOKEN` was flagged "looks like a real credential (40 chars)" although GitHub's API answered 401 Bad
+credentials and sbx's policy log showed `api.github.com` as `forward-bypass` (no credential swapped in).
+So a warning means "check where it comes from", not "it works". To check safely, make a read-only request
+inside the sandbox; 401 means a dead placeholder:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
+```
 
 ## 5. Host tools (compilers, flashers, debuggers outside the VM)
 
@@ -438,7 +448,15 @@ For repos you don't trust at all, use `mode = "clone"`: nothing on the host chan
 you fetch from the sandbox remote. Fetching runs no code from the sandbox's config.
 
 **clone mode**: the agent works on its own clone inside the VM; nothing on the host changes
-until you `git fetch sandbox-ab-<profile>` and merge. Safest for untrusted repos, but no host tools.
+until you fetch from `sandbox-ab-<profile>` and merge. Safest for untrusted repos, but no host tools.
+sbx removes that remote when the sandbox stops, so `sandbox-ab-<profile>/main` stops resolving (the commits
+stay in your object store). Fetch into a local branch, review, then fast-forward:
+
+```bash
+git fetch sandbox-ab-<profile> main:review/<profile>
+git log review/<profile>            # review
+git merge --ff-only review/<profile>
+```
 
 ## 7. What this protects and what it doesn't
 

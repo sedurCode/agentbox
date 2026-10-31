@@ -144,6 +144,19 @@ class StoppedJobTests(test_jobs.JobCase):
         self.assertEqual((j["id"], j["state"], j["vm"]), (job, "lost", "stopped"))
         self.assertEqual(len(self.execs()), n_exec)
 
+    def test_status_reports_the_vm_state_now_and_lists_once(self):
+        job = self.start()
+        self.finish(job)
+        ab.job_info(self.prof)                                     # caches "finished" with the then-running vm
+        self.vm.vm = "stopped"
+        self.vm.calls.clear()
+        code, out, _ = self.run_main("status", "--json")
+        self.assertEqual(code, 0)
+        j = {r["name"]: r for r in json.loads(out)["profiles"]}["p"]["job"]
+        self.assertEqual((j["state"], j["vm"]), ("finished", "stopped"))
+        self.assertEqual([c for c in self.vm.calls if c == ("ls", "--json")], [("ls", "--json")])   # once, not per profile
+        self.assertFalse(any(c[0] == "exec" for c in self.vm.calls))
+
     def test_resume_uses_the_recorded_session_without_booting_to_read_it(self):
         job = self.start()
         self.finish(job)
