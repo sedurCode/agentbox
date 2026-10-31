@@ -367,13 +367,13 @@ class StatusDownTests(JobCase):
     def test_status_json_job_field(self):
         code, out, _ = self.run_main("status", "--json")
         prof = {r["name"]: r for r in json.loads(out)["profiles"]}["p"]
-        self.assertEqual(prof["job"], ab.NO_JOB)
+        self.assertEqual(prof["job"], ab.NO_JOB | {"progress": None})
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         job = self.start()
         _, out, _ = self.run_main("status", "--json")
         j = {r["name"]: r for r in json.loads(out)["profiles"]}["p"]["job"]
         self.assertEqual((j["id"], j["state"], j["exit_code"]), (job, "running", None))
-        self.assertEqual(set(j), set(ab.NO_JOB))
+        self.assertEqual(set(j), set(ab.NO_JOB) | {"progress"})
 
     def test_status_json_finished(self):
         job = self.start()
