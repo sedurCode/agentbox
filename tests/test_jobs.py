@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest import mock
 
-from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab
+from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab, needs_linux_vm
 
 REAL_SLEEP = time.sleep          # ab.time is the real time module, so patching sleep patches ours too
 PROMPT = "SECRET-PROMPT-TEXT summarise the repo"
@@ -212,6 +212,7 @@ class JobCase(AgentboxTestCase):
 
 
 class RunTests(JobCase):
+    @needs_linux_vm
     def test_resume_passes_the_id_as_one_equals_argument_and_refuses_evil_ids(self):
         job = self.start()
         self.finish(job)
@@ -232,6 +233,7 @@ class RunTests(JobCase):
                     ab.cmd_resume(self.prof, self.args())
                 self.assertEqual(runs, [], evil)
 
+    @needs_linux_vm
     def test_prompt_never_on_any_argv_and_file_is_private(self):
         job = self.start()
         for call in self.vm.calls:
@@ -243,6 +245,7 @@ class RunTests(JobCase):
         self.assertEqual(oct((d / "prompt.md").stat().st_mode & 0o777), "0o600")
         self.assertEqual(self.keepalive, ["p"])                    # the keep-alive is on by default
 
+    @needs_linux_vm
     def test_keepalive_is_on_by_default_and_opt_out(self):
         self.finish(self.start())
         self.assertEqual(self.keepalive, ["p"])                    # default
@@ -256,6 +259,7 @@ class RunTests(JobCase):
         self.finish(self.start(keepalive=True))                    # --keepalive overrides it
         self.assertEqual(self.keepalive, ["p", "p"])
 
+    @needs_linux_vm
     def test_job_files_and_session_id(self):
         job = self.start()
         self.finish(job)
@@ -269,6 +273,7 @@ class RunTests(JobCase):
         rec = ab.job_record(self.prof)
         self.assertEqual((rec["session_id"], rec["exit_code"]), ("sess-12345678", 0))  # ... and in host state
 
+    @needs_linux_vm
     def test_running_then_finished_exit_code_passthrough(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         job = self.start()
@@ -276,12 +281,14 @@ class RunTests(JobCase):
         self.set_pid(job, "999999")                                  # process "vanished" -> lost
         self.assertEqual(ab.job_info(self.prof)["state"], "lost")
 
+    @needs_linux_vm
     def test_exit_status_is_the_jobs(self):
         self.vm.env["FAKE_CLAUDE_EXIT"] = "7"
         job = self.start()
         self.finish(job)
         self.assertEqual(ab.cmd_wait(self.prof, self.args()), 7)
 
+    @needs_linux_vm
     def test_wait_timeout_and_lost(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         job = self.start()
@@ -289,6 +296,7 @@ class RunTests(JobCase):
         self.set_pid(job, "999999")
         self.assertEqual(ab.cmd_wait(self.prof, self.args()), ab.EXIT_LOST)
 
+    @needs_linux_vm
     def test_running_job_blocks_a_second_run(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         self.start()
@@ -302,6 +310,7 @@ class RunTests(JobCase):
                 ab.cmd_run(prof, self.args(**kw))
             self.assertEqual(cm.exception.code, 2)
 
+    @needs_linux_vm
     def test_agent_args_are_quoted_not_the_prompt(self):
         job = self.start(agent_args=["--model", "a b"])
         script = [c[-1] for c in self.vm.calls if c[0] == "exec" and "wrap.sh" in c[-1] and "nohup" in c[-1]][0]
@@ -309,6 +318,7 @@ class RunTests(JobCase):
         self.finish(job)
 
 
+@needs_linux_vm
 class LogsTests(JobCase):
     def run_logs(self, **kw):
         import contextlib
@@ -363,6 +373,7 @@ class LogsTests(JobCase):
         self.assertIn("[result] success", out)
 
 
+@needs_linux_vm
 class StatusDownTests(JobCase):
     def test_status_json_job_field(self):
         code, out, _ = self.run_main("status", "--json")
@@ -410,6 +421,7 @@ class UpTests(JobCase):
         self.assertEqual(runs, [("run", "--name", "ab-p"), ("run", "--name", "ab-p", "--", "--resume", "x")])
 
 
+@needs_linux_vm
 class KeepAliveTests(JobCase):
     def run_sh(self, script):
         from helpers import REAL_POPEN, REAL_RUN
@@ -449,6 +461,7 @@ class KeepAliveTests(JobCase):
         self.assertNotIn("SECRET-PROMPT-TEXT", " ".join(procs[0]))
 
 
+@needs_linux_vm
 class KillSafetyTests(JobCase):
     """A job's pid file is agent-writable. Writing "1" into one and then SIGTERMing it once took the
     whole VM down (PID 1 is init), so the one place that signals a job pid must validate it."""

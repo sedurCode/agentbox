@@ -18,6 +18,12 @@ REAL_KILL, REAL_KILLPG = os.kill, os.killpg
 REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen   # for the few tests that run `sh` on purpose
 
 
+# The VM-side sh scripts (jobwrap, the job probe, kill_script, the progress probe) only ever run in the Linux VM
+# and use tools macOS lacks (setsid, /proc, GNU userland), so tests that run them for real need a Linux host.
+needs_linux_vm = unittest.skipUnless(sys.platform.startswith("linux"),
+                                     "runs VM-side sh scripts that use Linux-only tools (setsid, /proc, GNU userland)")
+
+
 @contextlib.contextmanager
 def real_sh():
     """Allow subprocess for one block (used only to run the in-VM probe under plain `sh`)."""

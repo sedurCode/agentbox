@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh
+from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh, needs_linux_vm
 from test_jobs import JobCase
 
 JOBPROGRESS = ab.SHARE_DIR / "jobprogress"
@@ -266,6 +266,7 @@ class SignalTests(ProgressCase):
         self.assertIn("$4.26", out)
         self.assertNotIn("~", out)
 
+    @needs_linux_vm
     def test_stall_detection(self):
         job = self.run_job()
         self.set_output(job, asst("m1", usage=USAGE, ago=400))
@@ -278,6 +279,7 @@ class SignalTests(ProgressCase):
         self.assertFalse(v["stalled"])
         self.assertNotIn("STALLED", self.progress())
 
+    @needs_linux_vm
     def test_stall_after_is_a_profile_key(self):
         job = self.run_job()
         self.set_output(job, asst("m1", usage=USAGE, ago=60))
@@ -303,6 +305,7 @@ class SignalTests(ProgressCase):
             return REAL_RUN(["git", "-C", str(self.ws), "-c", "user.name=t", "-c", "user.email=t@t", *a],
                             capture_output=True, text=True, check=True)
 
+    @needs_linux_vm
     def test_commits_since_the_job_started(self):
         self.git("init", "-q")
         self.git("commit", "-q", "--allow-empty", "-m", "before")
@@ -414,6 +417,7 @@ class AgentPlanTests(ProgressCase):
 
 
 class IncrementalTests(ProgressCase):
+    @needs_linux_vm
     def test_only_new_bytes_are_read(self):
         job = self.run_job()
         out = self.vm.jobdir(job) / "output.jsonl"
@@ -432,6 +436,7 @@ class IncrementalTests(ProgressCase):
         self.assertEqual(self.view()["turns"], 3)                          # nothing new: nothing double counted
         self.assertIn(f"o={out.stat().st_size};", self.scripts_since(mark)[-1])
 
+    @needs_linux_vm
     def test_a_half_written_line_waits_for_its_newline(self):
         job = self.run_job()
         out = self.vm.jobdir(job) / "output.jsonl"
@@ -442,6 +447,7 @@ class IncrementalTests(ProgressCase):
         out.write_text(line + "\n")
         self.assertEqual(self.view()["turns"], 1)
 
+    @needs_linux_vm
     def test_a_shrunk_file_is_recounted(self):
         job = self.run_job()
         out = self.vm.jobdir(job) / "output.jsonl"
@@ -460,6 +466,7 @@ class IncrementalTests(ProgressCase):
             (self.prof.state / ab.PROGRESS_CACHE).write_text(junk)
             self.assertEqual(self.view()["turns"], 1, junk)
 
+    @needs_linux_vm
     def test_big_files_are_read_in_rounds(self):
         job = self.run_job()
         self.set_output(job, *[asst(f"m{i}", usage=USAGE) for i in range(40)])
@@ -497,6 +504,7 @@ class NoExecTests(ProgressCase):
         self.assertIn("$1.50", out)
         self.assertNotIn("showing cached", out)                              # final values are not "stale"
 
+    @needs_linux_vm
     def test_stopped_sandbox_shows_cached_values_and_says_so(self):
         job = self.run_job()
         self.set_output(job, asst("m1", usage=USAGE))
@@ -516,6 +524,7 @@ class NoExecTests(ProgressCase):
         out = self.progress()
         self.assertIn("sandbox missing: showing cached values", out)
 
+    @needs_linux_vm
     def test_status_makes_one_extra_exec_per_running_job_only(self):
         job = self.run_job()
         self.set_output(job, asst("m1", usage=USAGE))
@@ -549,6 +558,7 @@ class StatusShapeTests(ProgressCase):
         self.assertEqual(code, 0)
         return {r["name"]: r for r in json.loads(out)["profiles"]}
 
+    @needs_linux_vm
     def test_shape(self):
         job = self.run_job(expect_commits=2)
         (self.vm.jobdir(job) / "progress.tsv").write_text("done\ta\nactive\tb\npending\tc\nnote\thi\n")
@@ -569,6 +579,7 @@ class StatusShapeTests(ProgressCase):
         self.assertIsNone(rows["p"]["job"]["progress"])
         self.assertIsNone(rows["sh"]["job"]["progress"])
 
+    @needs_linux_vm
     def test_human_suffix(self):
         job = self.run_job()
         (self.vm.jobdir(job) / "progress.tsv").write_text("done\ta\nactive\tb\n")
@@ -587,6 +598,7 @@ class StatusShapeTests(ProgressCase):
 
 
 class WatchTests(ProgressCase):
+    @needs_linux_vm
     def test_non_tty_prints_plain_lines_and_exits_with_the_jobs_status(self):
         self.vm.env.update(FAKE_CLAUDE_SLEEP="1", FAKE_CLAUDE_EXIT="7")
         self.run_job()
@@ -604,6 +616,7 @@ class WatchTests(ProgressCase):
         code, out, _ = self.run_main("progress", "p", "--watch", "--interval", "1")
         self.assertEqual(code, ab.EXIT_LOST)
 
+    @needs_linux_vm
     def test_tty_redraws_in_place_with_our_own_escape_codes_only(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "1"
         job = self.run_job()

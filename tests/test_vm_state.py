@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 import test_jobs
-from helpers import AgentboxTestCase, FakeSbx, ab
+from helpers import AgentboxTestCase, FakeSbx, ab, needs_linux_vm
 
 
 class SandboxStateTests(AgentboxTestCase):
@@ -65,6 +65,7 @@ class StoppedJobTests(test_jobs.JobCase):
         self.assertEqual((j["state"], j["exit_code"], j["session_id"]), ("finished", 0, "sess-12345678"))
         self.assertEqual(len(self.vm.calls), calls)
 
+    @needs_linux_vm
     def test_unknown_state_is_not_cached_and_flags_probe_failed(self):
         self.vm.env["FAKE_CLAUDE_SLEEP"] = "30"
         self.start()
