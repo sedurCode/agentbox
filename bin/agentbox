@@ -107,7 +107,7 @@ DEFAULT_PROFILE = {
     "instructions": "",
     "vscode": False,            # allow the hosts VS Code's remote server + extensions need
     "confirm_host_tools": False,  # ask on the host (macOS dialog) before every host-tool call
-    "keepalive": False,         # headless jobs: hold an `sbx exec` session open while a job runs (precaution)
+    "keepalive": True,          # headless jobs: hold an `sbx exec` session open while a job runs (sbx stops idle sandboxes)
 }
 
 # From https://code.visualstudio.com/docs/setup/network (server download + Marketplace).
@@ -1596,8 +1596,9 @@ def keepalive_pid(prof: Profile) -> int | None:
 
 
 def start_keepalive(prof: Profile):
-    """Host-side, opt-in (`run --keepalive` / `keepalive = true`): hold an `sbx exec` session open while
-    the job runs, as a precaution against session-bound stops. sbx has no idle stop that we know of."""
+    """Host-side, on by default (`--no-keepalive` / `keepalive = false` opt out): hold an `sbx exec` session
+    open while the job runs. sbx stops a sandbox with no open session ~30 s after the last one, killing
+    a detached job."""
     if keepalive_pid(prof):
         return
     log = open(prof.state / "keepalive.out", "a")
@@ -1616,7 +1617,7 @@ def stop_keepalive(prof: Profile):
 
 
 def cmd_keepalive(prof: Profile) -> int:
-    """Internal (started by `run --keepalive`): keep one exec session open until the job is no longer running."""
+    """Internal (started by `run`): keep one exec session open until the job is no longer running."""
     job_id = job_record(prof).get("id")
     if not job_id:
         return EXIT_OK
@@ -1766,7 +1767,8 @@ def cmd_run(prof: Profile, args) -> int:
     if r.returncode != 0:
         die(f"the job did not start inside {prof.sandbox} (exit {r.returncode})\n{r.stderr or ''}".rstrip())
     save_job_record(prof, {"id": job_id, "agent": agent, "session_id": None})
-    if getattr(args, "keepalive", False) or prof.d["keepalive"]:
+    keep = getattr(args, "keepalive", None)
+    if prof.d["keepalive"] if keep is None else keep:
         start_keepalive(prof)
     info(f"job {job_id} started in {prof.sandbox}")
     print(job_id)
@@ -2071,7 +2073,8 @@ def main():
     g.add_argument("--prompt-file", metavar="F", help="file holding the prompt ('-' = stdin)")
     g.add_argument("--prompt", metavar="TEXT", help="prompt text (visible in your host's process list; prefer --prompt-file)")
     p.add_argument("--detach", action="store_true", help="start the job and return")
-    p.add_argument("--keepalive", action="store_true", help="also hold an exec session open while the job runs (precaution)")
+    p.add_argument("--keepalive", action=argparse.BooleanOptionalAction, default=None,
+                   help="hold an exec session open while the job runs (default: on; sbx stops idle sandboxes)")
     p.add_argument("--agent-args", nargs=argparse.REMAINDER, default=[], help="extra agent arguments (rest of the line)")
     p = sub.add_parser("wait"); p.add_argument("profile"); p.add_argument("--job")
     p.add_argument("--timeout", type=float, metavar="S")
