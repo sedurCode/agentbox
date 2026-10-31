@@ -22,6 +22,7 @@ Docker Sandboxes (`sbx`).
     agentbox logs <profile> [--job ID] [-f] [--raw]    job output
     agentbox resume <profile> [--job ID]               attach interactively to the job's session
     agentbox progress <profile> [--job ID] [--watch [--interval S]] [--json]   how far the job is
+    agentbox fetch <profile> [--branch B] [--ref R] [--start] [--force] [--json]   clone mode: bring the commits to the host
 
 Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
 `wait` also 4 = timeout, 5 = job lost (otherwise it exits with the job's own exit code).
@@ -38,6 +39,7 @@ if sys.version_info < (3, 11):          # before anything that needs 3.11 (tomll
 
 import argparse
 import calendar
+import contextlib
 import datetime
 import fnmatch
 import hashlib
@@ -2219,7 +2221,8 @@ def cmd_wait(prof: Profile, args) -> int:
         j = job_info(prof, job_id)
         if j["state"] == "finished":
             cache_final_progress(prof, job_id, j)
-            info(f"job {job_id} finished (exit {j['exit_code']})")
+            info(f"job {job_id} finished (exit {j['exit_code']})"
+                 + (f"; `agentbox fetch {prof.name}` brings its commits to the host" if prof.d["mode"] == "clone" else ""))
             return job_exit_status(j)
         if j["state"] == "lost":
             doubts += 1                     # one flaky probe isn't "lost"
@@ -2328,7 +2331,8 @@ def cmd_run(prof: Profile, args) -> int:
     info(f"job {job_id} started in {prof.sandbox}")
     print(job_id)
     if args.detach:
-        info(f"follow with `agentbox logs {prof.name} -f`, block with `agentbox wait {prof.name}`")
+        info(f"follow with `agentbox logs {prof.name} -f`, block with `agentbox wait {prof.name}`"
+             + (f", then `agentbox fetch {prof.name}` for the commits" if prof.d["mode"] == "clone" else ""))
         return EXIT_OK
     args.job, args.follow, args.raw, args.wait_status = job_id, True, False, True
     return cmd_logs(prof, args)
@@ -2750,6 +2754,196 @@ def cmd_progress(prof: Profile, args) -> int:
             time.sleep(args.interval)
             continue
         return job_exit_status(j)
+
+
+# ------------------------------------------------------------------- fetch
+# Clone mode keeps the agent's work in the VM. While the sandbox runs, sbx adds the git remote
+# `sandbox-<sandbox>` to the host repo, and it removes it when the sandbox stops (which it does ~30 s
+# after the last exec session ends). `fetch` holds a session open, waits for the remote, fetches into a
+# review branch and reports. It never merges. The remote name is built here, never read from the VM.
+FETCH_WAIT, FETCH_POLL, FETCH_HOLD = 60.0, 1.5, 300      # seconds: wait for the remote, poll gap, keep-awake session
+REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")     # no leading '-', no spaces, no '@{', ':', '~', '^', '*', '\\'
+LOG_CAP, STAT_CAP = 50, 30
+
+
+def host_git(prof: Profile, *args, check: bool = True, timeout: float = 120):
+    """Run git on the host in the primary workspace. Only used in clone mode, where the agent cannot
+    have touched the host's .git; commit contents never choose a program (no external diff or textconv)."""
+    cmd = ["git", "-C", str(prof.primary), *args]
+    env = {**sbx_env(prof.cfg), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+    except FileNotFoundError:
+        die("git not found on the host")
+    except subprocess.TimeoutExpired:
+        die(f"`git {args[0]}` timed out after {timeout:g}s")
+    if check and r.returncode != 0:
+        die(f"`git {args[0]}` failed (exit {r.returncode})\n{(r.stderr or r.stdout or '').strip()}")
+    return r
+
+
+def check_fetch_ref(what: str, value: str) -> str:
+    if not REF_RE.match(value) or ".." in value or "//" in value or value.endswith(("/", ".", ".lock")) \
+            or "/." in value or len(value) > 200:
+        die(f"{what} {value!r} is not an acceptable branch name", EXIT_USAGE)
+    r = subprocess.run(["git", "check-ref-format", "--branch", value], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        die(f"{what} {value!r} is not a valid git branch name", EXIT_USAGE)
+    return value
+
+
+@contextlib.contextmanager
+def keep_awake(prof: Profile, seconds: int = FETCH_HOLD):
+    """One `sbx exec <sandbox> sleep N` child, so sbx does not stop the sandbox mid-fetch (and boots
+    it if it is stopped). Always ended, on success, error and Ctrl-C."""
+    p = subprocess.Popen([prof.cfg.settings["sbx"], "exec", prof.sandbox, "sleep", str(seconds)],
+                         env=sbx_env(prof.cfg), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        yield p
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+
+def wait_for_remote(prof: Profile, remote: str, child) -> None:
+    deadline = time.monotonic() + FETCH_WAIT
+    while True:
+        if remote in host_git(prof, "remote").stdout.split():
+            return
+        rc = child.poll()
+        if rc is not None:
+            die(f"the keep-awake session in {prof.sandbox} ended (exit {rc}) before remote {remote} appeared;"
+                f" is the sandbox healthy? (`agentbox doctor {prof.name}`)")
+        if time.monotonic() >= deadline:
+            die(f"remote {remote} did not appear within {FETCH_WAIT:g}s; the sandbox may still be starting."
+                f" Try again, or check `sbx ls` and `git -C {prof.primary} remote`")
+        time.sleep(FETCH_POLL)
+
+
+def fetch_missing_hint(prof: Profile) -> str:
+    r = host_git(prof, "for-each-ref", "--format=%(refname)", f"refs/sandboxes/{prof.sandbox}/", check=False)
+    refs = r.stdout.split() if r.returncode == 0 else []
+    if not refs:
+        return ""
+    return ("\nCommits fetched before the sandbox was removed are kept in refs/sandboxes/; keep one with"
+            "\n  " + "\n  ".join(f"git branch LOCAL {ref}" for ref in refs[:5]) + ("\n  ..." if len(refs) > 5 else ""))
+
+
+def checked_out_branches(prof: Profile) -> set[str]:
+    out = host_git(prof, "worktree", "list", "--porcelain").stdout
+    return {ln.split(" ", 1)[1] for ln in out.splitlines() if ln.startswith("branch ")}
+
+
+def parse_stat_summary(line: str) -> tuple[int, int, int]:
+    pick = lambda pat: int(m.group(1)) if (m := re.search(pat, line)) else 0
+    return pick(r"(\d+) files? changed"), pick(r"(\d+) insertions?\(\+\)"), pick(r"(\d+) deletions?\(-\)")
+
+
+def fetch_job_note(prof: Profile) -> tuple[bool, str]:
+    """(is a job running, progress suffix). Best effort: a failed look is not a failed fetch."""
+    try:
+        j = job_info(prof)
+        if j["state"] != "running":
+            return False, ""
+        try:
+            return True, progress_suffix(job_progress(prof, j["id"], j)[0])
+        except SystemExit:
+            return True, ""
+    except SystemExit:
+        return False, ""
+
+
+def cmd_fetch(prof: Profile, args) -> int:
+    if prof.d["mode"] != "clone":
+        die(f"profile '{prof.name}' is in direct mode: the agent edits {prof.primary} itself, so there is"
+            f" nothing to fetch. Review what it changed with `agentbox audit {prof.name}`", EXIT_USAGE)
+    ref, branch = check_fetch_ref("--ref", args.ref), check_fetch_ref("--branch", args.branch)
+    remote = f"sandbox-{prof.sandbox}"
+    vm = sandbox_state(prof)
+    if vm == "unknown":
+        die(f"cannot tell whether {prof.sandbox} is running (`sbx ls --json` failed)")
+    if vm == "missing":
+        die(f"sandbox {prof.sandbox} does not exist, so there is no {remote} remote to fetch from"
+            + fetch_missing_hint(prof))
+    if vm == "stopped" and not args.start:
+        die(f"sandbox {prof.sandbox} is stopped, and sbx removes {remote} when a sandbox stops. --start boots it;"
+            f" booting relaunches the agent that was last started with `sbx run`")
+    full = f"refs/heads/{branch}"
+    if host_git(prof, "rev-parse", "--git-dir", check=False).returncode != 0:
+        die(f"{prof.primary} is not a git repository")
+    if full in checked_out_branches(prof):
+        die(f"branch {branch} is checked out in {prof.primary}; pick another with --branch", EXIT_USAGE)
+    tip_r = host_git(prof, "rev-parse", "--verify", "-q", f"{full}^{{commit}}", check=False)
+    previous = tip_r.stdout.strip() if tip_r.returncode == 0 else None
+
+    try:
+        with keep_awake(prof) as child:
+            wait_for_remote(prof, remote, child)
+            if previous and not args.force:
+                host_git(prof, "fetch", "--no-tags", "--", remote, ref, timeout=300)
+                fetched = host_git(prof, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
+                if host_git(prof, "merge-base", "--is-ancestor", previous, fetched, check=False).returncode != 0:
+                    die(f"{branch} ({previous[:12]}) is not an ancestor of {remote}/{ref} ({fetched[:12]}),"
+                        f" so this would not be a fast-forward. Pass --force to overwrite {branch}, or use --branch")
+            host_git(prof, "fetch", "--no-tags", "--", remote, f"{'+' if args.force else ''}{ref}:{full}", timeout=300)
+            running, suffix = fetch_job_note(prof)
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+    commit = host_git(prof, "rev-parse", "--verify", f"{full}^{{commit}}").stdout.strip()
+    head_r = host_git(prof, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False)
+    head = head_r.stdout.strip() if head_r.returncode == 0 else None
+    rng = f"{head}..{commit}" if head else commit
+    total = int(host_git(prof, "rev-list", "--count", rng, "--").stdout.strip() or 0)
+    commits = []
+    for ln in host_git(prof, "log", "--no-color", "--no-show-signature", f"--max-count={LOG_CAP}",
+                       "--format=%H %s", rng, "--").stdout.splitlines():
+        h, _, subject = ln.partition(" ")
+        commits.append({"hash": h, "subject": subject})
+    stat = ""
+    if head:
+        stat = host_git(prof, "diff", "--stat=120", "--no-color", "--no-ext-diff", "--no-textconv",
+                        f"{head}...{commit}", "--").stdout.rstrip("\n")
+    stat_lines = stat.splitlines()
+    files, ins, dels = parse_stat_summary(stat_lines[-1]) if stat_lines else (0, 0, 0)
+    ff = bool(head) and host_git(prof, "merge-base", "--is-ancestor", head, commit, check=False).returncode == 0
+
+    if running:
+        info(f"a job is still running in {prof.sandbox}{suffix}: this is not necessarily its final state"
+             f" (`agentbox progress {prof.name}`)")
+    if args.json:
+        emit_json({"profile": prof.name, "sandbox": prof.sandbox, "remote": remote, "ref": ref, "branch": branch,
+                   "commit": commit, "previous": previous, "fast_forward_from_head": ff, "commits": commits,
+                   "commits_total": total, "files_changed": files, "insertions": ins, "deletions": dels,
+                   "job_running": running})
+        return EXIT_OK
+    print(f"fetched {remote} {ref} ({commit[:12]}) into {branch}"
+          + (f" (was {previous[:12]})" if previous else " (new branch)"))
+    print(f"\n{total} commit(s) {'not in HEAD' if head else 'on the branch'}:")
+    for c in commits:
+        print(f"  {c['hash'][:9]} {safe_text(c['subject'])}")
+    if total > len(commits):
+        print(f"  ... {total - len(commits)} more")
+    if stat_lines:
+        body, summary = stat_lines[:-1], stat_lines[-1]
+        print()
+        for ln in body[:STAT_CAP]:
+            print(safe_text(ln))
+        if len(body) > STAT_CAP:
+            print(f" ... {len(body) - STAT_CAP} more files")
+        print(safe_text(summary))
+    print(f"\nnext:\n  git diff HEAD...{branch}")
+    print(f"  git merge --ff-only {branch}" if ff else
+          f"  (a fast-forward is not possible: HEAD is not an ancestor of {branch}; rebase it or merge by hand)")
+    return EXIT_OK
 
 
 def emit_json(obj):
@@ -3517,6 +3711,12 @@ def main():
     p.add_argument("--watch", action="store_true", help="redraw until the job ends; exit with its status")
     p.add_argument("--interval", type=float, default=5.0, metavar="S", help="seconds between --watch updates (default 5)")
     p.add_argument("--json", action="store_true", help="print the job.progress object of `status --json`")
+    p = sub.add_parser("fetch", help="clone mode: fetch the agent's commits into a review branch (never merges)")
+    p.add_argument("profile"); p.add_argument("--branch"); p.add_argument("--ref", default="main", metavar="REF",
+                   help="branch to fetch from the sandbox (default main)")
+    p.add_argument("--start", action="store_true", help="boot the sandbox if it is stopped")
+    p.add_argument("--force", action="store_true", help="overwrite the review branch even if not a fast-forward")
+    p.add_argument("--json", action="store_true")
     sub.add_parser("keepalive", help=argparse.SUPPRESS).add_argument("profile")
     p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
@@ -3568,6 +3768,9 @@ def main():
         sys.exit(cmd_resume(prof, a))
     if a.cmd == "progress":
         sys.exit(cmd_progress(prof, a))
+    if a.cmd == "fetch":
+        a.branch = f"review/{prof.name}" if a.branch is None else a.branch
+        sys.exit(cmd_fetch(prof, a))
     if a.cmd == "keepalive":
         sys.exit(cmd_keepalive(prof))
     if a.cmd == "shell":
