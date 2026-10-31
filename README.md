@@ -3,7 +3,7 @@
 agentbox runs coding agents in constrained Docker Sandboxes, with profiles, scoped credentials and a bridge to allow-listed host tools.
 
 - **Requirements:** macOS, Docker Sandboxes (`sbx`), and Python 3.11+ (standard library only).
-- **Status:** early. The `sbx` kit schema is experimental and may change.
+- **Status:** early. The `sbx` kit schema is experimental and may change, and so may agentbox's own commands.
 
 `sbx` already does the heavy lifting: each sandbox is a **microVM** with its own kernel,
 its own Docker engine, and all egress forced through a **host-side proxy** that enforces
@@ -20,6 +20,15 @@ the VM. agentbox adds the parts you asked for on top:
 - **Audit**: hashes build files, git hooks/config, IDE task files and agent config at
   creation, and shows what changed — those are the files that turn "agent edited my repo"
   into "agent ran code on my Mac".
+- **Headless jobs**: `run` starts the agent inside the VM, detached, with a keep-alive so sbx doesn't
+  stop the sandbox under it; `wait`, `logs` and `resume` follow it.
+- **Progress**: `progress` shows what agentbox measures (time, tool calls, tokens, cost, commits) next to
+  the agent's own plan, and flags a job that has gone quiet.
+- **Clone mode and `fetch`**: the agent works on its own clone, and `agentbox fetch` brings its commits to a
+  review branch on the host. It never merges.
+- **Skill sets**: read-only git repos of agent skills, pinned to a commit you reviewed and linked into the VM.
+- **`provision`**: guided setup of a new profile, with suggestions taken from the workspace.
+- **VS Code** Remote-SSH into the sandbox, so terminals, tasks and extensions run in the VM.
 - **Junie** kit (not built into sbx) and an **Arm embedded toolchain** kit.
 
 ```
@@ -31,6 +40,19 @@ the VM. agentbox adds the parts you asked for on top:
    └─ STM32_Programmer_CLI / st-info / arm-none-eabi-gdb  (USB probe lives here)
  ~/src/h750-firmware  ◄═══ direct mount (rw) ═══►  same path inside the VM
  ~/src/stm32-common   ◄═══ mount :ro ══════════►   same path, read-only
+```
+
+## Quick start
+
+```bash
+brew trust docker/tap && brew install docker/tap/sbx && sbx login   # once; see Install
+agentbox provision myproj --workspace ~/src/myproj    # guided; clone mode is suggested
+agentbox run myproj --prompt-file task.md --detach    # the brief goes in a file, never on a command line
+agentbox progress myproj --watch                      # until the job ends
+agentbox fetch myproj                                 # the agent's commits, into review/myproj
+git diff HEAD...review/myproj                         # review
+git merge --ff-only review/myproj                     # only if you are happy with it
+agentbox down myproj --force                          # when finished with the sandbox
 ```
 
 ## 1. Install
@@ -135,7 +157,7 @@ the important keys:
 | `agent` | `claude`, `copilot`, `codex`, `gemini`, `shell` (built-in) or a sandbox kit name/path (`junie`) |
 | `workspace` | primary project, mounted read-write at the same absolute path |
 | `extra_workspaces` | more mounts, append `:ro` for read-only |
-| `mode` | `direct` (default) or `clone` — agent gets its own git clone, host tree untouched; you `git fetch sandbox-ab-<profile>` to review. Host tools need `direct`. |
+| `mode` | `direct` (default) or `clone` (agent gets its own git clone, host tree untouched; you `agentbox fetch <profile>` to review). Host tools need `direct`. |
 | `kits` | kit names under `~/.config/agentbox/kits/` or paths |
 | `skills` | names of `[skillsets.*]` (a git repo of agent skills, mounted read-only, skills picked by path and linked into `~/.claude/skills`), merged with `[defaults]` — see *Skill sets* below |
 | `allow` / `deny` | sandbox-scoped egress rules (merged with `[defaults]`; deny wins) |
@@ -273,7 +295,8 @@ agentbox up h750           # first time: create + scoped secrets + attach. Later
 agentbox up h750 -- --resume   # extra args go to the agent
 agentbox shell h750        # bash inside the VM
 agentbox tools h750        # what the agent can run on the host
-agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation
+agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation (direct mode)
+agentbox fetch h750        # clone mode: the agent's commits, into review/h750 (see §6)
 agentbox stop h750         # pause sandbox + bridge
 agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force: also kills a running job, skips sbx's
                             # confirmation - required without a TTY - and deletes the sandbox even if in use, e.g. an open VS Code session)
@@ -354,6 +377,41 @@ Exit codes for `wait` (and the final status of a foreground `run`): the **job's 
 (claude: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still
 running; `5` = job lost. Codes 1-3 keep their meaning from the table above for agentbox's own
 errors, so a job that exits with 2-5 is ambiguous: read `status --json` (`job.exit_code`) if you need to tell.
+
+### Handing a task to an agent
+
+The whole loop, for a clone-mode profile (`provision` suggests one):
+
+1. **Write the brief** in a file, for example `task.md`: what to do, where the tests are, what "done"
+   means, and what not to touch. It reaches the VM on stdin: use `--prompt-file task.md`, or
+   `--prompt-file -` with a pipe. Avoid `--prompt TEXT`, which sits in your own process list.
+2. **Start it**: `agentbox run h750 --prompt-file task.md --detach` prints the job id and returns. Add
+   `--expect-commits N` if you know how many commits to expect. The first `run` creates the sandbox.
+3. **Watch it**: `agentbox progress h750 --watch` for the plan and the measured numbers, or
+   `agentbox logs h750 -f` for what it is doing. `status` lists every profile.
+4. **Wait for it** in a script with `agentbox wait h750 --timeout 3600`; the exit status is the job's own
+   (`4` = still running, `5` = lost).
+5. **Fetch**: `agentbox fetch h750` holds the sandbox up, waits for the git remote, fetches the agent's
+   `main` into `review/h750` and prints the new commits and a diffstat. If the job is still running it
+   warns you, because what you got is not its final state.
+6. **Review** on the host: `git log HEAD..review/h750` and `git diff HEAD...review/h750`. Nothing has been
+   merged, and your checked-out branch is untouched.
+7. **Merge** when happy: `git merge --ff-only review/h750`. If HEAD has moved on and a fast-forward isn't
+   possible, rebase the review branch or merge by hand. To ask for changes, run again in the same sandbox
+   (`agentbox resume h750` continues the session interactively).
+8. **Finish**: `agentbox down h750` removes the sandbox, its scoped secrets and its state. Fetch first:
+   the commits live only in the VM until you do. To start clean with the same profile, use
+   `agentbox fresh h750`; to carry on, just `run` again.
+
+**sbx stops idle sandboxes**, about 30 s after the last `exec` or `run` session ends, and removes the
+`sandbox-ab-<profile>` git remote with it. A running job is protected by the keep-alive, and `fetch` opens a
+session of its own while it works. Once the job has ended and nothing is attached, the sandbox soon stops.
+`agentbox fetch h750 --start` boots it again, but booting relaunches the agent that was last started with
+`sbx run`, which is why it is not the default.
+
+**If the sandbox is gone**, `fetch` says so and exits 1. Commits fetched before it was removed stay in the
+host repo under `refs/sandboxes/<sandbox>/<branch>`; keep one with
+`git branch LOCAL refs/sandboxes/ab-h750/main`, and `fetch` prints that command when such refs exist.
 
 ### Watching a job
 
@@ -474,7 +532,7 @@ starting the agent), starts the host-tool bridge, checks SSH, then runs
 
 ### Scripting agentbox
 
-`status`, `doctor` and `tools` take `--json`: stdout is then exactly one JSON document, the human
+`status`, `doctor`, `tools`, `progress` and `fetch` take `--json`: stdout is then exactly one JSON document, the human
 text is unchanged without the flag, and diagnostics still go to stderr. No secret values appear
 in any of them (`doctor` reports token-like variables by name, class and length only).
 
@@ -485,7 +543,7 @@ in any of them (`doctor` reports token-like variables by name, class and length 
 | `0` | ok |
 | `1` | checks failed (`doctor`) or a command failed (`sbx` error, bridge, SSH, ...) |
 | `2` | usage or config error: bad arguments, no/invalid config, unknown or disabled profile, unsafe tool definition |
-| `3` | sandbox not found (`shell`, `stop`, `resume`, and `audit` when nothing was ever created) |
+| `3` | sandbox not found (`shell`, `stop`, `resume`, `logs` on a stopped sandbox, and `audit` when nothing was ever created) |
 | `4` | `wait --timeout` expired, job still running |
 | `5` | `wait`: job lost (process gone: VM stopped or reset) |
 
@@ -702,14 +760,32 @@ you fetch from the sandbox remote. Fetching runs no code from the sandbox's conf
 
 **clone mode**: the agent works on its own clone inside the VM; nothing on the host changes
 until you fetch from `sandbox-ab-<profile>` and merge. Safest for untrusted repos, but no host tools.
-sbx removes that remote when the sandbox stops, so `sandbox-ab-<profile>/main` stops resolving (the commits
-stay in your object store). Fetch into a local branch, review, then fast-forward:
+sbx adds that remote to the host repo while the sandbox runs and removes it when the sandbox stops
+(about 30 s after the last session ends). The commits you fetched stay in your object store.
 
 ```bash
-git fetch sandbox-ab-<profile> main:review/<profile>
-git log review/<profile>            # review
-git merge --ff-only review/<profile>
+agentbox fetch h750               # into review/h750; add --branch B, --ref R, --start, --force, --json
+git diff HEAD...review/h750       # review
+git merge --ff-only review/h750   # the only step that changes your branch, and you run it
 ```
+
+`fetch` is for clone-mode profiles only; for a direct-mode profile it exits 2 and points at `audit`. It
+refuses a stopped sandbox unless you pass `--start`, keeps one `sbx exec ... sleep` session open while it
+works (and always ends it), waits up to 60 s for the remote, then fetches `--ref` (default `main`) from the
+sandbox into `--branch` (default `review/<profile>`). It names the remote itself; it never takes one from
+anything the VM printed. Both names are checked as branch names and passed to git after `--`. It refuses
+to touch a branch that is checked out in the host repo (exit 2), and refuses an update that is not a
+fast-forward of the existing review branch (exit 1) unless you pass `--force`. Everything git prints is
+passed through `safe_text`, since commit subjects and file names are agent-written. With `--json` the
+result is one document: `profile`, `sandbox`, `remote`, `ref`, `branch`, `commit`, `previous`,
+`fast_forward_from_head`, `commits` (at most 50, each `{hash, subject}`), `commits_total`,
+`files_changed`, `insertions`, `deletions` and `job_running`.
+
+This is the one place agentbox runs git on the host. That is safe because in clone mode the host
+repo is mounted read-only, so the agent cannot have written its `.git/config`, and fetching from the
+sandbox remote runs nothing from the VM's config. The diff is run with `--no-ext-diff --no-textconv`.
+The raw equivalent, while the sandbox is running, is
+`git fetch sandbox-ab-<profile> main:review/<profile>`.
 
 ## 7. What this protects and what it doesn't
 
@@ -739,6 +815,12 @@ an escape sequence in a file name or log line could rewrite your screen or write
   (`render_local_kit`) if it needs adjusting.
 - **Changed the profile but nothing happened** → `agentbox fresh <profile>`.
 - **A skill isn't linked** → `agentbox doctor <profile>` says which and why (not mounted: needs `fresh`; name taken by a folder in the VM's `~/.claude/skills`; a rule violation in the set).
+- **`doctor` says "skill X is not linked (not-mounted)"** after you added a skill set to a profile: mounts
+  exist only from sandbox creation, so run `agentbox fresh <profile>`.
+- **`down` / `fresh` say stdin is not a terminal**: sbx asks for confirmation before removing a sandbox. Pass
+  `--force`, which also kills a running job and deletes the sandbox even while it is in use.
+- **The fetch remote `sandbox-ab-<profile>` is missing**: the sandbox is stopped, and sbx removes the remote
+  when it stops. Use `agentbox fetch <profile> --start`.
 - **Verbose** → `verbose = true` in `[settings]` prints every `sbx` command.
 
 ## Development
@@ -749,6 +831,10 @@ Tests use only the standard library and never call the real `sbx` (any attempt f
 python3 -m unittest discover -s tests -v
 python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher && sh -n share/jobwrap && sh -n share/jobprogress
 ```
+
+About 41 tests are skipped on macOS (41 in a simulated darwin run): they run the VM-side `sh` scripts
+(the job wrapper, the probes, the kill script), which use Linux tools such as `setsid` and `/proc`. The
+Ubuntu CI job runs them. The `fetch` tests use real temporary git repos and need `git`.
 
 CI (`.github/workflows/ci.yml`) runs the same on Ubuntu and macOS with Python 3.11 and 3.14.
 
