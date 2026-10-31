@@ -188,6 +188,8 @@ and `allow_scripts` are not part of the creation-time kit digest (a changed `pat
 until you update `ref` the check refuses to create or link, so a merge you haven't acknowledged cannot reach a
 new sandbox. Commands that run `up` link new `include` entries on the next run.
 
+None of this makes a skill's text trustworthy: read the diff before you update `ref`.
+
 **How linking works.** Each set is added to `sbx create` as `<path>:ro`, which mounts it read-only at the
 *same absolute path* as on the host (direct and clone mode). Then one idempotent `sh` script runs in the VM
 and makes `~/.claude/skills/<skill>` a symlink to `<set path>/<included path>`. It runs after create and on
@@ -203,40 +205,6 @@ the agent again if it had already read its skill directory.
 - A **new mount** (a new set or a changed `path`) needs `agentbox fresh`, and the message says so when the
   paths changed. A skill whose folder isn't mounted yet is reported as "not linked", not linked dangling.
 - The generated kit's instructions name the mounted sets and tell the agent they are read-only.
-
-**`agentbox skills vendor`** fills a set folder from a *pinned* GitHub commit (host side, no sandbox):
-
-```bash
-agentbox skills vendor github:OWNER/REPO@<40-hex SHA> --only a/b,c/d --into ~/agent-skills/core \
-    [--prefix skills/] [--text-only | --no-text-only] [--yes]
-```
-
-- The SHA must be 40 hex characters; branches and tags are refused, because the pin is the point.
-- It downloads `codeload.github.com/OWNER/REPO/tar.gz/SHA` with `urllib` (30 s timeout, 50 MB cap; no git,
-  nothing from the archive is executed) and reads it member by member. It refuses the whole archive for
-  absolute paths, `..`, backslashes, more than one top-level folder and any `.git` folder, and for
-  symlinks, hardlinks, devices or FIFOs inside a selected skill (the same kinds outside the selection are
-  never read, so they are ignored). The top folder is stripped; each `--only` path (relative to
-  `--prefix`) is one skill named after its last component, which must pass the name rules above.
-- `--text-only` (default) drops files that aren't `.md`, `.txt`, `.json`, `.yaml`/`.yml` or `LICENSE*`,
-  and executables, and lists what it dropped, so the result passes the set rules. `.gitattributes` and
-  `.gitmodules` are always dropped: git honours them in any folder, and you will run git in this one.
-- It writes `--into/<skill>/`. If that exists, you see a `difflib` diff and are asked to confirm (`--yes`
-  skips the question; no terminal means no). It also writes `--into/SOURCES.json` (per skill: repo, sha,
-  upstream path, sha256 per file, date) and copies the repo's `LICENSE`/`LICENSE.md` to
-  `--into/LICENSES/<owner>-<repo>.txt`.
-- Last it prints a read-only risk scan of what it wrote — URLs, curl/wget, pipes into `sh`, `npx` and
-  package installs, base64, eval, sudo, `rm -r`, `~/.ssh`, `.env`, keys and tokens, "ignore previous",
-  `gh pr/issue/api/auth`, `git push`, `--no-verify`, settings.json and hooks, and invisible or bidi
-  Unicode characters (shown as `\uXXXX`). It is a reading list: it never fails the command.
-
-**Updating a pinned set.** Run `vendor` again with the new SHA and the same `--only` and `--into`; read the
-diff it shows for each skill and the scan, answer `y` for the ones you accept, then commit in your skills
-folder (`git -C ~/agent-skills/core add -A && git commit`; `SOURCES.json` records the new SHA). Running
-sandboxes see the change at once through the mount; review before you accept it, not after.
-
-What this does *not* do: it doesn't make a skill's text trustworthy (read what you vendor), and it only
-knows Claude Code's skill directory.
 
 ## 3. Daily use
 

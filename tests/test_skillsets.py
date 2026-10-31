@@ -265,16 +265,16 @@ class CommitTests(SkillCase):
 
     def test_branch_detached_packed_and_unreadable(self):
         root = self.repo("ref: refs/heads/main\n", {"refs/heads/main": HEX})
-        self.assertEqual(ab.git_commit_of(root), HEX)
+        self.assertEqual(ab.git_head_of(root)[0], HEX)
         self.assertEqual(self.inspect(sets={"core": f'path = "{root}"'}).commit, HEX)
         root = self.repo("ref: refs/heads/main\n", packed=f"{HEX} refs/heads/main\n")
-        self.assertEqual(ab.git_commit_of(root), HEX)
+        self.assertEqual(ab.git_head_of(root)[0], HEX)
         root = self.repo(HEX + "\n")
-        self.assertEqual(ab.git_commit_of(root), HEX)
+        self.assertEqual(ab.git_head_of(root)[0], HEX)
         root = self.repo("ref: refs/heads/gone\n")
-        self.assertEqual(ab.git_commit_of(root), "unknown")
+        self.assertEqual(ab.git_head_of(root)[0], "unknown")
         root = self.repo("ref: refs/../../etc/passwd\n")
-        self.assertEqual(ab.git_commit_of(root), "unknown")
+        self.assertEqual(ab.git_head_of(root)[0], "unknown")
 
     def test_git_dir_is_not_scanned_for_skills_or_text_rules(self):
         root = self.repo("ref: refs/heads/main\n", {"refs/heads/main": HEX})
@@ -287,7 +287,7 @@ class CommitTests(SkillCase):
     def test_never_runs_git(self):
         # subprocess.run is a loud failure in these tests; reading must not need it
         self.repo("ref: refs/heads/main\n", {"refs/heads/main": HEX})
-        self.assertIsNotNone(ab.git_commit_of(self.sets / "core"))
+        self.assertIsNotNone(ab.git_head_of(self.sets / "core")[0])
 
 
 class RepoCase(SkillCase):
