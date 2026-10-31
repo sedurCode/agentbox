@@ -47,6 +47,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -96,6 +97,7 @@ DEFAULT_PROFILE = {
     "mode": "direct",           # direct | clone
     "template": "",
     "kits": [],
+    "skills": [],               # [skillsets.*] names; read-only host folders of agent skills
     "allow": [],
     "deny": [],
     "env": {},
@@ -121,7 +123,15 @@ VSCODE_APP_CLIS = [
     "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
     "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
 ]
-MERGED_LISTS = ("allow", "deny", "kits")   # defaults + profile are unioned
+MERGED_LISTS = ("allow", "deny", "kits", "skills")   # defaults + profile are unioned
+
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+# Claude Code's own skills: a user skill with one of these names would shadow it.
+BUILTIN_SKILLS = {"code-review", "security-review", "simplify", "init", "claude-api", "run", "loop",
+                  "schedule", "update-config", "keybindings-help", "fewer-permission-prompts",
+                  "statusline-setup"}
+SKILL_TEXT_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml")
+SKILLS_VM_DIR = "$HOME/.claude/skills"      # where Claude Code reads user skills inside the VM
 
 
 # ----------------------------------------------------------------- helpers
@@ -160,6 +170,16 @@ def is_within(p: Path, root: Path) -> bool:
     return p == root or root in p.parents
 
 
+def parse_workspace_spec(spec: str) -> tuple[Path, bool]:
+    """'path', 'path:ro' or 'path:rw' -> (resolved path, read_only)."""
+    ro = False
+    if spec.endswith(":ro"):
+        spec, ro = spec[:-3], True
+    elif spec.endswith(":rw"):
+        spec = spec[:-3]
+    return xp(spec), ro
+
+
 def sha256_file(p: Path) -> str:
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -176,6 +196,10 @@ class Config:
         self.raw = tomllib.loads(CONFIG_FILE.read_text())
         self.settings = {**DEFAULT_SETTINGS, **self.raw.get("settings", {})}
         self.tools = self.raw.get("tools", {})
+        self.skillsets = self.raw.get("skillsets", {})
+        for n, spec in self.skillsets.items():
+            if not NAME_RE.match(n) or not isinstance(spec, dict):
+                die(f"[skillsets.{n}]: the name must match {NAME_RE.pattern} and the entry must be a table", EXIT_USAGE)
         self.state_root = xp(self.settings["state_dir"])
 
     def profile_names(self):
@@ -207,14 +231,14 @@ class Profile:
         self.sandbox = f"{cfg.settings['name_prefix']}-{name}"
         self.state = cfg.state_root / self.sandbox
         self.primary = xp(d["workspace"])
-        self.extras: list[tuple[Path, bool]] = []      # (path, read_only)
-        for spec in d["extra_workspaces"]:
-            ro = False
-            if spec.endswith(":ro"):
-                spec, ro = spec[:-3], True
-            elif spec.endswith(":rw"):
-                spec = spec[:-3]
-            self.extras.append((xp(spec), ro))
+        self.extras: list[tuple[Path, bool]] = [parse_workspace_spec(spec) for spec in d["extra_workspaces"]]
+        skills = d["skills"]
+        if not isinstance(skills, list) or not all(isinstance(x, str) for x in skills):
+            die(f"profile '{name}': skills must be a list of skill set names", EXIT_USAGE)
+        for sk in skills:
+            if sk not in cfg.skillsets:
+                die(f"profile '{name}': unknown skill set '{sk}'. Known: {', '.join(cfg.skillsets) or '(none)'}", EXIT_USAGE)
+        self._skillsets: list[SkillSet] | None = None
         if d["mode"] not in ("direct", "clone"):
             die(f"profile '{name}': mode must be 'direct' or 'clone'", EXIT_USAGE)
         if not isinstance(d["enabled"], bool):
@@ -250,6 +274,43 @@ class Profile:
     def kit_paths(self) -> list[Path]:
         return [resolve_kit(k) for k in self.d["kits"]]
 
+    @property
+    def skillsets(self) -> "list[SkillSet]":
+        """The profile's skill sets, inspected on the host (read-only; cached per Profile)."""
+        if self._skillsets is None:
+            self._skillsets = [inspect_skillset(self.cfg, n) for n in self.d["skills"]]
+        return self._skillsets
+
+    def skill_mounts(self) -> list[Path]:
+        """Host paths mounted read-only for the skill sets (cheap: no filesystem walk)."""
+        out: list[Path] = []
+        for n in self.d["skills"]:
+            p = skillset_path(self.cfg.skillsets[n])
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    def skill_problems(self) -> list[str]:
+        problems, owner = [], {}
+        for ss in self.skillsets:
+            problems += [f"skill set '{ss.name}': {p}" for p in ss.problems]
+            for sk in ss.skills:
+                if owner.setdefault(sk, ss.name) != ss.name:
+                    problems.append(f"skill '{sk}' is in both set '{owner[sk]}' and set '{ss.name}'")
+        return problems
+
+    def require_skills(self):
+        """Die unless every skill set passes. Always looks at the folders again: the host can change
+        them (and the mount shows that at once) after this Profile was built."""
+        self._skillsets = None
+        problems = self.skill_problems()
+        if problems:
+            die(f"profile '{self.name}': skill sets refused:\n  - " + "\n  - ".join(problems), EXIT_USAGE)
+
+    def skill_links(self) -> list[tuple[str, str]]:
+        """(skill, VM path of its folder) for every skill of every set; the mount keeps the host path."""
+        return [(sk, f"{ss.path}/{sk}") for ss in self.skillsets for sk in ss.skills]
+
 
 def resolve_kit(ref: str) -> Path:
     """A kit is a name under ~/.config/agentbox/kits or a path. Kits live outside
@@ -259,6 +320,176 @@ def resolve_kit(ref: str) -> Path:
     if not (p / "spec.yaml").exists():
         die(f"kit '{ref}' not found (looked in {cand} and {p})", EXIT_USAGE)
     return p
+
+
+# ------------------------------------------------------------- skill sets
+# A skill set is a HOST folder with one subfolder per agent skill, mounted read-only into the
+# sandbox and symlinked into ~/.claude/skills. Skills are instructions the agent follows, so a
+# set the agent could write to would let one sandbox plant instructions for every other one.
+# Everything below reads the folder with Python only (lstat, os.walk without following links).
+class SkillSet:
+    def __init__(self, name: str, path: Path | None = None, description: str = ""):
+        self.name, self.path, self.description = name, path, description
+        self.skills: list[str] = []
+        self.commit: str | None = None      # 40 hex, "unknown", or None when the folder is not a git work tree
+        self.problems: list[str] = []
+        self.allow_scripts = False
+
+
+def skillset_path(spec: dict) -> Path | None:
+    raw = spec.get("path")
+    return xp(raw) if isinstance(raw, str) and raw.strip() else None
+
+
+def all_workspace_roots(cfg: Config) -> list[Path]:
+    """Every workspace of every profile (disabled ones too), read leniently from the raw config."""
+    roots = []
+    tables = [cfg.raw.get("defaults", {})] + list(cfg.raw.get("profiles", {}).values())
+    for t in tables:
+        if not isinstance(t, dict):
+            continue
+        if isinstance(t.get("workspace"), str):
+            roots.append(xp(t["workspace"]))
+        roots += [parse_workspace_spec(x)[0] for x in t.get("extra_workspaces", []) if isinstance(x, str)]
+    return roots
+
+
+def skillset_location_problems(cfg: Config, path: Path) -> list[str]:
+    """Where a skill set may live. `path` is resolved. Overlap is checked both ways: a workspace
+    inside the set is as writable by the agent as a set inside a workspace."""
+    problems = []
+    for r in all_workspace_roots(cfg):
+        if is_within(path, r) or is_within(r, path):
+            problems.append(f"overlaps workspace {r} (agent-writable)")
+    if is_within(path, CONFIG_DIR.resolve()):
+        problems.append(f"is inside the config dir {CONFIG_DIR}")
+    for what, p in (("config file", CONFIG_FILE), ("kits dir", KITS_DIR), ("state dir", cfg.state_root)):
+        if is_within(p.resolve(), path):
+            problems.append(f"contains the {what} {p}")
+    claude = (HOME / ".claude").resolve()
+    if is_within(path, claude) or is_within(claude, path):
+        problems.append(f"overlaps {HOME / '.claude'}")
+    return problems
+
+
+def _hex40(s: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{40}", s) is not None
+
+
+def git_commit_of(root: Path) -> str | None:
+    """HEAD commit of a git work tree, read as text - never runs git. None = not a git repo."""
+    g = root / ".git"
+    if g.is_symlink():
+        return None
+    gd = git_dir_of(root)
+    if gd is None:
+        return None
+    try:
+        head = (gd / "HEAD").read_text().strip()
+        if _hex40(head):
+            return head
+        m = re.fullmatch(r"ref:\s*(refs/[A-Za-z0-9._/-]+)", head)
+        if m and ".." not in m.group(1):
+            ref, common = m.group(1), gd
+            if (gd / "commondir").is_file():                 # linked worktree: refs live in the main git dir
+                common = (gd / (gd / "commondir").read_text().strip()).resolve()
+            for base in (gd, common):
+                f = base / ref
+                if f.is_file() and not f.is_symlink() and _hex40(f.read_text().strip()):
+                    return f.read_text().strip()
+            if (common / "packed-refs").is_file():
+                for line in (common / "packed-refs").read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1] == ref and _hex40(parts[0]):
+                        return parts[0]
+    except (OSError, ValueError):
+        pass
+    return "unknown"
+
+
+def _capped(names: list[str], limit: int = 20) -> str:
+    return ", ".join(names[:limit]) + (f" ... and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def inspect_skillset(cfg: Config, name: str) -> SkillSet:
+    """Check a [skillsets.<name>] against every rule and describe it. Never dies and never
+    raises on the folder's content: problems are returned for the caller to refuse or report."""
+    spec = cfg.skillsets[name]
+    ss = SkillSet(name, description=str(spec.get("description", "")))
+    raw = spec.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        ss.problems.append("needs `path = \"...\"`")
+        return ss
+    if not isinstance(spec.get("allow_scripts", False), bool):
+        ss.problems.append("allow_scripts must be true or false")
+        return ss
+    ss.allow_scripts = spec.get("allow_scripts", False)
+    lit = Path(os.path.expandvars(os.path.expanduser(raw)))
+    ss.path = lit
+    if not lit.is_absolute():
+        ss.problems.append(f"path {raw} must be absolute (or start with ~)")
+    elif lit.is_symlink():
+        ss.problems.append(f"{lit} is a symlink - point `path` at the real folder")
+    elif not lit.exists():
+        ss.problems.append(f"{lit} does not exist")
+    elif not lit.is_dir():
+        ss.problems.append(f"{lit} is not a directory")
+    if ss.problems:
+        return ss
+    ss.path = path = lit.resolve()
+    ss.problems += skillset_location_problems(cfg, path)
+    ss.commit = git_commit_of(path)
+
+    links, bad_text = [], []
+    for entry in sorted(os.listdir(path)):
+        full = path / entry
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            links.append(entry)
+        elif entry.startswith(".") or not stat.S_ISDIR(st.st_mode):
+            continue                                        # .git, SOURCES.json, README.md ...: not skills
+        elif entry == "LICENSES":
+            links += _walk_set(full, path, True, bad_text, [])
+        else:
+            specials: list[str] = []
+            links += _walk_set(full, path, ss.allow_scripts, bad_text, specials)
+            if specials:
+                ss.problems.append(f"special files (not regular files): {_capped(specials)}")
+            if not SKILL_NAME_RE.match(entry):
+                ss.problems.append(f"folder '{entry}': a skill name must match {SKILL_NAME_RE.pattern}")
+            elif entry in BUILTIN_SKILLS:
+                ss.problems.append(f"skill '{entry}' would shadow a built-in Claude Code skill")
+            elif not (full / "SKILL.md").is_file() or (full / "SKILL.md").is_symlink():
+                ss.problems.append(f"skill '{entry}' has no SKILL.md")
+            else:
+                ss.skills.append(entry)
+    if links:
+        ss.problems.append(f"symlinks are not allowed: {_capped(links)}")
+    if bad_text:
+        ss.problems.append("files that are not plain text (allowed: .md .txt .json .yaml .yml LICENSE*, none executable;"
+                           f" set allow_scripts = true to accept others): {_capped(bad_text)}")
+    return ss
+
+
+def _walk_set(top: Path, root: Path, allow_other: bool, bad_text: list, specials: list) -> list[str]:
+    """Walk one folder of a set without following links. Returns the symlinks found (relative to the
+    set); appends non-text / executable files to bad_text and non-regular files to specials."""
+    links = []
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        for n in dirnames + filenames:
+            full = Path(dirpath) / n
+            rel = str(full.relative_to(root))
+            st = os.lstat(full)
+            if stat.S_ISLNK(st.st_mode):
+                links.append(rel)
+            elif stat.S_ISDIR(st.st_mode):
+                continue
+            elif not stat.S_ISREG(st.st_mode):
+                specials.append(rel)
+            elif not allow_other and (st.st_mode & 0o111
+                                      or not (n.lower().endswith(SKILL_TEXT_SUFFIXES) or n.startswith("LICENSE"))):
+                bad_text.append(rel)
+    return links
 
 
 # --------------------------------------------------------------- sbx shell
@@ -449,6 +680,12 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
             tool_summary(cfg, prof.tool_names),
             "Host tools are deliberately narrow. If you need something they don't allow, ask the user.",
         ]
+    mounts = prof.skill_mounts()
+    if mounts:
+        instructions += ["", "## Skill sets",
+                         "Read-only skill sets from the user's host are mounted at " + ", ".join(map(str, mounts))
+                         + " and linked into ~/.claude/skills. They are read-only: do not try to edit them,"
+                           " ask the user. Skills you write yourself go in ~/.claude/skills as normal folders."]
     if prof.d.get("instructions"):
         instructions += ["", prof.d["instructions"]]
     spec = {
@@ -475,8 +712,11 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
         p = kit_dir / "files" / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
-    digest = hashlib.sha256((text + json.dumps(files, sort_keys=True)
-                             + json.dumps(prof.d, sort_keys=True, default=str)).encode()).hexdigest()
+    # `skills` only counts once used, so sandboxes made before skill sets existed don't look changed
+    shaped = {k: v for k, v in prof.d.items() if k != "skills" or v}
+    skill_defs = json.dumps([[n, cfg.skillsets[n]] for n in prof.d["skills"]], sort_keys=True, default=str)
+    digest = hashlib.sha256((text + json.dumps(files, sort_keys=True) + json.dumps(shaped, sort_keys=True, default=str)
+                             + (skill_defs if prof.d["skills"] else "")).encode()).hexdigest()
     return str(kit_dir), digest
 
 
@@ -1230,14 +1470,19 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
             die(f"workspace {r} does not exist", EXIT_USAGE)
     if prof.tool_names and prof.d["mode"] == "clone":
         die("host tools need mode = \"direct\": in clone mode the code lives only inside the VM", EXIT_USAGE)
+    prof.require_skills()               # re-checked before every mount: the folder may have changed
     token = get_token(prof)
     kit_dir, digest = render_local_kit(prof, token)
     digest_file = prof.state / "kit.digest"
 
     if sandbox_exists(prof, retry=retry):
         if digest_file.exists() and digest_file.read_text() != digest:
-            info("profile/config changed since this sandbox was created; kits apply at creation only."
-                 f" Run `agentbox fresh {prof.name}` to rebuild.")
+            msg = ("profile/config changed since this sandbox was created; kits apply at creation only."
+                   f" Run `agentbox fresh {prof.name}` to rebuild.")
+            if sorted(map(str, prof.skill_mounts())) != sorted(recorded_skill_mounts(prof)):
+                msg += (" The skill set paths changed: a new mount only exists after a fresh"
+                        " (links to skills that are already mounted apply on the next `up`).")
+            info(msg)
         start_bridge(prof)
     else:
         kits = [str(p) for p in prof.kit_paths()] + [kit_dir]
@@ -1252,6 +1497,8 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
         create.append(str(prof.primary))
         for p, ro in prof.extras:
             create.append(f"{p}:ro" if ro else str(p))
+        for p in prof.skill_mounts():
+            create.append(f"{p}:ro")                    # never writable
         write_snapshot(prof)
         start_bridge(prof)
         info(f"creating sandbox {prof.sandbox}")
@@ -1260,14 +1507,146 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
         else:
             sbx(cfg, *create)
         digest_file.write_text(digest)
+        (prof.state / "skills.mounts").write_text(json.dumps(list(map(str, prof.skill_mounts()))))
         set_secrets(prof)
         for p in prof.d["publish"]:
             sbx(cfg, "ports", prof.sandbox, "--publish", p, check=False)
 
 
+def recorded_skill_mounts(prof: Profile) -> list[str]:
+    try:
+        v = json.loads((prof.state / "skills.mounts").read_text())
+    except (OSError, ValueError):
+        return []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def skills_link_script(links: list[tuple[str, str]]) -> str:
+    """ONE idempotent sh script, run in the VM: make ~/.claude/skills/<skill> a symlink to the mounted
+    folder. It only replaces or removes symlinks listed in ~/.claude/skills/.agentbox-links (the names of
+    links agentbox made; that file is agent-writable, so a name is used only if it is a plain skill name
+    AND the entry is a symlink). Real folders and other symlinks (skills the agent wrote) are left alone.
+    Prints LINK / OK / UNLINK / SKIP <name> [reason] lines."""
+    want = " ".join(sk for sk, _ in links)
+    calls = "\n".join(f"link {shlex.quote(sk)} {shlex.quote(t)}" for sk, t in links)
+    return f'''set -f
+d="{SKILLS_VM_DIR}"; m="$d/.agentbox-links"; want=" {want} "; new=; old=
+if [ -f "$m" ]; then old=$(cat "$m" 2>/dev/null); fi
+mkdir -p "$d" || exit 1
+isours() {{ case " $(echo $old) " in *" $1 "*) return 0;; esac; return 1; }}
+for n in $old; do
+  case $n in ""|[!a-z0-9]*|*[!a-z0-9-]*) continue;; esac
+  case $want in *" $n "*) continue;; esac
+  if [ -L "$d/$n" ]; then rm -f "$d/$n" && echo "UNLINK $n"; fi
+done
+link() {{
+  n=$1; t=$2
+  if [ ! -f "$t/SKILL.md" ]; then
+    echo "SKIP $n not-mounted"; if isours "$n" && [ -L "$d/$n" ]; then new="$new $n"; fi; return
+  fi
+  if [ -L "$d/$n" ]; then
+    if ! isours "$n"; then echo "SKIP $n foreign-link"; return; fi
+    if [ "$(readlink "$d/$n")" = "$t" ]; then echo "OK $n"; else ln -sfn "$t" "$d/$n" && echo "LINK $n"; fi
+  elif [ -e "$d/$n" ]; then echo "SKIP $n exists"; return
+  else ln -s "$t" "$d/$n" && echo "LINK $n"
+  fi
+  new="$new $n"
+}}
+{calls}
+if [ -n "$new" ]; then
+  tmp="$m.tmp.$$"; {{ for n in $new; do echo "$n"; done; }} > "$tmp" && mv "$tmp" "$m"
+else rm -f "$m"; fi
+true'''
+
+
+def skills_check_script(links: list[tuple[str, str]]) -> str:
+    """sh run in the VM by doctor: SKILLOK / SKILLBAD <name> <reason> for every configured skill."""
+    body = "\n".join(
+        f't={shlex.quote(t)}; n={shlex.quote(sk)}; '
+        'if [ ! -f "$t/SKILL.md" ]; then echo "SKILLBAD $n not-mounted"; '
+        f'elif [ ! -L "{SKILLS_VM_DIR}/$n" ]; then echo "SKILLBAD $n not-linked"; '
+        f'elif [ "$(readlink "{SKILLS_VM_DIR}/$n")" != "$t" ]; then echo "SKILLBAD $n points-elsewhere"; '
+        'else echo "SKILLOK $n"; fi' for sk, t in links)
+    return body + "\ntrue"
+
+
+def parse_skill_lines(out: str, words: tuple[str, ...]) -> list[tuple[str, str, str]]:
+    """[(word, skill, reason)] for lines like `LINK name` / `SKIP name reason`; anything else is dropped."""
+    found = []
+    for line in out.splitlines():
+        m = re.fullmatch(r"(%s) ([a-z0-9][a-z0-9-]*)(?: ([a-z-]+))?" % "|".join(words), line.strip())
+        if m:
+            found.append((m.group(1), m.group(2), m.group(3) or ""))
+    return found
+
+
+SKILL_SKIP_WHY = {"not-mounted": "its folder is not mounted in this sandbox - a new skill set needs `agentbox fresh`",
+                  "foreign-link": "~/.claude/skills already has a symlink of that name that agentbox did not make",
+                  "exists": "~/.claude/skills already has a folder of that name (a skill written in the sandbox)"}
+
+
+def link_skills(prof: Profile, quiet: bool = False) -> bool:
+    """Link the profile's skills in a sandbox that is RUNNING (callers check). True on success."""
+    links = prof.skill_links()
+    r = vm_exec(prof, skills_link_script(links))
+
+    def say(msg):
+        if quiet:                           # the agent's UI owns the terminal
+            with open(prof.state / "skills.out", "a") as f:
+                f.write(safe_text(msg) + "\n")
+        else:
+            info(msg)
+    if r.returncode != 0:
+        say(f"could not link skills in {prof.sandbox} (exit {r.returncode}) {(r.stderr or '').strip()[:200]}")
+        return False
+    for _, sk, why in parse_skill_lines(r.stdout or "", ("SKIP",)):
+        say(f"skill '{sk}' not linked: {SKILL_SKIP_WHY.get(why, why)}")
+    prof.state.mkdir(parents=True, exist_ok=True)
+    if links:
+        (prof.state / "skills.json").write_text(json.dumps([sk for sk, _ in links]))
+    else:
+        (prof.state / "skills.json").unlink(missing_ok=True)
+    return True
+
+
+def link_skills_when_running(prof: Profile, timeout: float = 180.0, interval: float = 2.0):
+    """Background half of sync_skills: wait for a VM that something else (`sbx run`, `sbx exec`) is
+    booting, then link once. Never boots it itself."""
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            vm = sandbox_state(prof)
+            if vm == "running":
+                link_skills(prof, quiet=True)
+                return
+            if vm == "missing":
+                return
+            time.sleep(interval)
+    except SystemExit:
+        pass
+
+
+def sync_skills(prof: Profile, background: bool = True):
+    """Link the profile's skills (and drop links agentbox made for sets no longer configured) if the
+    sandbox is running. A stopped sandbox is never booted for this: with background=True a thread
+    links once something else has started it. Profiles that never used skills cost nothing."""
+    if not prof.d["skills"] and not (prof.state / "skills.json").exists():
+        return
+    if prof.d["skills"]:
+        prof.require_skills()
+    if sandbox_state(prof) == "running":
+        link_skills(prof)
+    elif background:
+        info("sandbox is not running; skills are linked as soon as it is")
+        threading.Thread(target=link_skills_when_running, args=(prof,), daemon=True).start()
+    else:
+        info(f"sandbox {prof.sandbox} is not running; skills not linked (`agentbox up {prof.name}` links them)")
+
+
 def cmd_up(prof: Profile, args) -> int:
     cfg = prof.cfg
     ensure_sandbox(prof)
+    sync_skills(prof)
     run = ["run", "--name", prof.sandbox]
     agent_args = list(args.agent_args or prof.d["agent_args"])
     if agent_args:
@@ -1332,6 +1711,7 @@ def cmd_code(prof: Profile, args) -> int:
             f"Is the sandbox running? Try `agentbox up {prof.name}` (or `sbx ls`), then re-run."
             " For host-key errors: delete the 'docker sandboxes (managed)' block in ~/.ssh/config and run `sbx setup ssh`.")
 
+    sync_skills(prof, background=False)             # the ssh check above started the VM
     info(f"opening {folder} in VS Code on {host}")
     subprocess.run([code, "--remote", f"ssh-remote+{host}", str(folder)], env=sbx_env(cfg), check=False)
     print(f"Terminals, tasks, debuggers and extensions in that window run inside {prof.sandbox}.\n"
@@ -1758,6 +2138,7 @@ def cmd_run(prof: Profile, args) -> int:
     job_id = new_job_id()
     vm_write(prof, job_id, "prompt.md", prompt)
     vm_write(prof, job_id, "wrap.sh", (SHARE_DIR / "jobwrap").read_text())
+    sync_skills(prof, background=False)             # the exec above started the VM, if it was stopped
     cmd = [*spec["cmd"], *(args.agent_args or [])]
     d = JOB_DIR.format(id=job_id)
     r = vm_exec(prof, (f'd={d}; S=; command -v setsid >/dev/null 2>&1 && S=setsid; '
@@ -1795,6 +2176,7 @@ def cmd_resume(prof: Profile, args) -> int:
     if not j["session_id"]:
         die(f"no session id recorded for job {job_id} (did the agent start?)")
     ensure_sandbox(prof)
+    sync_skills(prof)
     sid = j["session_id"]
     if not SESSION_ID_RE.match(sid):          # belt and braces: the id comes from an agent-writable file
         die(f"refusing to resume: malformed session id for job {job_id}")
@@ -1824,7 +2206,18 @@ def profile_status(prof: Profile, states=_FETCH) -> dict:
             "sandbox_exists": sandbox_exists(prof) if states is None else prof.sandbox in states,
             "host_tools": prof.tool_names,
             "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
-            "bridge": {"running": pid is not None, "pid": pid}}
+            "bridge": {"running": pid is not None, "pid": pid},
+            "skills": skills_status(prof)}
+
+
+def skills_status(prof: Profile) -> list[dict]:
+    rows = []
+    for ss in prof.skillsets:
+        row = {"set": ss.name, "path": str(ss.path) if ss.path else None, "skills": list(ss.skills), "commit": ss.commit}
+        if ss.problems:
+            row["problems"] = list(ss.problems)
+        rows.append(row)
+    return rows
 
 
 def cmd_status(cfg: Config, as_json: bool = False) -> int:
@@ -1998,6 +2391,16 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
                              details=findings)
                 rep.note("info", f"{r}: hooks in .git/hooks run on the host when you commit; a global"
                          " core.hooksPath helps, but a repo-level core.hooksPath overrides it - `agentbox audit` flags that")
+        for ss in prof.skillsets:
+            where = f"{ss.path} - {len(ss.skills)} skill(s), " + (f"commit {ss.commit}" if ss.commit else "not a git repo")
+            rep.note("info", f"skill set {ss.name}: {where}", data={"set": ss.name, "skills": ss.skills})
+            for problem in ss.problems:
+                chk(False, f"skill set {ss.name}: {problem}", "fix the folder or [skillsets.%s] in agentbox.toml" % ss.name)
+        for problem in prof.skill_problems():
+            if problem.startswith("skill '"):
+                chk(False, problem, "rename or remove one of them in the skill sets")
+        if prof.skillsets and not prof.skill_problems():
+            chk(True, "skill sets pass the safety rules: " + ", ".join(ss.name for ss in prof.skillsets))
         for k in prof.kit_paths():
             rv = sbx(cfg, "kit", "validate", "--offline", k, check=False, capture=True)
             if rv.returncode != 0:
@@ -2046,6 +2449,14 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
                          "ssh-add -l 2>&1; exit $?", check=False, capture=True)
                 chk(classify_ssh_add(ra.returncode, ra.stdout or "") == "none", "no SSH agent forwarded",
                     "restart the sbx daemon from a shell without SSH_AUTH_SOCK: `env -u SSH_AUTH_SOCK sbx daemon stop; env -u SSH_AUTH_SOCK sbx daemon start`")
+            if prof.d["skills"] and not prof.skill_problems():
+                rs = sbx(cfg, "exec", prof.sandbox, "sh", "-c", skills_check_script(prof.skill_links()),
+                         check=False, capture=True)
+                for word, sk, why in parse_skill_lines(rs.stdout or "", ("SKILLOK", "SKILLBAD")):
+                    hint = ("the folder is not mounted: a new skill set needs `agentbox fresh %s`" if why == "not-mounted"
+                            else "`agentbox up %s` links it (a folder of that name in ~/.claude/skills blocks the link)") % n
+                    chk(word == "SKILLOK", f"skill {sk} is linked to the mounted set" if word == "SKILLOK"
+                        else f"skill {sk} is not linked ({why})", hint)
             if prof.tool_names:
                 chk('"ok": true' in out or "pong" in out, "hosttool reaches the bridge",
                     f"is the bridge up? `agentbox up {n}`; check `sbx policy log` for localhost:{prof.port}")
@@ -2099,6 +2510,8 @@ def main():
     prof = cfg.profile(a.profile)
     if a.cmd in ("up", "code", "fresh", "run", "resume") and not prof.enabled:
         die(f"profile '{a.profile}' is disabled (enabled = false in agentbox.toml); enable it to use `{a.cmd}`", EXIT_USAGE)
+    if a.cmd in ("up", "fresh", "code", "run", "resume", "shell") and prof.d["skills"]:
+        prof.require_skills()               # before `fresh` tears anything down
     if a.cmd == "up":
         sys.exit(cmd_up(prof, a))
     if a.cmd == "fresh":
@@ -2125,6 +2538,7 @@ def main():
         if not sandbox_exists(prof):
             die(f"sandbox {prof.sandbox} not found - run `agentbox up {prof.name}` first", EXIT_NO_SANDBOX)
         start_bridge(prof)
+        sync_skills(prof)
         sys.exit(sbx(cfg, "exec", "-it", prof.sandbox, "bash", check=False).returncode)
     if a.cmd == "stop":
         stop_bridge(prof)
