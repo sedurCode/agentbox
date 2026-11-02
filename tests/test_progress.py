@@ -572,7 +572,9 @@ class StatusShapeTests(ProgressCase):
         self.assertEqual((p["plan"]["current"], p["plan"]["done"], p["plan"]["total"], p["note"]), (2, 1, 3, "hi"))
         self.assertEqual((p["turns"], p["tool_calls"], p["expect_commits"], p["stalled"]), (1, 1, 2, False))
         self.assertIsInstance(p["elapsed_s"], int)
-        self.assertEqual(p, self.view())                                      # progress --json is the same object
+        v = self.view()                                                       # progress --json is the same object
+        self.assertAlmostEqual(p["elapsed_s"], v["elapsed_s"], delta=1)       # the clock may tick between the two calls
+        self.assertEqual({**p, "elapsed_s": 0}, {**v, "elapsed_s": 0})
 
     def test_no_job_is_null(self):
         rows = self.status_job()

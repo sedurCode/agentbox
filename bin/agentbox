@@ -35,7 +35,7 @@ from __future__ import annotations
 import sys
 
 if sys.version_info < (3, 11):          # before anything that needs 3.11 (tomllib)
-    sys.exit("agentbox needs Python 3.11+ (brew install python)")
+    sys.exit("agentbox needs Python 3.11+ (macOS: brew install python; Linux: your package manager)")
 
 import argparse
 import calendar
@@ -44,6 +44,7 @@ import datetime
 import fnmatch
 import hashlib
 import hmac
+import html
 import http.server
 import json
 import os
@@ -115,7 +116,7 @@ DEFAULT_PROFILE = {
     "agent_args": [],
     "instructions": "",
     "vscode": False,            # allow the hosts VS Code's remote server + extensions need
-    "confirm_host_tools": False,  # ask on the host (macOS dialog) before every host-tool call
+    "confirm_host_tools": False,  # ask on the host (dialog) before every host-tool call
     "stall_after": 300,         # `progress`/`status`: a running job with no event for this many seconds is STALLED
     "keepalive": True,          # headless jobs: hold an `sbx exec` session open while a job runs (sbx stops idle sandboxes)
 }
@@ -128,9 +129,16 @@ VSCODE_HOSTS = [
     "*.gallery.vsassets.io", "*.gallerycdn.vsassets.io", "*.vscode-unpkg.net",
 ]
 VSCODE_APP_CLIS = [
+    "/usr/bin/code", "/snap/bin/code", "/usr/share/code/bin/code", "/var/lib/flatpak/exports/bin/com.visualstudio.code",
     "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
     "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
 ]
+# PATH for host tools: fixed, never the caller's. System directories come first so a user-writable
+# directory (~/.local/bin: pip --user, pipx, cargo...) can never shadow git, make or python3; it is last.
+# Directories that don't exist are skipped.
+HOST_TOOL_PATH = ":".join(d for d in (
+    "/opt/homebrew/bin", "/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+    "/usr/sbin", "/sbin", "/snap/bin", str(HOME / ".local" / "bin")) if os.path.isdir(d))
 MERGED_LISTS = ("allow", "deny", "kits", "skills")   # defaults + profile are unioned
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -686,7 +694,7 @@ def sbx(cfg: Config, *args, check=True, capture=False, stdin=None):
         return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True, errors="replace",
                               capture_output=capture, input=stdin)
     except FileNotFoundError:
-        die(f"'{cfg.settings['sbx']}' not found - brew trust docker/tap && brew install docker/tap/sbx")
+        die(f"'{cfg.settings['sbx']}' not found - install Docker Sandboxes (macOS: brew trust docker/tap && brew install docker/tap/sbx; Linux: docs.docker.com/sandboxes)")
     except subprocess.CalledProcessError as e:
         die(f"`{redact(cmd)}` failed (exit {e.returncode})"
             + (f"\n{e.stderr}" if e.stderr else ""))
@@ -1364,30 +1372,44 @@ class Bridge:
         return bool(t.get("confirm", self.prof.d.get("confirm_host_tools", False)))
 
     def confirm(self, tname: str, argv: list[str], timeout: int) -> bool:
-        """Ask the human on the host. macOS dialog; anything else -> deny."""
-        if sys.platform != "darwin" or not shutil.which("osascript"):
-            self.log({"tool": tname, "confirm": "denied", "reason": "no dialog available (non-macOS)"})
+        """Ask the human on the host: osascript on macOS, zenity or kdialog on Linux; else deny."""
+        where = "this Mac" if sys.platform == "darwin" else "this machine"
+        msg = f"Sandbox {self.prof.sandbox} wants to run on {where}:\n\n" + shlex.join(argv)[:900]
+        title = "agentbox host tool"
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            # argv is passed as an AppleScript run argument, never spliced into the script.
+            script = ["-e", "on run argv",
+                      "-e", "display dialog (item 1 of argv) with title \"" + title + "\" "
+                            "buttons {\"Deny\", \"Allow\"} default button \"Deny\" cancel button \"Deny\" "
+                            "with icon caution giving up after " + str(int(timeout)),
+                      "-e", "return button returned of result",
+                      "-e", "end run"]
+            cmd, ok_out = ["osascript", *script, msg], "Allow"
+        elif sys.platform.startswith("linux") and shutil.which("zenity") and (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            # exit 0 = Allow; Deny, close or timeout = non-zero. The text is an argument, never markup-parsed.
+            cmd, ok_out = ["zenity", "--question", "--no-markup", "--title", title, "--ok-label", "Allow",
+                           "--cancel-label", "Deny", "--default-cancel", "--timeout", str(int(timeout)),
+                           "--text", msg], ""
+        elif sys.platform.startswith("linux") and shutil.which("kdialog") and (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            # kdialog renders rich text: escape it so agent-supplied argv can't restyle or hide the command
+            cmd, ok_out = ["kdialog", "--title", title, "--yesno", html.escape(msg).replace("\n", "<br>"), "--yes-label", "Allow",
+                           "--no-label", "Deny"], ""
+        else:
+            self.log({"tool": tname, "confirm": "denied", "reason": "no dialog available"
+                      " (needs osascript on macOS, or zenity/kdialog and a display on Linux)"})
             return False
-        msg = (f"Sandbox {self.prof.sandbox} wants to run on this Mac:\n\n"
-               + shlex.join(argv)[:900])
-        # argv is passed as an AppleScript run argument, never spliced into the script.
-        script = ["-e", "on run argv",
-                  "-e", "display dialog (item 1 of argv) with title \"agentbox host tool\" "
-                        "buttons {\"Deny\", \"Allow\"} default button \"Deny\" cancel button \"Deny\" "
-                        "with icon caution giving up after " + str(int(timeout)),
-                  "-e", "return button returned of result",
-                  "-e", "end run"]
         try:
-            r = subprocess.run(["osascript", *script, msg], capture_output=True, text=True,
-                               timeout=timeout + 10)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return r.returncode == 0 and r.stdout.strip() == "Allow"
+        return r.returncode == 0 and r.stdout.strip() == ok_out
 
     def run(self, tname, params, extra, cwd):
         t, argv, run_cwd = self.build(tname, params, extra, cwd)
         self.check_rate(tname, t)
-        env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        env = {"PATH": HOST_TOOL_PATH,
                "HOME": str(HOME), "LANG": os.environ.get("LANG", "en_US.UTF-8")}
         env.update({k: _expand_literal(str(v)) for k, v in t.get("env", {}).items()})
         lock = self.locks.setdefault(t.get("lock", tname), threading.Lock())
@@ -1819,8 +1841,8 @@ def find_vscode(cfg: Config) -> str:
     for p in VSCODE_APP_CLIS:
         if Path(p).is_file():
             return p
-    die(f"VS Code CLI '{c}' not found. In VS Code run 'Shell Command: Install code command in PATH',"
-        " or set `vscode = \"/path/to/code\"` in [settings]")
+    die(f"VS Code CLI '{c}' not found. On macOS run 'Shell Command: Install code command in PATH' in VS Code;"
+        " on Linux install the code package (apt, snap, flatpak) so `code` is on PATH. Or set `vscode = \"/path/to/code\"` in [settings]")
 
 
 def ssh_config_has_sbx() -> bool:

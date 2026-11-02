@@ -17,5 +17,5 @@ for py in python3.14 python3.13 python3.12 python3.11 python3; do
     exec "$py" "$here/agentbox.py" "$@"
   fi
 done
-echo "agentbox needs Python 3.11+ (brew install python)" >&2
+echo "agentbox needs Python 3.11+ (macOS: brew install python; Linux: your package manager)" >&2
 exit 1

@@ -3,10 +3,22 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import unittest
 from unittest import mock
 
 from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh
+
+REAL_SLEEP, REAL_MONOTONIC = time.sleep, time.monotonic
+
+
+def from_agentbox() -> bool:
+    """True when the caller of the patched time function is agentbox itself. `ab.time` is the real `time`
+    module, so the fakes are process-wide: without this check the stdlib's own polling (subprocess waiting
+    for a slow real git) hit the fake sleep, which counted it as a poll or raised the test's KeyboardInterrupt."""
+    return sys._getframe(2).f_globals.get("__name__") == ab.__name__
+
 
 GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
            "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
@@ -47,7 +59,7 @@ class FetchCase(AgentboxTestCase):
         self.interrupt = False
         for target, name, fn in ((subprocess, "run", self.fake_run), (subprocess, "Popen", self.fake_popen),
                                  (ab, "sandbox_state", lambda prof, states=None: self.vm_state),
-                                 (ab.time, "sleep", self.fake_sleep), (ab.time, "monotonic", lambda: self.clock)):
+                                 (ab.time, "sleep", self.fake_sleep), (ab.time, "monotonic", self.fake_monotonic)):
             p = mock.patch.object(target, name, fn)
             p.start()
             self.addCleanup(p.stop)
@@ -80,7 +92,12 @@ class FetchCase(AgentboxTestCase):
         self.children.append(child)
         return child
 
+    def fake_monotonic(self):
+        return self.clock if from_agentbox() else REAL_MONOTONIC()
+
     def fake_sleep(self, s):
+        if not from_agentbox():
+            return REAL_SLEEP(s)
         self.sleeps += 1
         self.clock += s
         if self.interrupt:
@@ -171,6 +188,15 @@ class KeepAwakeTests(FetchCase):
         with mock.patch.object(subprocess, "Popen", self.fake_popen):
             self.assertEqual(self.fetch()[0], 0)
         self.assertTrue(self.children[0].killed)
+
+    def test_stdlib_sleep_is_not_counted_or_interrupted(self):
+        # A real process that outlives subprocess's first poll makes the stdlib call time.sleep itself;
+        # that must reach the real sleep, not the fake (it used to add a poll or raise the interrupt).
+        self.interrupt = True
+        with real_sh():
+            REAL_RUN(["sleep", "0.2"], timeout=10)
+        self.assertEqual(self.sleeps, 0)
+        self.assertEqual(self.clock, 0.0)
 
     def test_remote_appears_after_n_polls(self):
         self.appear_after = 3

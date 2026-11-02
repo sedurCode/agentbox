@@ -13,14 +13,14 @@ CFG="${AGENTBOX_CONFIG_DIR:-$HOME/.config/agentbox}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 - $2" >&2; exit 1; }; }
 
-need sbx "brew trust docker/tap && brew install docker/tap/sbx"
+need sbx "on macOS: brew trust docker/tap && brew install docker/tap/sbx; on Linux see docs.docker.com/sandboxes"
 PY=""
 for c in python3.14 python3.13 python3.12 python3.11 python3; do
   if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3,11))'; then
     PY="$(command -v "$c")"; break
   fi
 done
-[ -n "$PY" ] || { echo "need Python 3.11+ (brew install python)" >&2; exit 1; }
+[ -n "$PY" ] || { echo "need Python 3.11+ (macOS: brew install python; Linux: your package manager)" >&2; exit 1; }
 echo "found $PY"
 
 mkdir -p "$DEST/bin" "$DEST/share" "$BIN" "$CFG/kits" "$CFG/gdb"

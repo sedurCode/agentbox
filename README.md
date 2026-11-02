@@ -2,7 +2,7 @@
 
 agentbox runs coding agents in constrained Docker Sandboxes, with profiles, scoped credentials and a bridge to allow-listed host tools.
 
-- **Requirements:** macOS, Docker Sandboxes (`sbx`), and Python 3.11+ (standard library only).
+- **Requirements:** macOS or Linux, Docker Sandboxes (`sbx`), and Python 3.11+ (standard library only).
 - **Status:** early. The `sbx` kit schema is experimental and may change, and so may agentbox's own commands.
 
 `sbx` already does the heavy lifting: each sandbox is a **microVM** with its own kernel,
@@ -32,7 +32,7 @@ the VM. agentbox adds the parts you asked for on top:
 - **Junie** kit (not built into sbx) and an **Arm embedded toolchain** kit.
 
 ```
- host (macOS)                                   microVM  ab-h750
+ host (macOS/Linux)                                 microVM  ab-h750
  ───────────────                                ─────────────────────────────
  ~/.config/agentbox/agentbox.toml  (agent can't see)
  sbx daemon ── proxy ── allow-list + key injection ◄── all HTTP(S) egress
@@ -59,6 +59,10 @@ agentbox down myproj                                  # when finished; asks for 
 ```
 
 ## 1. Install
+
+On Linux install Docker Sandboxes from docs.docker.com/sandboxes and Python 3.11+ with your package manager; the
+`brew` lines below are the macOS route. Host tools run with a fixed `PATH` (Homebrew, `/usr/local/bin`,
+`/usr/bin`, `/snap/bin`, then `~/.local/bin` last so it can't shadow system tools; missing directories skipped). Use an absolute path for anything else.
 
 ```bash
 brew trust docker/tap && brew install docker/tap/sbx
@@ -623,7 +627,13 @@ secrets = [
 ```
 
 - **Claude Code** — run `/login` inside the first sandbox. sbx keeps the OAuth token on the
-  host and the VM only sees a sentinel; later sandboxes reuse it. Or use `service = "anthropic"`.
+  host and the VM only sees a sentinel. **The login is global to the host**: every sandbox uses it,
+  and a `/login` in any sandbox replaces it for all of them, so you get one subscription at a time
+  (to change account, `/login` again). Per-sandbox subscriptions don't work as of sbx v0.50.1:
+  a `CLAUDE_CODE_OAUTH_TOKEN` custom secret loses to the global login (or isn't used), and
+  `sbx secret set anthropic --sandbox …` sends an OAuth token as an `x-api-key`, which is rejected
+  (docker/sbx-releases#11). A separate account per profile needs an API key
+  (`service = "anthropic"` with a `ref`), billed per use.
 - **Copilot CLI** — `service = "github"`. The proxy injects it for github.com and the Copilot
   API hosts, so **use a fine-grained PAT with only the Copilot Requests permission and no
   repository access**. Don't feed it `gh auth token`; that token can push to everything you can.
@@ -694,7 +704,8 @@ a path the agent passes is the same file on the host. The bridge:
   tools load config from `./` (OpenOCD's `openocd.cfg`, gdb's `.gdbinit`). Opt in per tool
   with `cwd = "{workspace}"` only if it's safe;
 - can ask you first: `confirm = true` on a tool (or `confirm_host_tools = true` on a profile)
-  pops a macOS dialog showing the exact command; Deny or no answer within
+  pops a dialog on the host showing the exact command (`osascript` on macOS; `zenity` or `kdialog` plus a
+  display on Linux, otherwise every confirmed call is denied; `kdialog` has no timeout); Deny or no answer within
   `confirm_timeout` (120 s) refuses the call. The example config confirms `flash-elf`.
   Without approval, the running agent can call any tool its profile lists, so keep the list
   short;
