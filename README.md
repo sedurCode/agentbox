@@ -506,6 +506,21 @@ first) the last cached totals are shown.
 `finished_at`, `last_event_age_s` is `null` unless the job is running, and `stale` is true when the values
 come from the host's cache because the sandbox could not be read.
 
+### Dashboard
+
+```bash
+agentbox dashboard                  # one snapshot
+agentbox dashboard --watch          # redraw every 5 s until Ctrl-C (--interval S, at least 2)
+agentbox dashboard --json
+```
+
+One card per running sandbox: VM uptime, load, CPU, memory and disk bars, and for its job the elapsed time,
+idle time (since the agent's last event), turns, tool calls, tokens and cost (an estimate unless the agent
+reported one). Stopped and disabled profiles are listed on one line and are never booted. A running sandbox
+costs one extra `sbx exec` (CPU is sampled over half a second inside the VM) on top of what `status` does.
+The VM's output is parsed as numbers and drawn by agentbox, never printed raw. Colour is used only on a
+terminal and not if `NO_COLOR` is set.
+
 ### VS Code inside the sandbox
 
 ```bash
@@ -539,7 +554,7 @@ starting the agent), starts the host-tool bridge, checks SSH, then runs
 
 ### Scripting agentbox
 
-`status`, `doctor`, `tools`, `progress` and `fetch` take `--json`: stdout is then exactly one JSON document, the human
+`status`, `dashboard`, `doctor`, `tools`, `progress` and `fetch` take `--json`: stdout is then exactly one JSON document, the human
 text is unchanged without the flag, and diagnostics still go to stderr. No secret values appear
 in any of them (`doctor` reports token-like variables by name, class and length only).
 

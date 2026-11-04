@@ -15,6 +15,7 @@ Docker Sandboxes (`sbx`).
     agentbox fresh <profile>     down + up (use after editing the profile)
     agentbox provision <name>    guided setup of a new profile (--yes, --dry-run, --up)
     agentbox status              sandboxes and bridges (--json)
+    agentbox dashboard           running sandboxes at a glance: uptime, idle, tokens, cpu (--watch, --json)
     agentbox doctor [<profile>]  sanity / security checks (--json)
     agentbox bridge <profile>    run the host-tool bridge in the foreground
     agentbox run <profile> (--prompt-file F | --prompt T) [--detach]   headless agent job
@@ -3048,6 +3049,213 @@ def cmd_status(cfg: Config, as_json: bool = False) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- dashboard
+# One screen for every running sandbox: VM uptime, CPU, memory, disk, and the job's activity and
+# tokens. A running sandbox costs one `sbx exec` (the resource probe below) plus whatever `status`
+# already needs for its job; stopped sandboxes are listed, never booted. Everything the VM prints is
+# parsed as numbers here and drawn by us, so nothing from the VM reaches the terminal as text.
+VM_STATS_SCRIPT = r"""
+echo "stat1 $(head -n1 /proc/stat)"; sleep 0.5; echo "stat2 $(head -n1 /proc/stat)"
+echo "uptime $(cut -d' ' -f1 /proc/uptime)"
+echo "load $(cut -d' ' -f1-3 /proc/loadavg)"
+echo "cpus $(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)"
+grep -E '^(MemTotal|MemAvailable):' /proc/meminfo | tr -s ' ' | sed 's/^/mem /'
+echo "disk $(df -Pk / | tail -n1)"
+"""
+
+
+def _cpu_times(fields: list[str]) -> tuple[int, int] | None:
+    """(busy, total) jiffies from the fields after "cpu" in /proc/stat."""
+    try:
+        v = [int(x) for x in fields]
+    except ValueError:
+        return None
+    if len(v) < 5:
+        return None
+    idle = v[3] + v[4]                  # idle + iowait
+    return sum(v[:8]) - idle, sum(v[:8])
+
+
+def parse_vm_stats(out: str) -> dict | None:
+    """The numbers from VM_STATS_SCRIPT, or None if the output is not what we expect."""
+    rows: dict[str, list[list[str]]] = {}
+    for line in out.splitlines():
+        key, *rest = line.split()
+        rows.setdefault(key, []).append(rest)
+    try:
+        t1, t2 = _cpu_times(rows["stat1"][0][1:]), _cpu_times(rows["stat2"][0][1:])
+        mem = {r[0].rstrip(":"): int(r[1]) * 1024 for r in rows["mem"]}
+        disk = rows["disk"][0]
+        total, used = int(disk[1]) * 1024, int(disk[2]) * 1024
+        res = {"uptime_s": int(float(rows["uptime"][0][0])), "cpus": int(rows["cpus"][0][0]),
+               "load": [float(x) for x in rows["load"][0][:3]],
+               "mem_total": mem["MemTotal"], "mem_used": mem["MemTotal"] - mem["MemAvailable"],
+               "disk_total": total, "disk_used": used}
+    except (KeyError, IndexError, ValueError):
+        return None
+    if t1 is None or t2 is None or len(res["load"]) != 3:
+        return None
+    dt = t2[1] - t1[1]
+    res["cpu_pct"] = round(100.0 * (t2[0] - t1[0]) / dt, 1) if dt > 0 else None
+    return res
+
+
+def dashboard_entry(cfg: Config, name: str, states) -> dict:
+    """One profile's row. Never raises: a broken profile or an unreadable VM is a row with less in it."""
+    try:
+        prof = cfg.profile(name)
+        if not prof.enabled:
+            return {"name": name, "enabled": False, "vm": "disabled"}
+        vm = sandbox_state(prof, states)
+        row = {"name": name, "enabled": True, "sandbox": prof.sandbox, "agent": prof.d["agent"],
+               "mode": prof.d["mode"], "vm": vm, "job": None, "resources": None}
+        if vm != "running":
+            return row
+        r = vm_exec(prof, VM_STATS_SCRIPT)
+        row["resources"] = parse_vm_stats(r.stdout or "") if r.returncode == 0 else None
+        j = job_info(prof, states=states)
+        row["job"] = public_job(j) | {"progress": status_progress(prof, j, states)}
+        return row
+    except SystemExit:
+        return {"name": name, "enabled": True, "vm": "unknown", "error": True}
+
+
+def collect_dashboard(cfg: Config) -> dict:
+    from concurrent.futures import ThreadPoolExecutor
+    states = sandbox_states(cfg)
+    names = cfg.profile_names()
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(names)))) as pool:
+        rows = list(pool.map(lambda n: dashboard_entry(cfg, n, states), names))
+    return {"generated_at": int(time.time()), "sandboxes_known": states is not None, "profiles": rows}
+
+
+def fmt_bytes(n) -> str:
+    n = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit in ("B", "K") or n >= 100 else f"{n:.1f}{unit}"
+        n /= 1024
+    return "?"
+
+
+def fmt_count(n) -> str:
+    n = int(n)
+    for div, unit in ((10**9, "G"), (10**6, "M"), (10**3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return str(n)
+
+
+class Style:
+    """ANSI colour only on a terminal, and not if NO_COLOR is set."""
+    CODES = {"dim": "2", "bold": "1", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __call__(self, kind: str, text: str) -> str:
+        return f"\x1b[{self.CODES[kind]}m{text}\x1b[0m" if self.on else text
+
+
+def bar(pct, st: Style, width: int = 20) -> str:
+    if pct is None:
+        return st("dim", "░" * width) + "    ?"
+    pct = max(0.0, min(100.0, float(pct)))
+    n = round(pct * width / 100)
+    colour = "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
+    return st(colour, "█" * n) + st("dim", "░" * (width - n)) + f" {pct:3.0f}%"
+
+
+def strip_ansi_len(s: str) -> int:
+    return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+
+
+def box(title: str, lines: list[str], width: int, st: Style) -> list[str]:
+    inner = width - 4
+    top = f"╭─ {title} " + "─" * max(0, width - 5 - strip_ansi_len(title)) + "╮"
+    out = [top]
+    for ln in lines:
+        out.append("│ " + ln + " " * max(0, inner - strip_ansi_len(ln)) + " │")
+    out.append("╰" + "─" * (width - 2) + "╯")
+    return out
+
+
+def dashboard_card(row: dict, st: Style, width: int) -> list[str]:
+    res, job = row["resources"], row["job"]
+    name = safe_text(row["name"])
+    title = st("bold", name) + st("dim", f"  {safe_text(row['agent'])} · {safe_text(row['mode'])}")
+    lines = []
+    if res is None:
+        lines.append(st("yellow", "running, but the VM could not be read"))
+    else:
+        mem_pct = 100 * res["mem_used"] / res["mem_total"] if res["mem_total"] else None
+        disk_pct = 100 * res["disk_used"] / res["disk_total"] if res["disk_total"] else None
+        lines += [f"uptime {fmt_dur(res['uptime_s'])}   load {res['load'][0]:.2f} {res['load'][1]:.2f} {res['load'][2]:.2f}"
+                  f"   {res['cpus']} cpu",
+                  f"cpu    {bar(res['cpu_pct'], st)}",
+                  f"memory {bar(mem_pct, st)}  {fmt_bytes(res['mem_used'])}/{fmt_bytes(res['mem_total'])}",
+                  f"disk   {bar(disk_pct, st)}  {fmt_bytes(res['disk_used'])}/{fmt_bytes(res['disk_total'])}"]
+    if job and job["state"] != "none":
+        view = job.get("progress")
+        state = {"running": st("green", "running"), "finished": st("cyan", "finished"),
+                 "lost": st("red", "lost")}.get(job["state"], job["state"])
+        head = f"job {safe_text(job['id'])}  {state}"
+        if view:
+            head += st("red", "  STALLED") if view["stalled"] else ""
+        lines.append(head)
+        if view:
+            idle = f"idle {fmt_dur(view['last_event_age_s'])}" if view["last_event_age_s"] is not None else "idle -"
+            t = view["tokens"]
+            cost = "" if view["cost_usd"] is None else \
+                f"   cost {'~' if view['cost_is_estimate'] else ''}${view['cost_usd']:.2f}"
+            lines.append(f"       elapsed {fmt_dur(view['elapsed_s'])}   {idle}   turns {view['turns']}   tools {view['tool_calls']}")
+            lines.append(f"       tokens {fmt_count(t['total'])} (in {fmt_count(t['input'])} out {fmt_count(t['output'])}"
+                         f" cache {fmt_count(t['cache_read'] + t['cache_creation'])}){cost}")
+    else:
+        lines.append(st("dim", "no job"))
+    return box(title, lines, width, st)
+
+
+def dashboard_lines(data: dict, st: Style, width: int = 78) -> list[str]:
+    rows = data["profiles"]
+    running = [r for r in rows if r.get("vm") == "running"]
+    others = [r for r in rows if r.get("vm") != "running"]
+    stamp = time.strftime("%H:%M:%S", time.localtime(data["generated_at"]))
+    out = [st("bold", "agentbox") + f"  {len(running)} running" + st("dim", f"   {stamp}"), ""]
+    if not data["sandboxes_known"]:
+        out += [st("red", "could not list sandboxes (`sbx ls --json` failed)"), ""]
+    for r in running:
+        out += dashboard_card(r, st, width)
+    if not running and data["sandboxes_known"]:
+        out += [st("dim", "no sandbox is running"), ""]
+    if others:
+        out.append(st("dim", "not running: " + ", ".join(f"{safe_text(r['name'])} ({r.get('vm', '?')})" for r in others)))
+    return out
+
+
+def cmd_dashboard(cfg: Config, args) -> int:
+    if args.json and args.watch:
+        die("--json cannot be combined with --watch", EXIT_USAGE)
+    if args.interval < 2:
+        die("--interval must be at least 2 seconds", EXIT_USAGE)
+    tty = sys.stdout.isatty()
+    st = Style(tty and "NO_COLOR" not in os.environ)
+    width = max(60, min(100, shutil.get_terminal_size((78, 24)).columns - 2))
+    try:
+        while True:
+            data = collect_dashboard(cfg)
+            if args.json:
+                emit_json(data)
+                return EXIT_OK
+            text = "\n".join(dashboard_lines(data, st, width))
+            print(("\x1b[H\x1b[2J" if tty and args.watch else "") + text, flush=True)
+            if not args.watch:
+                return EXIT_OK
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return EXIT_OK
+
+
 def describe_tool(t: dict) -> dict:
     return {"description": t.get("description", ""),
             "params": t.get("params", {}),
@@ -3742,6 +3950,10 @@ def main():
     sub.add_parser("keepalive", help=argparse.SUPPRESS).add_argument("profile")
     p = sub.add_parser("code"); p.add_argument("profile"); p.add_argument("path", nargs="?")
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("dashboard", help="live overview of the running sandboxes: uptime, idle, tokens, cpu, memory")
+    p.add_argument("--watch", action="store_true", help="redraw until interrupted")
+    p.add_argument("--interval", type=float, default=5.0, metavar="S", help="seconds between --watch updates (default 5)")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
     p = sub.add_parser("provision", help="guided setup of a new profile"); p.add_argument("name")
@@ -3759,6 +3971,8 @@ def main():
     secure_state(cfg)
     if a.cmd == "status":
         sys.exit(cmd_status(cfg, a.json))
+    if a.cmd == "dashboard":
+        sys.exit(cmd_dashboard(cfg, a))
     if a.cmd == "doctor":
         sys.exit(cmd_doctor(cfg, a.profile, a.json, a.start))
     if a.cmd == "provision":
