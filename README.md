@@ -524,6 +524,23 @@ costs one extra `sbx exec` (CPU is sampled over half a second inside the VM) on 
 The VM's output is parsed as numbers and drawn by agentbox, never printed raw. Colour is used only on a
 terminal and not if `NO_COLOR` is set.
 
+### Using agentbox from Rex
+
+[Rex](https://www.superlogical.com/rex/docs) users get palette actions and job status from
+`share/rex/` (installed to `~/.local/share/agentbox/share/rex/`; setup in
+[`share/rex/README.md`](share/rex/README.md)):
+
+- **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
+  a job from a prompt file, open the dashboard, fetch for review, remove a sandbox. Two lines in
+  `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
+- **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` and `wait`
+  report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
+  idle; the dashboard keeps one record per running profile. Only host-side state goes in (job state, exit
+  code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
+  terminal with `REX_SESSION` set, never with `--json`; `AGENTBOX_NO_OSC=1` turns them off.
+- **Notifications**: `rex do ~/.local/share/agentbox/share/rex/notify.lua --all`, in a tab you keep open,
+  posts a macOS notification when a job needs you, finishes or fails.
+
 ### VS Code inside the sandbox
 
 ```bash
