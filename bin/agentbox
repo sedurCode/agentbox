@@ -40,6 +40,7 @@ if sys.version_info < (3, 11):          # before anything that needs 3.11 (tomll
     sys.exit("agentbox needs Python 3.11+ (macOS: brew install python; Linux: your package manager)")
 
 import argparse
+import base64
 import calendar
 import contextlib
 import datetime
@@ -2238,6 +2239,15 @@ def resolve_job(prof: Profile, arg: str | None) -> str:
 
 
 def cmd_wait(prof: Profile, args) -> int:
+    rex = RexStatus(rex_wanted())
+    try:
+        return _wait(prof, args, rex)
+    except KeyboardInterrupt:
+        rex.report({"state": "idle"})
+        raise
+
+
+def _wait(prof: Profile, args, rex: RexStatus) -> int:
     job_id = resolve_job(prof, args.job)
     deadline = time.monotonic() + args.timeout if args.timeout else None
     delays, doubts = poll_delays(), 0
@@ -2245,17 +2255,21 @@ def cmd_wait(prof: Profile, args) -> int:
         j = job_info(prof, job_id)
         if j["state"] == "finished":
             cache_final_progress(prof, job_id, j)
+            rex.report(rex_fields(j))
             info(f"job {job_id} finished (exit {j['exit_code']})"
                  + (f"; `agentbox fetch {prof.name}` brings its commits to the host" if prof.d["mode"] == "clone" else ""))
             return job_exit_status(j)
         if j["state"] == "lost":
             doubts += 1                     # one flaky probe isn't "lost"
             if not j.get("probe_failed") or doubts >= 3:
+                rex.report(rex_fields(j))
                 info(f"job {job_id} lost (its process is gone; sandbox {j['vm']})")
                 return EXIT_LOST
         else:
             doubts = 0
+            rex.report(rex_fields(j))
         if deadline is not None and time.monotonic() >= deadline:
+            rex.report({"state": "idle"})   # no longer watched
             info(f"job {job_id} still running after {args.timeout:g}s")
             return EXIT_TIMEOUT
         time.sleep(min(next(delays), max(0.0, deadline - time.monotonic()) if deadline else 1e9))
@@ -2751,6 +2765,107 @@ def progress_lines(job_id: str, state: str, view: dict, why: str = "") -> list[s
     return [safe_text(ln) for ln in lines]
 
 
+# --------------------------------------------------------------------- rex
+# Rex (a terminal multiplexer) shows a per-terminal status record that a program reports with OSC 7501:
+# ESC ] 7501 ; key=value:key=value ESC \. share/rex/notify.lua turns app=agentbox records into
+# notifications. A report carries ONLY state agentbox derives on the host - job state, the stalled
+# flag, exit code, profile name, plan counts, and agentbox's own wording. Never VM text: no agent
+# output, plan step text, notes, commit messages or sbx stderr.
+OSC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+OSC_VALUE_RE = re.compile(r"^[A-Za-z0-9_.,+/=-]+$")
+OSC_ID_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,32}(/[A-Za-z0-9_.+-]{1,32})*$")
+OSC_TEXT_KEYS = ("msg", "title")       # sent as base64 of single-line UTF-8
+OSC_BAD_TEXT = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def osc7501(fields: dict) -> str:
+    """One OSC 7501 report. Raises ValueError for anything outside the grammar."""
+    pairs = []
+    for k, v in fields.items():
+        if not OSC_KEY_RE.match(k):
+            raise ValueError(f"bad key {k!r}")
+        v = str(v)
+        if k in OSC_TEXT_KEYS:
+            if OSC_BAD_TEXT.search(v):
+                raise ValueError(f"control character in {k}")
+            v = base64.b64encode(v.encode()).decode()
+        elif k == "id" and not OSC_ID_RE.match(v):
+            raise ValueError(f"bad id {v!r}")
+        if not OSC_VALUE_RE.match(v):
+            raise ValueError(f"bad value for {k}")
+        pairs.append(f"{k}={v}")
+    return "\x1b]7501;" + ":".join(pairs) + "\x1b\\"
+
+
+def rex_wanted(as_json: bool = False) -> bool:
+    return (sys.stdout.isatty() and bool(os.environ.get("REX_SESSION")) and not as_json
+            and "AGENTBOX_NO_OSC" not in os.environ)
+
+
+def rex_fields(j: dict, view: dict | None = None) -> dict:
+    """The report for a job (`job_info` shape) and its progress view: see README, "Using agentbox from Rex".
+    Only numbers and agentbox's own words go in; `view`'s text (plan steps, note, tools) is never read."""
+    state = j.get("state")
+    if state == "running":
+        if view and view.get("stalled"):
+            age = view.get("last_event_age_s")
+            age = age if isinstance(age, int) else view.get("elapsed_s")
+            mins = max(1, age // 60) if isinstance(age, int) else None
+            return {"state": "blocked", "kind": "other",
+                    "msg": f"no event for {mins} min" if mins else "no recent event"}
+        plan = view.get("plan") if view else None
+        if plan and isinstance(plan.get("done"), int) and isinstance(plan.get("total"), int) and plan["total"] > 0:
+            return {"state": "working", "progress": max(0, min(100, plan["done"] * 100 // plan["total"]))}
+        return {"state": "working"}
+    if state == "finished":
+        code = j.get("exit_code")
+        if code == 0:
+            return {"state": "done"}
+        return {"state": "error", "msg": f"exit {code}" if isinstance(code, int) else "exit ?"}
+    if state == "lost":
+        return {"state": "error", "msg": "job lost"}
+    return {"state": "idle"}
+
+
+class RexStatus:
+    """Writes OSC 7501 reports to stdout when `rex_wanted`, each record only when it changes.
+    Records are keyed by id; None is the terminal's root record."""
+
+    def __init__(self, on: bool):
+        self.on, self.last = on, {}
+
+    def report(self, fields: dict, rid: str | None = None):
+        if not self.on or self.last.get(rid) == fields:
+            return
+        rec = {"state": fields["state"]}
+        if "kind" in fields:
+            rec["kind"] = fields["kind"]
+        rec["app"] = "agentbox"
+        if rid is not None:
+            rec["id"] = rid
+        rec |= {k: v for k, v in fields.items() if k not in ("state", "kind")}
+        try:
+            text = osc7501(rec)
+        except ValueError:
+            return                    # e.g. a 33-41 char profile name: longer than an id segment
+        self.last[rid] = fields
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def clear(self, rid: str):
+        if not self.on or rid not in self.last:
+            return
+        del self.last[rid]
+        try:
+            sys.stdout.write(osc7501({"state": "clear", "id": rid}))
+            sys.stdout.flush()
+        except ValueError:
+            pass
+
+    def ids(self) -> list:
+        return [r for r in self.last if r is not None]
+
+
 def cmd_progress(prof: Profile, args) -> int:
     job_id = resolve_job(prof, args.job)
     if args.json and args.watch:
@@ -2758,26 +2873,35 @@ def cmd_progress(prof: Profile, args) -> int:
     if args.interval < 1:
         die("--interval must be at least 1 second", EXIT_USAGE)
     tty, doubts = sys.stdout.isatty(), 0
-    while True:
-        j = job_info(prof, job_id)
-        view, why = job_progress(prof, job_id, j, finalize=True)
-        if args.json:
-            emit_json(view)
-            return EXIT_OK
-        lines = progress_lines(job_id, j["state"], view, why)
-        if not args.watch:
-            print("\n".join(lines))
-            return EXIT_OK
-        if tty:     # our own escape codes: home, clear screen. Nothing from the VM is ever printed raw.
-            print("\x1b[H\x1b[2J" + "\n".join(lines), flush=True)
-        else:
-            print(lines[0] + (f"  {lines[1]}" if view["plan"] else ""), flush=True)
-        if j["state"] == "lost" and j.get("probe_failed"):
-            doubts += 1                     # one flaky probe isn't "lost"
-        if j["state"] == "running" or (j["state"] == "lost" and j.get("probe_failed") and doubts < 3):
-            time.sleep(args.interval)
-            continue
-        return job_exit_status(j)
+    rex = RexStatus(args.watch and rex_wanted(args.json))
+    try:
+        while True:
+            j = job_info(prof, job_id)
+            view, why = job_progress(prof, job_id, j, finalize=True)
+            if args.json:
+                emit_json(view)
+                return EXIT_OK
+            lines = progress_lines(job_id, j["state"], view, why)
+            if not args.watch:
+                print("\n".join(lines))
+                return EXIT_OK
+            if tty:     # our own escape codes: home, clear screen. Nothing from the VM is ever printed raw.
+                print("\x1b[H\x1b[2J" + "\n".join(lines), flush=True)
+            else:
+                print(lines[0] + (f"  {lines[1]}" if view["plan"] else ""), flush=True)
+            if j["state"] == "lost" and j.get("probe_failed"):
+                doubts += 1                     # one flaky probe isn't "lost"
+            if j["state"] == "lost" and j.get("probe_failed") and doubts < 3:
+                time.sleep(args.interval)       # the Rex record keeps its last state until this is certain
+                continue
+            rex.report(rex_fields(j, view))
+            if j["state"] == "running":
+                time.sleep(args.interval)
+                continue
+            return job_exit_status(j)
+    except KeyboardInterrupt:
+        rex.report({"state": "idle"})
+        raise
 
 
 # ------------------------------------------------------------------- fetch
@@ -3242,6 +3366,7 @@ def cmd_dashboard(cfg: Config, args) -> int:
     tty = sys.stdout.isatty()
     st = Style(tty and "NO_COLOR" not in os.environ)
     width = max(60, min(100, shutil.get_terminal_size((78, 24)).columns - 2))
+    rex = RexStatus(args.watch and rex_wanted(args.json))
     try:
         while True:
             data = collect_dashboard(cfg)
@@ -3252,9 +3377,29 @@ def cmd_dashboard(cfg: Config, args) -> int:
             print(("\x1b[H\x1b[2J" if tty and args.watch else "") + text, flush=True)
             if not args.watch:
                 return EXIT_OK
+            dashboard_rex(rex, data)
             time.sleep(args.interval)
     except KeyboardInterrupt:
+        for rid in rex.ids():        # nothing is watched any more
+            rex.clear(rid)
         return EXIT_OK
+
+
+def dashboard_rex(rex: RexStatus, data: dict):
+    """One record per running profile (id = profile name); `clear` once it stops running. A profile whose
+    state can't be read keeps its last record, so a flaky `sbx ls` doesn't clear and re-notify."""
+    if not data["sandboxes_known"]:
+        return
+    running = set()
+    for row in data["profiles"]:
+        if row.get("vm") == "unknown":
+            running.add(row["name"])
+        elif row.get("vm") == "running":
+            running.add(row["name"])
+            rex.report(rex_fields(row["job"] or NO_JOB, (row["job"] or {}).get("progress")), row["name"])
+    for rid in rex.ids():
+        if rid not in running:
+            rex.clear(rid)
 
 
 def describe_tool(t: dict) -> dict:
