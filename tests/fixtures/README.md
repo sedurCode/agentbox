@@ -14,3 +14,9 @@ text starts with "Permission for this action was denied by the Claude Code auto 
 the `claude` binary itself tests for; the `result` event lists them again in `permission_denials` (field
 names from the binary's output schema). It has two denials, one repeated event, a plain tool error and a
 non-error result quoting the text, none of which count. Replace it with a recorded stream when one is at hand.
+
+`rex_review_harness.lua` is NOT Rex: it is a stand-in for the parts of Rex's Lua API that
+`share/rex/agentbox.lua`'s `agentbox_review` action calls (`rex.exec`, `rex.ui.pick`, `rex.call`,
+`rex.client.queue`, `rex.layout.block`), written from how the other actions use them. Each method prints
+what it was asked. `window.list` and a session's `windows` list are assumptions about Rex's API (the action
+tries both), so check the action against a real Rex.

@@ -11,6 +11,7 @@
 --   agentbox_fetch      fetch in a visible tab (agentbox prints what it did)
 --   agentbox_stop       stop a running sandbox in a visible tab (a running job: type the name; never --force)
 --   agentbox_down       down in a visible tab (sbx asks for confirmation there; never --force)
+--   agentbox_review     pick a clone-mode profile (or all) -> `agentbox review` in a "Review" window
 
 local M = {}
 
@@ -110,6 +111,43 @@ local function ab(...)
   return { opts.agentbox, ... }
 end
 
+-- The window labelled `label` in a session, if Rex lists it: from session.list's windows, else window.list.
+local function find_window(session_id, label)
+  local lists = {}
+  local r = rex.call("session.list")
+  for _, s in ipairs(r and r.sessions or {}) do
+    if s.session_id == session_id then table.insert(lists, s.windows) end
+  end
+  local ok, w = pcall(rex.call, "window.list", { session_id = session_id })
+  if ok and type(w) == "table" then table.insert(lists, w.windows) end
+  for _, ws in ipairs(lists) do
+    for _, win in ipairs(type(ws) == "table" and ws or {}) do
+      if win.window_label == label or win.label == label then return win.window_id or win.id end
+    end
+  end
+end
+
+-- Review items per clone-mode profile, from `agentbox review --json` (no git parsing here).
+local function review_counts()
+  local r, err = rex.exec({ opts.agentbox, "review", "--json" }, { timeout = 60 })
+  if not r then warn("cannot run agentbox: " .. tostring(err)); return nil end
+  if not r.ok then warn("review --json failed: " .. (r.stderr or "")); return nil end
+  local ok, data = pcall(rex.json.decode, r.stdout)
+  if not ok or type(data) ~= "table" or type(data.profiles) ~= "table" then
+    warn("review --json was not understood"); return nil
+  end
+  return data.profiles
+end
+
+local function count_text(c)
+  local parts = {}
+  for _, k in ipairs({ { "ready", "ready" }, { "not_fetched", "not fetched" }, { "diverged", "diverged" } }) do
+    local n = type(c) == "table" and tonumber(c[k[1]]) or 0
+    if n and n > 0 then table.insert(parts, math.floor(n) .. " " .. k[2]) end
+  end
+  return #parts > 0 and table.concat(parts, " · ") or "nothing to review"
+end
+
 function M.setup(user)
   for k, v in pairs(user or {}) do opts[k] = v end
 
@@ -191,6 +229,40 @@ function M.setup(user)
   end
   visible("agentbox_fetch", "agentbox: Fetch for Review…", "fetch")
   visible("agentbox_down", "agentbox: Remove Sandbox…", "down")
+
+  rex.action{
+    name = "agentbox_review", title = "agentbox: Review…", category = "agentbox",
+    keywords = "merge branch diff pull request fetch",
+    run = function(ctx)
+      local profs = review_counts()
+      if not profs then return end
+      local items, total = {}, { ready = 0, not_fetched = 0, diverged = 0 }
+      for _, p in ipairs(profs) do
+        if valid_name(p.name) then
+          local c = type(p.counts) == "table" and p.counts or {}
+          for k in pairs(total) do total[k] = total[k] + (tonumber(c[k]) or 0) end
+          table.insert(items, { id = p.name, title = p.name, icon = "package",
+            subtitle = type(p.error) == "string" and "cannot read the workspace" or count_text(c) })
+        end
+      end
+      if #items == 0 then warn("no clone-mode profiles to review"); return end
+      table.insert(items, 1, { id = "*", title = "All profiles", icon = "package", subtitle = count_text(total) })
+      local pick = rex.ui.pick{ title = "Review", placeholder = "Filter profiles", items = items }
+      if pick ~= "*" and not valid_name(pick) then return end
+      local label = pick == "*" and "agentbox" or "ab:" .. pick
+      local cmd = pick == "*" and ab("review") or ab("review", pick)
+      local window = { window_label = "Review", layout = term(cmd, "review", false) }
+      local id = find_session(label)
+      if not id then ensure_session(label, { window }); return end
+      local win = find_window(id, "Review")
+      if win then
+        rex.client.queue("window.select", { session_id = id, window_id = win })
+      else
+        rex.call("session.new_window", { session_id = id, window_label = "Review", layout = window.layout })
+      end
+      show(id)
+    end,
+  }
 
   rex.action{
     name = "agentbox_stop", title = "agentbox: Stop…", category = "agentbox",
