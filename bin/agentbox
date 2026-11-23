@@ -3951,7 +3951,7 @@ def fmt_count(n) -> str:
 
 class Style:
     """ANSI colour only on a terminal, and not if NO_COLOR is set."""
-    CODES = {"dim": "2", "bold": "1", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+    CODES = {"dim": "2", "bold": "1", "red": "31", "green": "32", "yellow": "33", "blue": "34", "cyan": "36"}
 
     def __init__(self, on: bool):
         self.on = on
@@ -4020,6 +4020,14 @@ def dashboard_card(row: dict, st: Style, width: int) -> list[str]:
                          f" cache {fmt_count(t['cache_read'] + t['cache_creation'])}){cost}")
     else:
         lines.append(st("dim", "no job"))
+    sessions = row.get("sessions") or []
+    if sessions:
+        age, mode = row.get("activity_age_s"), row.get("permission_mode")
+        n = f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}"
+        act = f", active {fmt_dur(age)} ago" if isinstance(age, int) else ""
+        mode = (f", mode {st('yellow', mode) if mode == 'bypassPermissions' else mode}"
+                if mode in SESSION_MODES else "")
+        lines.append(st("blue", "interactive") + f": {n}{act}{mode}")
     return box(title, lines, width, st)
 
 
@@ -4078,7 +4086,9 @@ def dashboard_rex(rex: RexStatus, data: dict):
     """One record per profile (id = profile name) that follows its latest job, whatever the VM's state:
     done/error stay until the next job starts. A record is cleared only when the profile has no job, is
     disabled or is gone from the config. A profile whose state can't be read keeps its last record, so a
-    flaky `sbx ls` doesn't clear and re-notify."""
+    flaky `sbx ls` doesn't clear and re-notify. While interactive sessions run (and no job does) the record
+    is working/idle with msg "interactive...", never done/error/blocked; when they end it is the job's
+    again."""
     if not data["sandboxes_known"]:
         return
     keep = set()
@@ -4088,10 +4098,21 @@ def dashboard_rex(rex: RexStatus, data: dict):
             keep.add(row["name"])
         elif vm == "running" or (row.get("enabled") and j["state"] != "none"):
             keep.add(row["name"])
-            rex.report(dashboard_fields(j), row["name"])
+            rex.report(dashboard_interactive_fields(row) or dashboard_fields(j), row["name"])
     for rid in rex.ids():
         if rid not in keep:
             rex.clear(rid)
+
+
+def dashboard_interactive_fields(row: dict) -> dict | None:
+    """The Rex record for a row in an interactive state, else None."""
+    st = dash_state(row)
+    if st == "interactive_working":
+        return {"state": "working", "msg": "interactive"}
+    if st == "interactive_idle":
+        age = _int_or_none(row.get("activity_age_s"))
+        return {"state": "idle", "msg": "interactive" + (f", idle {fmt_dur(age - age % 60)}" if age is not None else "")}
+    return None
 
 
 def dashboard_fields(j: dict) -> dict:
@@ -4111,15 +4132,18 @@ def dashboard_fields(j: dict) -> dict:
 DASH_MIN_W, DASH_MIN_H, DASH_WIDE = 60, 15, 100       # smallest usable pane; side-by-side from this width
 DASH_STATES = {     # display state: (glyph, ASCII glyph, style, label, sort group)
     "working": ("●", "*", "green", "working", 0),
-    "stalled": ("◐", "~", "yellow", "stalled", 1),
-    "error": ("✗", "x", "red", "failed", 1),
-    "lost": ("◌", "!", "red", "lost", 1),
-    "done": ("✓", "+", "cyan", "done", 2),
-    "nojob": ("○", "o", "", "no job", 3),
-    "stopped": ("□", "-", "dim", "stopped", 3),
-    "disabled": ("⊘", "/", "dim", "disabled", 3),
-    "unknown": ("?", "?", "yellow", "unknown", 3),
+    "interactive_working": ("◉", "@", "blue", "interactive", 1),
+    "stalled": ("◐", "~", "yellow", "stalled", 2),
+    "error": ("✗", "x", "red", "failed", 2),
+    "lost": ("◌", "!", "red", "lost", 2),
+    "interactive_idle": ("◦", "i", "blue", "interactive, idle", 3),
+    "done": ("✓", "+", "cyan", "done", 4),
+    "nojob": ("○", "o", "", "no job", 5),
+    "stopped": ("□", "-", "dim", "stopped", 5),
+    "disabled": ("⊘", "/", "dim", "disabled", 5),
+    "unknown": ("?", "?", "yellow", "unknown", 5),
 }
+DASH_ACTIVE_S = 90          # an interactive session wrote within this many seconds: "working"
 DASH_VM_STYLE = {"running": "green", "stopped": "dim", "missing": "dim", "unknown": "yellow", "disabled": "dim"}
 DASH_STEP = {"done": ("✓", "+", "green"), "active": ("▶", ">", "bold"), "pending": ("·", "-", "dim")}
 DASH_SPARK, DASH_SPARK_ASCII = "▁▂▃▄▅▆▇█", "_.-:=+*#"
@@ -4143,6 +4167,9 @@ def dash_state(row: dict) -> str:
     state = job.get("state")
     if state == "running":
         return "stalled" if (job.get("progress") or {}).get("stalled") else "working"
+    if vm == "running" and row.get("sessions"):
+        age = _int_or_none(row.get("activity_age_s"))
+        return "interactive_working" if age is not None and age <= DASH_ACTIVE_S else "interactive_idle"
     if state == "finished":
         return "done" if job.get("exit_code") == 0 else "error"
     if state == "lost":
@@ -4155,8 +4182,8 @@ def dash_state(row: dict) -> str:
 
 
 def dash_sort(rows: list) -> list:
-    """Working first, then the ones needing attention (stalled, failed, lost), then finished, then the rest;
-    by name within each group."""
+    """Working jobs first, then working interactive sessions, then the ones needing attention (stalled,
+    failed, lost), then idle interactive sessions, then finished, then the rest; by name within each group."""
     return sorted(rows, key=lambda r: (DASH_STATES[dash_state(r)][4], str(r.get("name"))))
 
 
@@ -4455,10 +4482,16 @@ def _dash_count(v) -> str:
 
 
 def dash_when(row: dict, now: float) -> str:
-    """The list's time column: a running job's elapsed time, or how long ago an ended job finished."""
+    """The list's time column: a running job's elapsed time, how long ago an interactive session last wrote,
+    or how long ago an ended job finished."""
     st, job = dash_state(row), row.get("job") or {}
     if st in ("working", "stalled"):
         return _dash_dur((job.get("progress") or {}).get("elapsed_s"))
+    if st in ("interactive_working", "interactive_idle"):
+        age = _int_or_none(row.get("activity_age_s"))
+        if age is None:
+            return "idle" if st == "interactive_idle" else "-"
+        return f"{fmt_dur(age)} ago" if st == "interactive_working" else f"idle {fmt_dur(age)}"
     if st in ("done", "error", "lost"):
         t = iso_epoch(job.get("finished_at")) if isinstance(job.get("finished_at"), str) else None
         return f"{fmt_dur(max(0, now - t))} ago" if t is not None else "-"
@@ -4526,9 +4559,19 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
     if note:
         L += [[], [("review ", "bold"), (note, "yellow")]]
     job = row.get("job") or {}
+    interactive = st in ("interactive_working", "interactive_idle")
+    if vm == "running" and row.get("sessions"):
+        L += [[]] + dash_sessions(row, ascii_)
     L.append([])
     if job.get("state") in (None, "none") or not job.get("id"):
-        L.append([("job  ", "bold"), ("none", "dim")])
+        L.append([("last job  " if interactive else "job  ", "bold" if not interactive else "dim"), ("none", "dim")])
+        return L
+    if interactive:         # an ended job: one line under the sessions
+        jl = DASH_STATES["done" if job.get("state") == "finished" and job.get("exit_code") == 0
+                         else "error" if job.get("state") == "finished" else "lost"][3]
+        when = dash_when(row | {"sessions": []}, now)
+        L.append([(f"last job: {jl}{' ' + when if when and when != '-' else ''}", "dim"),
+                  (f"   {job.get('id')}", "dim")])
         return L
     view = job.get("progress") if isinstance(job.get("progress"), dict) else {}
     jstate = job.get("state")
@@ -4579,6 +4622,23 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
             L.append([("     ", ""), (sa if ascii_ else sg, sst), (" ", ""), (s.get("text"), sst if sst != "green" else "")])
     if view.get("note"):
         L.append([("note ", "bold"), (view.get("note"), ""), ("   agent's note", "dim")])
+    return L
+
+
+def dash_sessions(row: dict, ascii_: bool) -> list:
+    """The detail panel's block for a running VM's interactive agent sessions."""
+    sessions = [s for s in row.get("sessions") or [] if isinstance(s, dict)]
+    age, mode = _int_or_none(row.get("activity_age_s")), row.get("permission_mode")
+    L = [[("sessions  ", "bold"), (f"{len(sessions)} interactive", "blue")]]
+    for s in sessions:
+        L.append([(f"     {dash_clean(s.get('agent')):<9.9}", ""), (f"running {_dash_dur(s.get('age_s'))}", "dim")])
+    last = [("     last activity ", ""), (f"{fmt_dur(age)} ago" if age is not None else "-", "")]
+    if mode in SESSION_MODES:
+        bypass = mode == "bypassPermissions"
+        last += [("   mode ", ""), (mode, "yellow" if bypass else "")]
+        if bypass:
+            last.append(("  (bypass: no permission checks)", "yellow"))
+    L.append(last)
     return L
 
 
@@ -4810,7 +4870,7 @@ class DashScreen:
             c.mouseinterval(0)
         colour = c.has_colors() and "NO_COLOR" not in os.environ
         a = {"": 0, "bold": c.A_BOLD, "dim": c.A_DIM, "sel": c.A_REVERSE}
-        plain = {"red": c.A_BOLD, "yellow": c.A_BOLD, "green": 0, "cyan": 0}
+        plain = {"red": c.A_BOLD, "yellow": c.A_BOLD, "green": 0, "cyan": 0, "blue": 0}
         if colour:
             try:
                 c.use_default_colors()
@@ -4818,7 +4878,8 @@ class DashScreen:
             except c.error:
                 bg = c.COLOR_BLACK
             for i, (k, fg) in enumerate((("red", c.COLOR_RED), ("green", c.COLOR_GREEN),
-                                         ("yellow", c.COLOR_YELLOW), ("cyan", c.COLOR_CYAN)), 1):
+                                         ("yellow", c.COLOR_YELLOW), ("cyan", c.COLOR_CYAN),
+                                         ("blue", c.COLOR_BLUE)), 1):
                 try:
                     c.init_pair(i, fg, bg)
                     a[k] = c.color_pair(i)
