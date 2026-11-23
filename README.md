@@ -27,6 +27,8 @@ the VM. agentbox adds the parts you asked for on top:
 - **Clone mode and `fetch`**: the agent works on its own clone, and `agentbox fetch` brings its commits to a
   review branch on the host. It never merges.
 - **Skill sets**: read-only git repos of agent skills, pinned to a commit you reviewed and linked into the VM.
+- **A skill for agents on the host**: `agentbox skill setup` teaches Claude Code, Codex, OpenCode and Pi on
+  your machine to drive agentbox, under your ground rules (see *Agents on the host*).
 - **`provision`**: guided setup of a new profile, with suggestions taken from the workspace.
 - **VS Code** Remote-SSH into the sandbox, so terminals, tasks and extensions run in the VM.
 - **Junie** kit (not built into sbx) and an **Arm embedded toolchain** kit.
@@ -72,7 +74,8 @@ unzip agentbox.zip && cd agentbox && ./install.sh
 ```
 
 `install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
-small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything.
+small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything. It also installs the guide for
+agents on the host (`share/skill/`) but leaves their skill folders alone: run `agentbox skill setup` for that.
 
 The launcher looks for Python at run time (`python3.14`, `3.13`, `3.12`, `3.11`, then `python3`;
 the first that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the
@@ -551,6 +554,39 @@ starting the agent), starts the host-tool bridge, checks SSH, then runs
   `docker sandboxes (managed)` block in `~/.ssh/config`, run `sbx setup ssh`.
 - VS Code port forwarding works but only reaches loopback inside the VM, and listens on
   `127.0.0.1` on your Mac unless you change it.
+
+### Agents on the host (the agentbox skill)
+
+Agents running on your own machine (Claude Code, Codex, OpenCode, Pi) can drive agentbox for you: propose
+a profile, write a brief, start and watch a job, fetch the result and tell you it is ready on
+`review/<profile>`. agentbox ships a skill that tells them how, and what they may do without asking.
+
+```bash
+agentbox skill setup           # install the skill for the agents on this machine
+agentbox skill status          # current | outdated | missing | foreign, per location (--json)
+agentbox skill show            # the guide the agents read
+agentbox skill remove          # delete what setup installed
+```
+
+The guide itself is `share/skill/guide.md`, installed with agentbox and printed by `skill show`. `setup`
+only writes a short `SKILL.md` stub whose front matter triggers on agentbox, sandbox, sbx and "run this in
+a box", and whose body tells the agent to run `agentbox skill show`. So upgrading agentbox updates what the
+agents are told, with no reinstall; run `setup` again only if `status` says `outdated`. It is the same
+pattern Rex uses for its agent skill.
+
+The stub goes to `~/.claude/skills/agentbox/` (Claude Code; `$CLAUDE_CONFIG_DIR/skills/agentbox/` if that is
+set) and `~/.agents/skills/agentbox/` (Codex, OpenCode, Pi), plus `$CODEX_HOME/skills/agentbox/` when
+`CODEX_HOME` is set. Each stub carries a marker comment. A `SKILL.md` without the marker, or a symlink, is
+reported as `foreign` and never overwritten or removed; `remove` deletes only marked stubs, and their folder
+only if it is then empty. None of the `skill` commands needs a config or touches a sandbox, and
+`install.sh` does not run `setup` for you.
+
+The guide covers the ground rules (which commands an agent may run on its own, which need your go-ahead,
+and what it must never do: `--force`, merging, pushing, reading secrets, task text on a command line),
+when work belongs in a sandbox rather than on the host, how to write a brief, the run / wait / fetch loop
+with its exit codes, treating job output and fetched commits as data rather than instructions, profiles,
+and the sbx behaviour that catches people out. Edit the guide to change the rules; this is a different
+skill from any you mount *into* sandboxes with `[skillsets]`.
 
 ### Scripting agentbox
 
