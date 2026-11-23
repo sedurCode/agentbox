@@ -25,6 +25,7 @@ Docker Sandboxes (`sbx`).
     agentbox resume <profile> [--job ID]               attach interactively to the job's session
     agentbox progress <profile> [--job ID] [--watch [--interval S]] [--json]   how far the job is
     agentbox fetch <profile> [--ref R] [--branch B] [--start] [--force] [--json]   clone mode: the job's branch, to review/<profile>-<branch>
+    agentbox review [<profile>] [--json]   clone mode: review branches like a pull request; merge (owner only)
     agentbox history [<profile>] [--json]  the jobs each profile ran: branch, cost, title, the agent's summary
     agentbox skill show|setup|status|remove   the skill for agents on this machine (status --json)
 
@@ -3829,7 +3830,8 @@ def dashboard_entry(cfg: Config, name: str, states) -> dict:
             return {"name": name, "enabled": False, "vm": "disabled"}
         vm = sandbox_state(prof, states)
         row = {"name": name, "enabled": True, "sandbox": prof.sandbox, "agent": prof.d["agent"],
-               "mode": prof.d["mode"], "vm": vm, "job": None, "resources": None}
+               "mode": prof.d["mode"], "vm": vm, "job": None, "resources": None,
+               "review": review_summary(cfg, prof, states)}      # clone mode: what `review` would list
         if vm == "unknown":
             return row
         if vm == "running":
@@ -4046,6 +4048,7 @@ DASH_HELP = [("↑ ↓  j k", "select a profile (or click it)"), ("Home End", "f
              ("wheel", "scroll the list or the details"), ("Enter  p", "watch the job: agentbox progress --watch"),
              ("l", "the job's log in a pager ($PAGER)"), ("f", "fetch the job's commits (asks first)"),
              ("u", "start: agentbox up (in a new Rex tab inside Rex)"), ("s", "stop the sandbox (asks first)"),
+             ("v", "review and merge its branches: agentbox review (a new Rex tab inside Rex)"),
              ("r", "refresh now"), ("?", "this help"), ("q  Ctrl-C", "quit")]
 DASH_HISTORY, DASH_HISTORY_JOBS = 120, 64            # samples per job, jobs remembered
 
@@ -4198,19 +4201,20 @@ def dash_new_ui(size=(80, 24), tab: bool = False) -> dict:
     """The UI state dash_key and dash_render share. `names` is the sorted profile names, `sel` an index
     into it, `top` / `dtop` the scroll of the list / details, `mode` list | help | confirm | nofetch (fetch
     refused: the sandbox is not running) | stop (y/N) | stopname (the name typed so far is `typed`),
-    `vm` each profile's sandbox state, `states` its dash_state. `tab`: `u` opens a Rex tab (rex_tab_program
+    `vm` each profile's sandbox state, `states` its dash_state, `modes` its mode (clone | direct). `tab`: `u` opens a Rex tab (rex_tab_program
     found one); `up_fallback` names the profile whose tab failed to open, so its next `u` runs here."""
     return {"names": [], "sel": 0, "top": 0, "dtop": 0, "size": tuple(size), "mode": "list", "target": None,
-            "msg": "", "busy": False, "error": "", "vm": {}, "states": {}, "typed": "", "tab": tab,
+            "msg": "", "busy": False, "error": "", "vm": {}, "states": {}, "modes": {}, "typed": "", "tab": tab,
             "up_fallback": None}
 
 
-def dash_set_rows(ui: dict, names: list, vms: dict | None = None, states: dict | None = None) -> dict:
+def dash_set_rows(ui: dict, names: list, vms: dict | None = None, states: dict | None = None,
+                  modes: dict | None = None) -> dict:
     """New data arrived: keep the same profile selected if it is still there."""
     old = ui["names"][ui["sel"]] if ui["names"] else None
     sel = names.index(old) if old in names else min(ui["sel"], max(0, len(names) - 1))
     return _dash_follow({**ui, "names": list(names), "sel": sel, "vm": dict(vms or {}),
-                         "states": dict(states or {})}, sel)
+                         "states": dict(states or {}), "modes": dict(modes or {})}, sel)
 
 
 def _dash_follow(ui: dict, sel: int) -> dict:
@@ -4240,6 +4244,7 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
     says why there is nothing to fetch: fetch needs the sandbox running, and booting it (`fetch --start`)
     relaunches the agent, so the dashboard never offers that.
     `u` gives ("up_tab", name) when ui["tab"] (the loop opens a Rex tab), else ("up", name) (run here).
+    `v` on a clone-mode profile gives ("review_tab", name) or ("review", name), as `u` does.
     `s` on a running sandbox gives ("confirm_stop", name) and opens a question; ("stop", name) comes only
     from it: a "y" if no job is running there, else the profile name typed exactly and Enter."""
     ui = {**ui, "msg": ""}
@@ -4308,6 +4313,12 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
         if ui.get("tab") and ui.get("up_fallback") != name:
             return {**ui, "msg": warn}, ("up_tab", name)
         return {**ui, "msg": warn, "up_fallback": None}, ("up", name)
+    if key == "v":
+        if (ui.get("modes") or {}).get(name) != "clone":
+            return {**ui, "msg": f"{name} is not a clone-mode profile: nothing to review (see `agentbox audit {name}`)"}, None
+        if ui.get("tab") and ui.get("up_fallback") != name:
+            return ui, ("review_tab", name)
+        return {**ui, "up_fallback": None}, ("review", name)
     if key == "s":
         if vm != "running":
             return {**ui, "msg": f"{name}'s sandbox is {vm or 'unknown'}, not running: nothing to stop"}, None
@@ -4339,12 +4350,13 @@ def _dash_type_name(ui: dict, key) -> tuple[dict, tuple | None]:
 
 def dash_argv(action) -> list[str] | None:
     """The agentbox arguments for an action that runs a command, or None. These are the only commands
-    the dashboard ever runs (progress, logs, fetch, up, stop), and never with another flag."""
+    the dashboard ever runs (progress, logs, fetch, up, stop, review), and never with another flag."""
     kind, name = (tuple(action) + (None, None))[:2]
     if not isinstance(name, str) or not NAME_RE.match(name):
         return None
     return {"progress": ["progress", name, "--watch"], "logs": ["logs", name], "fetch": ["fetch", name],
-            "up": ["up", name], "up_tab": ["up", name], "stop": ["stop", name]}.get(kind)
+            "up": ["up", name], "up_tab": ["up", name], "stop": ["stop", name],
+            "review": ["review", name], "review_tab": ["review", name]}.get(kind)
 
 
 def _dash_clock(iso, now: float) -> str:
@@ -4391,9 +4403,10 @@ def dash_list(rows: list, ui: dict, w: int, h: int, now: float, ascii_: bool) ->
         g, ga, style, _, _ = DASH_STATES[dash_state(row)]
         sel = " sel" if i == ui["sel"] else ""
         name, used = _clip(dash_clean(row.get("name")), nw)
-        text = f"{name}{' ' * (nw - used)} {dash_clean(row.get('agent') or '-'):<8.8} {dash_when(row, now):>11} "
-        out.append(dash_line([(" ", sel), (ga if ascii_ else g, (style + sel).strip()), (" ", sel), (text, sel.strip())],
-                             w, ascii_))
+        text = f"{name}{' ' * (nw - used)} {dash_clean(row.get('agent') or '-'):<8.8} {dash_when(row, now):>11}"
+        mark = ("R" if ascii_ else "◆") if dash_review_note((row.get("review") or {}).get("counts"), 0) else " "
+        out.append(dash_line([(" ", sel), (ga if ascii_ else g, (style + sel).strip()), (" ", sel), (text, sel.strip()),
+                              (mark, ("yellow" + sel).strip())], w, ascii_))
     return out
 
 
@@ -4429,6 +4442,10 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
                     ("disk", pct(res.get("disk_used"), res.get("disk_total")), (res.get("disk_used"), res.get("disk_total")))):
                 tail = f"  {fmt_bytes(extra[0])}/{fmt_bytes(extra[1])}" if extra and p is not None else ""
                 L.append([(f"     {lbl:<7}", "")] + dash_bar(p, bw, ascii_) + [(tail, "dim")])
+    rv = row.get("review") if isinstance(row.get("review"), dict) else {}
+    note = dash_review_note(rv.get("counts"), _int_or_none(rv.get("commits")))
+    if note:
+        L += [[], [("review ", "bold"), (note, "yellow")]]
     job = row.get("job") or {}
     L.append([])
     if job.get("state") in (None, "none") or not job.get("id"):
@@ -4611,7 +4628,7 @@ def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = 
         foot = [(" type the profile name, ", ""), ("Enter", "bold"), (" stop   ", ""), ("Esc", "bold"), (" cancel", "")]
     else:
         keys = (("j/k" if ascii_ else "↑↓", "select"), ("Enter", "progress"), ("l", "logs"), ("f", "fetch"),
-                ("u", "up"), ("s", "stop"), ("r", "refresh"), ("?", "help"), ("q", "quit"))
+                ("u", "up"), ("s", "stop"), ("v", "review"), ("r", "refresh"), ("?", "help"), ("q", "quit"))
         foot = [s for k, d in keys for s in ((f" {k}", "bold"), (f" {d}  ", "dim"))]
     return [dash_line(head, w, ascii_)] + body + [dash_line(foot, w, ascii_)]
 
@@ -4675,14 +4692,14 @@ def rex_tab_program(env=None) -> str | None:
     return rex_program(env) if env.get("REX_SESSION") and env.get("REX_BLOCK") else None
 
 
-def rex_run_argv(rex: str, name: str) -> list[str] | None:
-    """`rex run` opening `agentbox up <name>` in a new tab of this Rex session. The only rex command the
-    dashboard runs; the agentbox part comes from dash_argv, so the name is checked the same way."""
-    argv = dash_argv(("up", name))
-    if argv is None or not rex:
+def rex_run_argv(rex: str, argv: list[str] | None, keep_open: bool = True) -> list[str] | None:
+    """`rex run` opening `agentbox <argv>` in a new tab of this Rex session; argv is what dash_argv made of an
+    action (`up <name>`, `review <name>`), so the name was checked there. --keep-open leaves the tab open
+    after the command ends, so its output can be read."""
+    if not rex or not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         return None
-    return [rex, "run", "--shell=none", "--keep-open", "--label", shlex.join(["agentbox", *argv]), "--",
-            *agentbox_argv(argv)]
+    return [rex, "run", "--shell=none", *(["--keep-open"] if keep_open else []), "--label",
+            shlex.join(["agentbox", *argv]), "--", *agentbox_argv(argv)]
 
 
 def dash_pager() -> list[str]:
@@ -4770,7 +4787,8 @@ class DashScreen:
                 return ("click", x, y)
             return None
         return {c.KEY_UP: "up", c.KEY_DOWN: "down", c.KEY_HOME: "home", c.KEY_END: "end", c.KEY_PPAGE: "pgup",
-                c.KEY_NPAGE: "pgdn", c.KEY_ENTER: "enter", c.KEY_RESIZE: "resize", c.KEY_BACKSPACE: "backspace"}.get(ch)
+                c.KEY_NPAGE: "pgdn", c.KEY_ENTER: "enter", c.KEY_RESIZE: "resize", c.KEY_BACKSPACE: "backspace",
+                c.KEY_LEFT: "left", c.KEY_RIGHT: "right", getattr(c, "KEY_BTAB", -2): "btab"}.get(ch)
 
     def run(self) -> int:
         self.setup()
@@ -4783,7 +4801,8 @@ class DashScreen:
                 dashboard_rex(self.rex, self.data)
                 rows = dash_sort(self.data.get("profiles") or [])
                 ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in rows],
-                                   {r.get("name"): r.get("vm") for r in rows}, {r.get("name"): dash_state(r) for r in rows})
+                                   {r.get("name"): r.get("vm") for r in rows}, {r.get("name"): dash_state(r) for r in rows},
+                                   {r.get("name"): r.get("mode") for r in rows})
             elif res:
                 ui = {**ui, "error": f"refresh failed: {res[1]}"}
             if res:
@@ -4808,22 +4827,24 @@ class DashScreen:
                 return EXIT_OK
             if action[0] == "refresh":
                 next_at = 0.0                   # starts now, unless one is already running
-            elif action[0] in ("progress", "logs", "fetch", "up", "stop"):
+            elif action[0] in ("progress", "logs", "fetch", "up", "stop", "review"):
                 msg = self.suspend(action)
                 ui = {**ui, "msg": "; ".join(m for m in (msg, ui["msg"]) if m)}
-                if action[0] in ("up", "stop"):
-                    next_at = 0.0               # the sandbox changed: show it now
-            elif action[0] == "up_tab":
-                ok, msg = self.open_tab(action[1])
+                if action[0] in ("up", "stop", "review"):
+                    next_at = 0.0               # the sandbox or the branches changed: show it now
+            elif action[0] in ("up_tab", "review_tab"):
+                ok, msg = self.open_tab(action)
                 if ok:
                     ui = {**ui, "msg": "; ".join(m for m in (msg, ui["msg"]) if m)}
                     next_at = 0.0
                 else:
-                    ui = {**ui, "msg": f"{msg} - press u again to run it here", "up_fallback": action[1]}
+                    again = "u" if action[0] == "up_tab" else "v"
+                    ui = {**ui, "msg": f"{msg} - press {again} again to run it here", "up_fallback": action[1]}
 
-    def open_tab(self, name: str) -> tuple[bool, str]:
-        """`agentbox up <name>` in a new tab of this Rex session (Rex focuses it). Returns (ok, footer message)."""
-        argv = rex_run_argv(self.rexbin, name)
+    def open_tab(self, action) -> tuple[bool, str]:
+        """The action's agentbox command (`up <name>`, `review <name>`) in a new tab of this Rex session (Rex
+        focuses it). Returns (ok, footer message)."""
+        argv = rex_run_argv(self.rexbin, dash_argv(action), keep_open=action[0] != "review_tab")
         if argv is None:
             return False, "could not open a Rex tab"
         try:
@@ -4837,36 +4858,42 @@ class DashScreen:
             return False, f"rex run exited {r.returncode}" + (f": {why}" if why else "")
         return True, "opened in a new Rex tab"
 
-    def suspend(self, action) -> str:
-        """Leave curses, run the action's command in this terminal, come back. Returns a footer message."""
-        argv = dash_argv(action)
-        if argv is None:
-            return ""
-        c, msg = self.c, ""
+    @contextlib.contextmanager
+    def suspended(self):
+        """Leave curses for the block (a command runs in this terminal), then take the screen back."""
+        c = self.c
         c.def_prog_mode()
         c.endwin()
         # Ctrl-C belongs to the child while it runs. A Python handler (not SIG_IGN, which a child
         # would inherit) keeps it from interrupting us; exec resets it to the default in the child.
         old = signal.signal(signal.SIGINT, lambda *_: None)
-        env = {**os.environ, "AGENTBOX_NO_OSC": "1"}     # the dashboard keeps reporting this profile itself
-        rc = 0
         try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, old)
+            c.reset_prog_mode()
+            self.scr.clear()
+            with contextlib.suppress(c.error):
+                c.curs_set(0)
+
+    def suspend(self, action) -> str:
+        """Leave curses, run the action's command in this terminal, come back. Returns a footer message."""
+        argv = dash_argv(action)
+        if argv is None:
+            return ""
+        msg, rc = "", 0
+        env = {**os.environ, "AGENTBOX_NO_OSC": "1"}     # the dashboard keeps reporting this profile itself
+        with self.suspended():
             if action[0] == "logs":
                 rc, msg = self._logs(argv, env)
             else:
                 print(f"\n$ {shlex.join(['agentbox', *argv])}", flush=True)
                 rc = subprocess.run(agentbox_argv(argv), env=env).returncode
-        finally:
-            signal.signal(signal.SIGINT, old)
-        if action[0] != "logs" and rc != -signal.SIGINT:
-            try:
-                input(f"\n[agentbox {argv[0]} exited {rc}; press Enter to return to the dashboard] ")
-            except (EOFError, KeyboardInterrupt):
-                pass
-        c.reset_prog_mode()
-        self.scr.clear()
-        with contextlib.suppress(c.error):
-            c.curs_set(0)
+            if action[0] not in ("logs", "review") and rc != -signal.SIGINT:
+                try:
+                    input(f"\n[agentbox {argv[0]} exited {rc}; press Enter to return to the dashboard] ")
+                except (EOFError, KeyboardInterrupt):
+                    pass
         return msg or (f"agentbox {argv[0]} exited {rc}" if rc not in (0, -signal.SIGINT) else "")
 
     def _logs(self, argv: list[str], env: dict) -> tuple[int, str]:
@@ -4905,6 +4932,1418 @@ def dashboard_ui(collect, interval: float, rex: RexStatus) -> int:
         sys.stderr = real_err
         for rid in rex.ids():                   # nothing is watched any more
             rex.clear(rid)
+
+
+# ------------------------------------------------------------------- review
+# `agentbox review`: a pull-request page for clone mode. The items are the review branches `fetch` made
+# (refs/heads/review/<p> and review/<p>-*) and the history jobs whose branch is not fetched yet; the target is
+# the branch checked out in the profile's primary workspace. Git runs on the host with argv lists, never a
+# shell, never a pager or an external diff, and with -c options that pin the output format. Everything it
+# prints (file names, commit messages, diffs) and everything from the job (title, summary) is agent-written:
+# parsed as bytes where names are involved, and drawn only through dash_line (dash_clean). The UI only ever
+# runs `agentbox fetch`, `git merge --ff-only`, `git merge --no-ff --no-edit` (after typing "merge"),
+# `git merge --abort` (after a conflict), `git branch -d` (merged items only), `git difftool` for VS Code and
+# an interactive shell. It never rebases, resets, forces or pushes, and never runs a project script.
+REVIEW_STATUSES = {     # status: (glyph, ASCII glyph, style, label, sort group)
+    "ready": ("●", "*", "green", "ready", 0),
+    "not_fetched": ("↓", "v", "yellow", "not fetched", 0),
+    "diverged": ("≠", "!", "yellow", "diverged", 0),
+    "merged": ("✓", "+", "dim", "merged", 1),
+}
+REVIEW_FILE_LINES = 20000           # diff lines shown per file
+REVIEW_DIFF_BYTES = 64 << 20        # most bytes of one diff read from git
+REVIEW_LOG_MAX = 1000               # commits listed
+REVIEW_JOBS = 50                    # newest history jobs looked at for "not fetched"
+REVIEW_RENDER = ("--no-color", "--no-ext-diff", "--no-textconv")
+REVIEW_IN_PROGRESS = (("MERGE_HEAD", "a merge"), ("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or am"),
+                      ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert"))
+
+
+def review_git_argv(repo, *args) -> list[str]:
+    """git with the options that keep the owner's config from changing what is parsed: no pager, C-quoted
+    names in text output, a/ b/ prefixes in patches."""
+    return ["git", "--no-pager", "-c", "core.quotePath=true", "-c", "diff.noprefix=false", "-C", str(repo), *args]
+
+
+def rgit(repo, *args, timeout: float = 60, cap: int | None = None) -> subprocess.CompletedProcess:
+    """Run git for review; stdout and stderr are bytes. Never raises: a missing git is rc 127, a timeout 124.
+    `cap`: read at most that many bytes of stdout (then the process is killed)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    env |= {"LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_EDITOR": "true",
+            "GIT_PAGER": "cat"}
+    argv = review_git_argv(repo, *args)
+    try:
+        if cap is None:
+            return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL) as p:
+            out = p.stdout.read(cap + 1)
+            if len(out) > cap:
+                p.kill()
+            rc = p.wait(timeout=timeout)
+            return subprocess.CompletedProcess(argv, 0 if len(out) > cap else rc, out, b"")
+    except (OSError, ValueError):
+        return subprocess.CompletedProcess(argv, 127, b"", b"git not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, b"", b"git timed out")
+
+
+def _rtext(r) -> str:
+    return (r.stdout or b"").decode("utf-8", "replace").strip()
+
+
+def _rerr(r) -> str:
+    """git's last line of complaint, sanitised: for a footer or a message box."""
+    lines = [ln for ln in (r.stderr or r.stdout or b"").decode("utf-8", "replace").splitlines() if ln.strip()]
+    return dash_clean(lines[-1].strip()[:200]) if lines else f"exit {r.returncode}"
+
+
+def _ancestor(repo, a: str, b: str) -> bool:
+    return rgit(repo, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+def _rev(repo, rev: str) -> str | None:
+    return _commit(_rtext(rgit(repo, "rev-parse", "-q", "--verify", "--end-of-options", rev + "^{commit}")))
+
+
+def review_owner(branch: str, names) -> str | None:
+    """Which profile a review branch belongs to: review/<p> or review/<p>-<ref>, the longest profile name
+    that fits (review/a-b-x is a-b's, not a's)."""
+    fits = [n for n in names if branch == f"review/{n}" or branch.startswith(f"review/{n}-")]
+    return max(fits, key=len) if fits else None
+
+
+def review_target(repo) -> tuple[str | None, str | None]:
+    """(branch checked out in the workspace or None if detached, its tip or None)."""
+    r = rgit(repo, "symbolic-ref", "-q", "--short", "HEAD")
+    name = _rtext(r) if r.returncode == 0 else None
+    return (name if name and ref_name_ok(name) else None), _rev(repo, "HEAD")
+
+
+def review_status(repo, tip: str, head: str | None) -> tuple[str, int]:
+    """(status, commits on the branch that the target lacks) for a review branch at `tip`."""
+    if head is None:
+        n = _rtext(rgit(repo, "rev-list", "--count", tip, "--"))
+        return "ready", int(n) if n.isdigit() else 0
+    n = _rtext(rgit(repo, "rev-list", "--count", f"{head}..{tip}", "--"))
+    ahead = int(n) if n.isdigit() else 0
+    if ahead == 0 or _ancestor(repo, tip, head):
+        return "merged", 0
+    return ("ready" if _ancestor(repo, head, tip) else "diverged"), ahead
+
+
+def _epoch(v) -> float | None:
+    return iso_epoch(v) if isinstance(v, str) else None
+
+
+def review_profile(prof: Profile, names, states=_FETCH) -> dict:
+    """One clone-mode profile's review items (newest first) and their counts. Never raises."""
+    repo = prof.primary
+    out = {"name": prof.name, "workspace": str(repo), "target": None, "head": None, "vm": None, "items": [],
+           "counts": dict.fromkeys(REVIEW_STATUSES, 0), "error": None}
+    try:
+        out["vm"] = sandbox_state(prof, states) if prof.enabled else "disabled"
+    except (Exception, SystemExit):
+        out["vm"] = "unknown"
+    if rgit(repo, "rev-parse", "--git-dir").returncode != 0:
+        out["error"] = f"{repo} is not a git repository"
+        return out
+    target, head = review_target(repo)
+    out["target"], out["head"] = target, head
+    record_history(prof)
+    jobs = list(reversed(read_history(prof)))               # newest first
+    latest = job_record(prof).get("id")
+    r = rgit(repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(committerdate:unix)", "refs/heads/review/")
+    branches = {}
+    for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
+        ref, _, rest = line.partition("\0")
+        tip, _, when = rest.partition("\0")
+        short = ref.removeprefix("refs/heads/")
+        if ref.startswith("refs/heads/") and ref_name_ok(short) and _commit(tip) and review_owner(short, names) == prof.name:
+            branches[short] = (tip, int(when) if when.isdigit() else None)
+
+    def item(kind, branch, job, status, tip=None, ahead=0, when=None, ref=None):
+        return {"profile": prof.name, "kind": kind, "branch": branch, "ref": ref, "status": status, "tip": tip,
+                "ahead": ahead, "title": (job or {}).get("title"), "when": when, "job": job,
+                "latest": bool(job) and job.get("id") == latest, "target": target, "head": head,
+                "workspace": str(repo), "vm": out["vm"]}
+    items = []
+    for short, (tip, when) in branches.items():
+        mine = [j for j in jobs if fetch_defaults(prof.name, j)["branch"] == short]
+        job = next((j for j in mine if j.get("end_head") == tip), mine[0] if mine else None)
+        status, ahead = review_status(repo, tip, head)
+        items.append(item("branch", short, job, status, tip, ahead,
+                          _epoch((job or {}).get("finished_at")) or when, (job or {}).get("branch")))
+    seen = set()
+    for j in jobs[:REVIEW_JOBS]:
+        ref = job_branch(j.get("branch"))
+        if not ref or j.get("commits") == 0:
+            continue
+        rb = fetch_defaults(prof.name, j)["branch"]
+        if rb in seen or not ref_name_ok(rb):
+            continue
+        end = _commit(j.get("end_head"))
+        have = end and rgit(repo, "cat-file", "-e", f"{end}^{{commit}}").returncode == 0
+        if have and ((head and _ancestor(repo, end, head)) or (rb in branches and _ancestor(repo, end, branches[rb][0]))):
+            continue                        # fetched (and maybe merged since)
+        if not end and rb in branches:
+            continue
+        seen.add(rb)
+        items.append(item("job", rb, j, "not_fetched", end, j.get("commits") or 0,
+                          _epoch(j.get("finished_at")) or _epoch(j.get("started_at")), ref))
+    items.sort(key=lambda i: (REVIEW_STATUSES[i["status"]][4], -(i["when"] or 0), i["branch"]))
+    out["items"] = items
+    for i in items:
+        out["counts"][i["status"]] += 1
+    return out
+
+
+def review_collect(cfg: Config, name: str | None = None) -> dict:
+    """Every clone-mode profile (or just `name`): review_profile for each, with one shared sandbox listing."""
+    names = cfg.profile_names()
+    profs = []
+    for n in [name] if name else names:
+        try:
+            p = cfg.profile(n)
+        except SystemExit:
+            continue
+        if p.d["mode"] == "clone":
+            profs.append(p)
+    try:
+        states = sandbox_states(cfg) if profs else None     # only for `f`: is the sandbox up to fetch from
+    except SystemExit:
+        states = None
+    return {"generated_at": int(time.time()), "profiles": [review_profile(p, names, states) for p in profs]}
+
+
+def review_items(data: dict) -> list:
+    """All profiles' items in one list, the actionable ones first, newest first."""
+    items = [i for p in (data or {}).get("profiles") or [] for i in p.get("items") or []]
+    return sorted(items, key=lambda i: (REVIEW_STATUSES[i["status"]][4], -(i["when"] or 0), i["profile"], i["branch"]))
+
+
+def review_pending(counts: dict) -> int:
+    """How many items still need the owner: ready or not fetched (diverged ones are reported with ready)."""
+    return sum(counts.get(k, 0) for k in ("ready", "not_fetched", "diverged"))
+
+
+def review_public(data: dict) -> dict:
+    """`review --json`: the items and their statuses, no diff, no summary."""
+    keep = ("kind", "branch", "ref", "status", "tip", "ahead", "title", "when")
+    return {"generated_at": data["generated_at"], "profiles": [
+        {"name": p["name"], "workspace": p["workspace"], "target": p["target"], "head": p["head"], "vm": p["vm"],
+         "error": p["error"], "counts": p["counts"],
+         "items": [{k: i[k] for k in keep} | {"job": (i["job"] or {}).get("id")} for i in p["items"]]}
+        for p in data["profiles"]]}
+
+
+# -- git output parsers (bytes in, so a hostile file name cannot break a record apart)
+def _fsname(b: bytes) -> str:
+    return b.decode("utf-8", "surrogateescape")
+
+
+def parse_numstat_z(data: bytes) -> list[dict]:
+    """`git diff --numstat -z`: "<add>\\t<del>\\t<path>\\0", or for a rename or copy
+    "<add>\\t<del>\\t\\0<old>\\0<new>\\0". Binary files have "-" counts. Names may hold any byte but NUL."""
+    toks = (data or b"").split(b"\0")
+    out, i = [], 0
+    while i < len(toks):
+        tok = toks[i]
+        i += 1
+        if not tok.strip():
+            continue
+        parts = tok.split(b"\t", 2)
+        if len(parts) != 3:
+            continue
+        a, d, path = parts
+        old = None
+        if path == b"":
+            if i + 1 >= len(toks):
+                break
+            old, path = toks[i], toks[i + 1]
+            i += 2
+        binary = a == b"-" and d == b"-"
+        out.append({"path": _fsname(path), "old": _fsname(old) if old is not None else None,
+                    "add": None if binary else int(a) if a.isdigit() else 0,
+                    "del": None if binary else int(d) if d.isdigit() else 0, "binary": binary})
+    return out
+
+
+def parse_patch(data: bytes, max_lines: int = REVIEW_FILE_LINES) -> list[dict]:
+    """A unified diff (`git diff`/`git show`, -p) split per file: {"lines": [(kind, text)], "binary", "more"}.
+    kind: file (a header line), hunk, add, del, ctx, note. Header names in a patch are C-quoted by git, so a
+    file's section always starts at a line beginning "diff --git " (or "diff --cc "); no content line can.
+    At most max_lines content lines per file are kept; "more" counts the rest."""
+    files, cur, in_hunk = [], None, False
+    for raw in (data or b"").split(b"\n"):
+        if raw.startswith((b"diff --git ", b"diff --cc ", b"diff --combined ")):
+            cur, in_hunk = {"lines": [], "binary": False, "more": 0}, False
+            files.append(cur)
+        if cur is None:
+            continue
+        text = raw.decode("utf-8", "replace").expandtabs(4)
+        if raw.startswith(b"@@"):
+            in_hunk, kind = True, "hunk"
+        elif not in_hunk:
+            kind = "file"
+            if raw.startswith((b"Binary files ", b"GIT binary patch")):
+                cur["binary"] = True
+        elif raw.startswith(b"+"):
+            kind = "add"
+        elif raw.startswith(b"-"):
+            kind = "del"
+        elif raw.startswith(b"\\"):
+            kind = "note"
+        elif raw == b"":
+            continue                        # the end of the output, or between files
+        else:
+            kind = "ctx"
+        if kind in ("file",) or len(cur["lines"]) < max_lines:
+            cur["lines"].append((kind, text))
+        else:
+            cur["more"] += 1
+    return files
+
+
+def parse_log_z(data: bytes) -> list[dict]:
+    """`git log -z --format=%H%x1f%at%x1f%s`: one record per commit; the subject is last, so a 0x1f in it
+    stays in it."""
+    out = []
+    for rec in (data or b"").split(b"\0"):
+        rec = rec.strip(b"\n")
+        h, _, rest = rec.partition(b"\x1f")
+        at, _, subject = rest.partition(b"\x1f")
+        h = h.decode("ascii", "replace")
+        if _commit(h):
+            out.append({"hash": h, "time": int(at) if at.isdigit() else None,
+                        "subject": subject.decode("utf-8", "replace")})
+    return out
+
+
+def review_view(files: list[dict], patch: list[dict]) -> dict:
+    """What the Files and diff tab draws: the numstat file list, the patch flattened into lines, where each
+    file and each hunk starts."""
+    lines, starts, hunks = [], [], []
+    for f in patch:
+        starts.append(len(lines))
+        for kind, text in f["lines"]:
+            if kind == "hunk":
+                hunks.append(len(lines))
+            lines.append((kind, text))
+        if f["binary"]:
+            lines.append(("note", "binary"))
+        if f["more"]:
+            lines.append(("note", f"({f['more']} more lines; open in VS Code)"))
+    add = sum(f["add"] or 0 for f in files)
+    dele = sum(f["del"] or 0 for f in files)
+    return {"files": files, "lines": lines, "starts": starts, "hunks": hunks, "add": add, "del": dele}
+
+
+def review_detail(item: dict) -> dict:
+    """The commits and the merge-base diff (target...branch) of an item that has a branch. Never raises."""
+    empty = {"commits": [], "view": review_view([], []), "error": None, "base": None}
+    if item.get("kind") != "branch" or not _commit(item.get("tip")):
+        return empty
+    repo, tip, head = item["workspace"], item["tip"], item.get("head")
+    rng = f"{head}..{tip}" if head else tip
+    log = rgit(repo, "log", "--no-color", "--no-show-signature", f"--max-count={REVIEW_LOG_MAX}", "-z",
+               "--format=%H%x1f%at%x1f%s", rng, "--")
+    base = f"{head}...{tip}" if head else None
+    if base:
+        num = rgit(repo, "diff", *REVIEW_RENDER, "-M", "--numstat", "-z", base, "--")
+        pat = rgit(repo, "diff", *REVIEW_RENDER, "-M", base, "--", cap=REVIEW_DIFF_BYTES)
+    else:
+        num = rgit(repo, "show", *REVIEW_RENDER, "-M", "--format=", "--numstat", "-z", tip, "--")
+        pat = rgit(repo, "show", *REVIEW_RENDER, "-M", "--format=", "-p", tip, "--", cap=REVIEW_DIFF_BYTES)
+    err = next((f"git failed: {_rerr(r)}" for r in (log, num, pat) if r.returncode != 0), None)
+    return {"commits": parse_log_z(log.stdout), "view": review_view(parse_numstat_z(num.stdout), parse_patch(pat.stdout)),
+            "error": err, "base": base}
+
+
+def review_commit_view(item: dict, commit: str) -> dict:
+    """The diff of one commit (against its first parent), in review_view's shape."""
+    if not _commit(commit):
+        return review_view([], [])
+    repo = item["workspace"]
+    flags = (*REVIEW_RENDER, "-M", "--diff-merges=first-parent", "--format=")
+    num = rgit(repo, "show", *flags, "--numstat", "-z", commit, "--")
+    pat = rgit(repo, "show", *flags, "-p", commit, "--", cap=REVIEW_DIFF_BYTES)
+    return review_view(parse_numstat_z(num.stdout), parse_patch(pat.stdout))
+
+
+# -- the actions that change something
+def review_merge_argv(branch: str, ff: bool) -> list[str] | None:
+    """The only two merges review runs (git's arguments, after review_git_argv's)."""
+    if not ref_name_ok(branch):
+        return None
+    return ["merge", "--ff-only", "--", branch] if ff else ["merge", "--no-ff", "--no-edit", "--", branch]
+
+
+def review_delete_argv(branch: str) -> list[str] | None:
+    """Lower-case -d: git itself refuses a branch that is not merged."""
+    return ["branch", "-d", "--", branch] if ref_name_ok(branch) else None
+
+
+def review_in_progress(repo) -> str | None:
+    """"a merge" etc. if one is in progress in the workspace, else None."""
+    for name, what in REVIEW_IN_PROGRESS:
+        r = rgit(repo, "rev-parse", "--git-path", name)
+        p = Path(repo) / os.fsdecode(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+        if p is not None and p.exists():
+            return what
+    return None
+
+
+def review_merge_check(item: dict) -> dict:
+    """May the item be merged into its target now? {"ok", "reason", "ff", "count", "argv"}. Looks again at
+    the workspace, the target and the branch: the list may be older than what is on disk."""
+    no = lambda why: {"ok": False, "reason": why, "ff": False, "count": 0, "argv": None}
+    branch, repo = item.get("branch"), item.get("workspace")
+    if item.get("kind") != "branch" or item.get("status") not in ("ready", "diverged"):
+        return no(f"nothing to merge: {REVIEW_STATUSES.get(item.get('status'), ('',) * 4)[3] or 'unknown'}")
+    if not ref_name_ok(branch) or not repo:
+        return no("not a valid review branch")
+    target, head = review_target(repo)
+    if target is None:
+        return no(f"{repo} is on a detached HEAD: check out the branch to merge into first")
+    if head is None:
+        return no(f"{target} has no commits yet")
+    if target != item.get("target") or head != item.get("head"):
+        return no(f"the workspace is now on {target} at {head[:12]}: refresh (r) and look again")
+    tip = _rev(repo, f"refs/heads/{branch}")
+    if tip is None or tip != item.get("tip"):
+        return no(f"{branch} has moved since the list was read: refresh (r) and look again")
+    busy = review_in_progress(repo)
+    if busy:
+        return no(f"{busy} is in progress in {repo}: finish or abort it first")
+    st = rgit(repo, "status", "--porcelain=v1", "-z", "--untracked-files=no")
+    if st.returncode != 0:
+        return no(f"git status failed: {_rerr(st)}")
+    if st.stdout.strip(b"\0"):
+        n = len([x for x in st.stdout.split(b"\0") if x[:2].strip()])
+        return no(f"{repo} has uncommitted changes to tracked files ({n}): commit or stash them first")
+    n = _rtext(rgit(repo, "rev-list", "--count", f"{head}..{tip}", "--"))
+    count = int(n) if n.isdigit() else 0
+    if count == 0:
+        return no(f"{branch} is already in {target}")
+    ff = _ancestor(repo, head, tip)
+    return {"ok": True, "reason": "", "ff": ff, "count": count, "argv": review_merge_argv(branch, ff)}
+
+
+def review_merge(item: dict, ff: bool) -> dict:
+    """Merge the item into the target: `merge --ff-only` (ff) or `merge --no-ff --no-edit`, after checking
+    again. A conflicted merge is aborted at once (`merge --abort`). {"ok", "msg", "lines"}."""
+    chk = review_merge_check(item)
+    if not chk["ok"]:
+        return {"ok": False, "msg": chk["reason"], "lines": []}
+    if chk["ff"] != ff:
+        return {"ok": False, "msg": "the branch or the target changed: refresh (r) and look again", "lines": []}
+    repo = item["workspace"]
+    r = rgit(repo, *chk["argv"], timeout=300)
+    if r.returncode == 0:
+        tip = _rev(repo, "HEAD") or "?"
+        subj = _rtext(rgit(repo, "log", "--no-color", "--no-show-signature", "-1", "--format=%s", tip, "--"))
+        return {"ok": True, "msg": f"merged; t opens a shell to run install/tests",
+                "lines": [f"{item['target']} is now at {tip[:12]}", subj]}
+    if not ff and review_in_progress(repo) == "a merge":
+        un = rgit(repo, "diff", "--name-only", "-z", "--diff-filter=U")
+        files = [_fsname(x) for x in un.stdout.split(b"\0") if x]
+        ab_ = rgit(repo, "merge", "--abort")
+        lines = ["conflicts in:"] + [f"  {f}" for f in files[:30]] + ([f"  ... {len(files) - 30} more"] if len(files) > 30 else [])
+        lines.append("the merge was aborted (git merge --abort)" if ab_.returncode == 0
+                     else f"git merge --abort failed: {_rerr(ab_)}; run it yourself")
+        return {"ok": False, "msg": f"merge conflict in {len(files)} file(s): aborted", "lines": lines}
+    return {"ok": False, "msg": f"git merge failed: {_rerr(r)}", "lines": []}
+
+
+def review_delete(item: dict) -> dict:
+    """`git branch -d` for a merged item, after checking it is still merged into the target."""
+    branch, repo = item.get("branch"), item.get("workspace")
+    argv = review_delete_argv(branch) if item.get("kind") == "branch" and item.get("status") == "merged" else None
+    if argv is None:
+        return {"ok": False, "msg": "only merged review branches are deleted"}
+    tip, head = _rev(repo, f"refs/heads/{branch}"), _rev(repo, "HEAD")
+    if not tip or not head or not _ancestor(repo, tip, head):
+        return {"ok": False, "msg": f"{branch} is no longer merged into the checked-out branch: refresh (r)"}
+    r = rgit(repo, *argv)
+    return {"ok": r.returncode == 0, "msg": f"deleted {branch}" if r.returncode == 0 else f"git branch -d failed: {_rerr(r)}"}
+
+
+def review_fetch_argv(item: dict) -> list[str] | None:
+    """agentbox's arguments for `f`: `fetch <p>` for the profile's latest job (fetch picks its branch itself),
+    else the job's branch and review branch spelled out."""
+    p, ref, rb = item.get("profile"), job_branch(item.get("ref")), item.get("branch")
+    if item.get("status") != "not_fetched" or not isinstance(p, str) or not NAME_RE.match(p) or not ref \
+            or not ref_name_ok(rb):
+        return None
+    return ["fetch", p] if item.get("latest") else ["fetch", p, "--ref", ref, "--branch", rb]
+
+
+def review_code_argv(code: str, item: dict) -> list[str] | None:
+    """VS Code on the item's diff, one file at a time: `git difftool` with `code --wait --diff` on temporary
+    copies (outside the repo; git removes them). None if there is no branch to show."""
+    if item.get("kind") != "branch" or not _commit(item.get("tip")) or not _commit(item.get("head")) or not code:
+        return None
+    return review_git_argv(item["workspace"], "difftool", "--no-prompt", "--no-symlinks",
+                           f"--extcmd={shlex.quote(code)} --wait --diff", f"{item['head']}...{item['tip']}", "--")
+
+
+def login_shell() -> str:
+    try:
+        import pwd
+        sh = pwd.getpwuid(os.getuid()).pw_shell
+    except (ImportError, KeyError, OSError):
+        sh = ""
+    return sh if _executable(sh) else (os.environ.get("SHELL") if _executable(os.environ.get("SHELL")) else "/bin/sh")
+
+
+def rex_shell_argv(rex: str, workspace: str, profile: str, shell: str) -> list[str] | None:
+    """`t` inside Rex: an interactive shell in a new tab, in the profile's primary workspace."""
+    if not rex or not NAME_RE.match(profile or "") or not os.path.isabs(workspace or "") or not _executable(shell):
+        return None
+    return [rex, "run", "--shell=none", "--cwd", workspace, "--label", f"{profile} shell", "--", shell, "-i"]
+
+
+def review_title(item: dict | None, profile: str | None = None) -> str:
+    """The terminal title (OSC 2) while reviewing: "review: <profile>/<branch>", or "review: <profile>"."""
+    if item:
+        text = f"review: {item.get('profile')}/{item.get('branch')}"
+    else:
+        text = f"review: {profile}" if profile else "review"
+    text = dash_clean(text)[:120]
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+
+
+def osc_title(text: str) -> str:
+    return "\x1b]2;" + "".join(ch for ch in text if unicodedata.category(ch)[0] != "C") + "\x1b\\"
+
+
+TITLE_PUSH, TITLE_POP = "\x1b[22;0t", "\x1b[23;0t"      # xterm's title stack: save, restore
+
+
+def review_rex_fields(n: int) -> dict | None:
+    """The `review` record: idle with how many items wait for the owner; None (clear it) when none do.
+    Never blocked, done or error: Rex would notify about a screen that is just open."""
+    return {"state": "idle", "msg": f"{n} to review"} if n > 0 else None
+
+
+def review_rex(rex: RexStatus, n: int):
+    fields = review_rex_fields(n)
+    if fields:
+        rex.report(fields, "review")
+    else:
+        rex.clear("review")
+
+
+def dash_review_note(counts: dict | None, commits: int | None) -> str:
+    """The dashboard's line for a profile with something to review."""
+    if not counts:
+        return ""
+    ready, nf = counts.get("ready", 0) + counts.get("diverged", 0), counts.get("not_fetched", 0)
+    if not ready and not nf:
+        return ""
+    parts = []
+    if commits:
+        parts.append(f"{commits} commit{'s' if commits != 1 else ''} ready to review")
+    elif ready:
+        parts.append(f"{ready} branch{'es' if ready != 1 else ''} ready to review")
+    if nf:
+        parts.append(f"{nf} not fetched")
+    return " · ".join(parts) + "  (v reviews)"
+
+
+def review_summary(cfg: Config, prof: Profile, states=_FETCH) -> dict | None:
+    """For the dashboard: {"counts", "commits"} of a clone-mode profile, or None. Never raises."""
+    if prof.d["mode"] != "clone":
+        return None
+    try:
+        p = review_profile(prof, cfg.profile_names(), states)
+    except (Exception, SystemExit):
+        return None
+    if p["error"]:
+        return None
+    commits = sum(i["ahead"] or 0 for i in p["items"] if i["status"] in ("ready", "diverged", "not_fetched"))
+    return {"counts": p["counts"], "commits": commits}
+
+
+# -- the full-screen UI. Plain functions over plain data (the items, a UI-state dict, the loaded diff), as for
+# the dashboard: review_key turns a key into a new state and maybe an action, review_render draws lines of
+# (text, style) segments. Only ReviewScreen touches curses, git and subprocesses.
+REVIEW_MIN_W, REVIEW_MIN_H, REVIEW_WIDE, REVIEW_FILES_SIDE = 60, 15, 100, 120
+REVIEW_TABS = ("Overview", "Commits", "Files and diff")
+REVIEW_STYLE = {"file": "bold", "hunk": "cyan", "add": "green", "del": "red", "ctx": "", "note": "dim"}
+REVIEW_TYPED_MAX = 64
+REVIEW_HELP = [("↑ ↓  j k", "select an item, or scroll the tab (← → or a click: list / tab)"),
+               ("Tab  1 2 3", "Overview, Commits, Files and diff"),
+               ("PgUp PgDn", "page; Home End: first / last"), ("Enter", "on a commit: its diff in the Files tab"),
+               ("a", "back to the whole diff"), ("n  N", "next / previous file"), ("]  [", "next / previous hunk"),
+               ("/", "search the diff (Enter on an empty search repeats it)"), ("w", "wrap long lines"),
+               ("f", "fetch a job's branch: agentbox fetch (asks first)"),
+               ("m", "merge into the target (asks first; never rebases, resets, forces or pushes)"),
+               ("d", "delete a merged review branch: git branch -d (asks first)"),
+               ("o", "the diff in VS Code (git difftool, one file at a time)"),
+               ("t", "a shell in the workspace, to run your install or tests"),
+               ("r", "refresh"), ("?", "this help"), ("q  Ctrl-C", "quit")]
+
+
+def review_key_of(item: dict | None):
+    return None if not item else (item.get("profile"), item.get("kind"), item.get("branch"), (item.get("job") or {}).get("id"))
+
+
+def review_new_ui(size=(80, 24), tab: bool = False) -> dict:
+    """The UI state. `items` the list, `sel`/`top` its selection and scroll, `tab` 0-2, `focus` list | pane,
+    per-item scrolls (`otop` overview, `csel`/`ctop` commits, `ftop` file list, `dtop` diff), `source` None (the
+    target...branch diff) or a commit id, `mode` list | help | box | fetch | nofetch | merge | mergetyped |
+    delete | search, `target` the item a question is about, `check` its review_merge_check, `typed` text typed
+    so far, `query` the last search. `tab_ok`: `t` opens a Rex tab."""
+    return {"items": [], "sel": 0, "top": 0, "size": tuple(size), "tab": 0, "focus": "list", "otop": 0, "csel": 0,
+            "ctop": 0, "ftop": 0, "dtop": 0, "source": None, "wrap": False, "mode": "list", "target": None,
+            "check": None, "typed": "", "query": "", "msg": "", "box": None, "busy": False, "error": "",
+            "tab_ok": tab}
+
+
+def review_layout(width: int, height: int, n: int) -> dict | None:
+    """Rects (x, y, w, h) for the item list and the pane; None if too small. Row 0 header, last row footer."""
+    if width < REVIEW_MIN_W or height < REVIEW_MIN_H:
+        return None
+    body = height - 2
+    if width >= REVIEW_WIDE:
+        lw = max(30, min(48, width // 3))
+        return {"stacked": False, "list": (0, 1, lw, body), "pane": (lw + 1, 1, width - lw - 1, body)}
+    lh = max(4, min(2 * max(n, 1), body // 3))
+    return {"stacked": True, "list": (0, 1, width, lh), "pane": (0, lh + 2, width, body - lh - 1)}
+
+
+def review_rects(rv: dict, nfiles: int) -> dict | None:
+    """review_layout plus the pane's parts: the tab bar, the content and, for the diff tab, the file list
+    and the diff."""
+    lay = review_layout(*rv["size"], len(rv["items"]))
+    if lay is None:
+        return None
+    px, py, pw, ph = lay["pane"]
+    cx, cy, cw, ch = px, py + 1, pw, ph - 1
+    if cw >= REVIEW_FILES_SIDE:
+        fw = min(44, cw // 3)
+        files, diff, side = (cx, cy, fw, ch), (cx + fw + 1, cy, cw - fw - 1, ch), True
+    else:
+        fh = max(1, min(max(nfiles, 1), max(3, ch // 4)))
+        files, diff, side = (cx, cy, cw, fh), (cx, cy + fh + 1, cw, max(1, ch - fh - 1)), False
+    return lay | {"tabs": (px, py, pw, 1), "content": (cx, cy, cw, ch), "files": files, "diff": diff, "side": side}
+
+
+def review_tab_labels(counts: tuple | None = None) -> list[str]:
+    """The tab bar's labels; counts = (commits, files) once the item's detail is loaded."""
+    extra = ("", f" ({counts[0]})", f" ({counts[1]})") if counts else ("", "", "")
+    return [f" {i + 1} {name}{extra[i]} " for i, name in enumerate(REVIEW_TABS)]
+
+
+def review_tab_spans(labels: list[str]) -> list:
+    """(x0, x1) of each label in the tab bar, relative to the pane: one space before the first, one between."""
+    spans, x = [], 1
+    for lb in labels:
+        spans.append((x, x + len(lb)))
+        x += len(lb) + 1
+    return spans
+
+
+def review_set_items(rv: dict, items: list) -> dict:
+    """New data: keep the same item selected if it is still listed."""
+    old = review_key_of(rv["items"][rv["sel"]]) if rv["items"] else None
+    keys = [review_key_of(i) for i in items]
+    if old in keys:
+        sel = keys.index(old)
+        return _rv_follow({**rv, "items": list(items), "sel": sel}, sel, keep=True)
+    return _rv_follow({**rv, "items": list(items)}, min(rv["sel"], max(0, len(items) - 1)))
+
+
+def _rv_item_reset(rv: dict) -> dict:
+    return {**rv, "otop": 0, "csel": 0, "ctop": 0, "ftop": 0, "dtop": 0, "source": None}
+
+
+def _rv_follow(rv: dict, sel: int, keep: bool = False) -> dict:
+    """Select item `sel` and scroll the list to it (two rows per item). A new item starts at the top of
+    every tab."""
+    n = len(rv["items"])
+    sel = max(0, min(sel, n - 1)) if n else 0
+    lay = review_layout(*rv["size"], n)
+    top = rv["top"]
+    if lay:
+        vis = max(1, lay["list"][3] // 2)
+        top = min(top, sel) if sel < top else max(top, sel - vis + 1)
+        top = max(0, min(top, max(0, n - vis)))
+    out = {**rv, "sel": sel, "top": top}
+    return out if keep or sel == rv["sel"] else _rv_item_reset(out)
+
+
+def _cur_file(starts: list, dtop: int) -> int:
+    i = 0
+    for k, s in enumerate(starts):
+        if s <= dtop:
+            i = k
+    return i
+
+
+def _rv_diff_to(rv: dict, dtop: int, view: dict, rects) -> dict:
+    """Scroll the diff to line dtop and keep the file it is in visible in the file list."""
+    lines = len(view.get("lines") or [])
+    dh = rects["diff"][3] if rects else 10
+    dtop = max(0, min(dtop, max(0, lines - 1)))
+    rv = {**rv, "dtop": dtop}
+    if rects and view.get("starts"):
+        cur, fh = _cur_file(view["starts"], dtop), max(1, rects["files"][3])
+        ftop = rv["ftop"]
+        ftop = cur if cur < ftop else (cur - fh + 1 if cur >= ftop + fh else ftop)
+        rv["ftop"] = max(0, ftop)
+    return rv if lines > dh or dtop <= max(0, lines - dh) else {**rv, "dtop": max(0, lines - dh)}
+
+
+def review_search(lines: list, query: str, start: int, back: bool = False) -> int | None:
+    """Index of the next line (after `start`, wrapping) whose text contains query, case-insensitively."""
+    q = query.lower()
+    n = len(lines)
+    if not q or not n:
+        return None
+    order = [(start - k) % n for k in range(1, n + 1)] if back else [(start + k) % n for k in range(1, n + 1)]
+    return next((i for i in order if q in dash_clean(lines[i][1]).lower()), None)
+
+
+def review_merge_prompt(rv: dict, item: dict, chk: dict) -> dict:
+    """After `m`: the y/N question for a fast-forward, the typed one for a merge commit, or the refusal."""
+    if not chk.get("ok"):
+        return {**rv, "mode": "box", "box": ("merge refused", [chk.get("reason") or "refused"]), "msg": "merge refused"}
+    return {**rv, "mode": "merge" if chk["ff"] else "mergetyped", "target": item, "check": chk, "typed": ""}
+
+
+def _rv_typed(rv: dict, key) -> tuple[dict, str | None]:
+    """Typing into a question: (new state, "enter" | "cancel" | None)."""
+    typed = rv.get("typed", "")
+    if key == "enter":
+        return rv, "enter"
+    if key in ("esc", "ctrl-c"):
+        return rv, "cancel"
+    if key == "backspace":
+        return {**rv, "typed": typed[:-1]}, None
+    if isinstance(key, str) and len(key) == 1 and unicodedata.category(key)[0] != "C" and len(typed) < REVIEW_TYPED_MAX:
+        return {**rv, "typed": typed + key}, None
+    return rv, None
+
+
+def review_key(rv: dict, key, ctx: dict | None = None) -> tuple[dict, tuple | None]:
+    """(UI state, key, what is loaded) -> (new state, action or None). ctx: {"commits": [...], "view": the diff
+    shown}. Keys as for dash_key, plus "left", "right", "tab", "btab". Actions: ("quit",), ("refresh",),
+    ("redraw",), ("merge_check", item) (the loop checks the workspace, then calls review_merge_prompt),
+    ("code", item), ("shell", item), and only after a question was answered: ("fetch", item) after y,
+    ("merge", item, True) after y to a fast-forward, ("merge", item, False) after typing "merge" for a merge
+    commit, ("delete", item) after y to a merged item."""
+    ctx = ctx or {}
+    view = ctx.get("view") or {}
+    commits = ctx.get("commits") or []
+    rv = {**rv, "msg": ""}
+    items, mode = rv["items"], rv["mode"]
+    n = len(items)
+    item = items[rv["sel"]] if n else None
+    if key == "resize":
+        return _rv_follow(rv, rv["sel"], keep=True), ("redraw",)
+    if mode in ("fetch", "merge", "delete"):
+        target, done = rv["target"], {**rv, "mode": "list", "target": None, "check": None}
+        if key in ("y", "Y") and target:
+            return done, {"fetch": ("fetch", target), "merge": ("merge", target, True), "delete": ("delete", target)}[mode]
+        return {**done, "msg": f"{mode} cancelled"}, None
+    if mode == "mergetyped":
+        rv, how = _rv_typed(rv, key)
+        done = {**rv, "mode": "list", "target": None, "check": None, "typed": ""}
+        if how == "enter":
+            if rv["typed"] == "merge" and rv["target"]:
+                return done, ("merge", rv["target"], False)
+            return {**done, "msg": "merge cancelled: type merge to make a merge commit"}, None
+        if how == "cancel":
+            return {**done, "msg": "merge cancelled"}, None
+        return rv, None
+    rects = review_rects(rv, len(view.get("files") or []))
+    if mode == "search":
+        rv, how = _rv_typed(rv, key)
+        if how == "cancel":
+            return {**rv, "mode": "list", "typed": ""}, None
+        if how != "enter":
+            return rv, None
+        q = rv["typed"] or rv["query"]
+        rv = {**rv, "mode": "list", "typed": "", "query": q}
+        hit = review_search(view.get("lines") or [], q, rv["dtop"])
+        if hit is None:
+            return {**rv, "msg": f"not found: {q}" if q else ""}, None
+        return {**_rv_diff_to(rv, hit, view, rects), "msg": f"/{q}"}, None
+    if mode in ("help", "box", "nofetch"):
+        return {**rv, "mode": "list", "target": None, "box": None}, ("quit",) if key in ("q", "ctrl-c") else None
+    if key in ("q", "Q", "ctrl-c"):
+        return rv, ("quit",)
+    if key == "r":
+        return rv, ("refresh",)
+    if key == "?":
+        return {**rv, "mode": "help"}, None
+    if key in ("tab", "btab"):
+        return {**rv, "tab": (rv["tab"] + (1 if key == "tab" else -1)) % 3, "focus": "pane"}, None
+    if key in ("1", "2", "3"):
+        return {**rv, "tab": int(key) - 1, "focus": "pane"}, None
+    if key in ("left", "h", "esc"):
+        return {**rv, "focus": "list"}, None
+    if key in ("right", "l"):
+        return {**rv, "focus": "pane"}, None
+    if key == "w":
+        return {**rv, "wrap": not rv["wrap"], "msg": "wrap on" if not rv["wrap"] else "wrap off"}, None
+    if isinstance(key, tuple):
+        return _rv_mouse(rv, key, rects, view, commits, ctx.get("detail"))
+    moves = {"up": -1, "k": -1, "down": 1, "j": 1}
+    lay_list = rects["list"][3] // 2 if rects else 1
+    if rv["focus"] == "list" or not item:
+        page = {"pgup": -lay_list, "pgdn": lay_list}
+        if key in moves or key in page:
+            return _rv_follow(rv, rv["sel"] + {**moves, **page}[key]), None
+        if key in ("home", "g"):
+            return _rv_follow(rv, 0), None
+        if key in ("end", "G"):
+            return _rv_follow(rv, n - 1), None
+        if key == "enter" and item:
+            return {**rv, "focus": "pane"}, None
+    else:
+        ch = rects["content"][3] if rects else 10
+        if rv["tab"] == 0:
+            step = {**moves, "pgup": -ch, "pgdn": ch, "home": -10 ** 9, "g": -10 ** 9, "end": 10 ** 9, "G": 10 ** 9}
+            if key in step:
+                return {**rv, "otop": max(0, rv["otop"] + step[key])}, None
+        elif rv["tab"] == 1:
+            step = {**moves, "pgup": -ch, "pgdn": ch, "home": -10 ** 9, "g": -10 ** 9, "end": 10 ** 9, "G": 10 ** 9}
+            if key in step:
+                csel = max(0, min(rv["csel"] + step[key], len(commits) - 1))
+                ctop = min(rv["ctop"], csel) if csel < rv["ctop"] else max(rv["ctop"], csel - ch + 1)
+                return {**rv, "csel": csel, "ctop": max(0, ctop)}, None
+            if key == "enter" and commits:
+                c = commits[max(0, min(rv["csel"], len(commits) - 1))]
+                return {**rv, "tab": 2, "source": c["hash"], "dtop": 0, "ftop": 0,
+                        "msg": f"commit {c['hash'][:9]}: a shows the whole diff again"}, None
+        else:
+            dh = rects["diff"][3] if rects else 10
+            step = {**moves, "pgup": -dh, "pgdn": dh, "home": -10 ** 9, "g": -10 ** 9, "end": 10 ** 9, "G": 10 ** 9}
+            if key in step:
+                return _rv_diff_to(rv, rv["dtop"] + step[key], view, rects), None
+    if key in ("n", "N", "]", "["):
+        if rv["tab"] != 2:
+            return {**rv, "tab": 2, "focus": "pane"}, None
+        starts, hunks, d = view.get("starts") or [], view.get("hunks") or [], rv["dtop"]
+        if key == "n":
+            nxt = next((s for s in starts if s > d), None)
+        elif key == "N":
+            nxt = next((s for s in reversed(starts) if s < d), None)
+        elif key == "]":
+            nxt = next((s for s in hunks if s > d), None)
+        else:
+            nxt = next((s for s in reversed(hunks) if s < d), None)
+        if nxt is None:
+            return {**rv, "msg": "no more files" if key in "nN" else "no more hunks"}, None
+        return _rv_diff_to({**rv, "focus": "pane"}, nxt, view, rects), None
+    if key == "/":
+        return {**rv, "tab": 2, "focus": "pane", "mode": "search", "typed": ""}, None
+    if key == "a":
+        return ({**rv, "source": None, "dtop": 0, "ftop": 0, "msg": "the whole diff"}, None) if rv["source"] else (rv, None)
+    if item is None:
+        return rv, None
+    st = item.get("status")
+    if key == "f":
+        if st != "not_fetched":
+            return {**rv, "msg": "f fetches items that are not fetched yet"}, None
+        if review_fetch_argv(item) is None:
+            return {**rv, "msg": "this job's branch cannot be fetched from here"}, None
+        if item.get("vm") in ("stopped", "missing"):
+            return {**rv, "mode": "nofetch", "target": item}, None
+        return {**rv, "mode": "fetch", "target": item}, None
+    if key == "m":
+        if st not in ("ready", "diverged"):
+            return {**rv, "msg": f"nothing to merge: this item is {REVIEW_STATUSES[st][3]}"}, None
+        return rv, ("merge_check", item)
+    if key == "d":
+        if st != "merged":
+            return {**rv, "msg": "d deletes merged review branches only"}, None
+        return {**rv, "mode": "delete", "target": item}, None
+    if key == "o":
+        if item.get("kind") != "branch":
+            return {**rv, "msg": "fetch it first (f): there is no branch to open yet"}, None
+        return rv, ("code", item)
+    if key == "t":
+        return rv, ("shell", item)
+    return rv, None
+
+
+def _rv_mouse(rv: dict, key, rects, view: dict, commits: list, ctx_detail=None) -> tuple[dict, tuple | None]:
+    if not rects:
+        return rv, None
+    kind, *rest = key
+    n = len(rv["items"])
+    if kind == "click":
+        x, y = rest
+        lx, ly, lw, lh = rects["list"]
+        if _inside(rects["list"], x, y):
+            i = rv["top"] + (y - ly) // 2
+            return (_rv_follow({**rv, "focus": "list"}, i), None) if i < n else ({**rv, "focus": "list"}, None)
+        if _inside(rects["tabs"], x, y):
+            counts = (len(commits), len(view.get("files") or [])) if ctx_detail else None
+            for i, (a, b) in enumerate(review_tab_spans(review_tab_labels(counts))):
+                if a <= x - rects["tabs"][0] < b:
+                    return {**rv, "tab": i, "focus": "pane"}, None
+            return rv, None
+        if rv["tab"] == 2 and _inside(rects["files"], x, y):
+            i = rv["ftop"] + y - rects["files"][1]
+            starts = view.get("starts") or []
+            if i < len(starts):
+                return _rv_diff_to({**rv, "focus": "pane"}, starts[i], view, rects) | {"ftop": rv["ftop"]}, None
+            return {**rv, "focus": "pane"}, None
+        if rv["tab"] == 1 and _inside(rects["content"], x, y):
+            i = rv["ctop"] + y - rects["content"][1]
+            return ({**rv, "csel": i, "focus": "pane"} if i < len(commits) else {**rv, "focus": "pane"}), None
+        if _inside(rects["pane"], x, y):
+            return {**rv, "focus": "pane"}, None
+        return rv, None
+    if kind == "wheel":
+        step, x, y = rest
+        if _inside(rects["list"], x, y):
+            vis = max(1, rects["list"][3] // 2)
+            return {**rv, "top": max(0, min(rv["top"] + step, max(0, n - vis)))}, None
+        if rv["tab"] == 2 and _inside(rects["files"], x, y):
+            nf = len(view.get("files") or [])
+            return {**rv, "ftop": max(0, min(rv["ftop"] + step, max(0, nf - rects["files"][3])))}, None
+        if rv["tab"] == 2 and _inside(rects["pane"], x, y):
+            return {**rv, "dtop": max(0, min(rv["dtop"] + 3 * step, max(0, len(view.get("lines") or []) - rects["diff"][3])))}, None
+        if rv["tab"] == 1 and _inside(rects["pane"], x, y):
+            ch = rects["content"][3]
+            return {**rv, "ctop": max(0, min(rv["ctop"] + 3 * step, max(0, len(commits) - ch)))}, None
+        if _inside(rects["pane"], x, y):
+            return {**rv, "otop": max(0, rv["otop"] + 3 * step)}, None
+    return rv, None
+
+
+def _review_when(t, now: float) -> str:
+    if not isinstance(t, (int, float)):
+        return ""
+    age = max(0, now - t)
+    return f"{fmt_dur(age)} ago" if age < 86400 else time.strftime("%b %d", time.localtime(t))
+
+
+def review_list(rv: dict, w: int, h: int, now: float, ascii_: bool) -> list:
+    out = []
+    items = rv["items"]
+    for i in range(rv["top"], min(len(items), rv["top"] + h // 2)):
+        it = items[i]
+        g, ga, style, label, _ = REVIEW_STATUSES[it["status"]]
+        sel = "sel" if i == rv["sel"] else ""
+        if sel and rv["focus"] != "list":
+            sel = "sel dim"
+        right = f" {label} "
+        nw = max(1, w - 4 - len(right))
+        name, used = _clip(dash_clean(f"{it['profile']}/{it['branch']}"), nw)
+        out.append(dash_line([(" ", sel), (ga if ascii_ else g, f"{style} {sel}".strip()), (" ", sel),
+                              (name, f"bold {sel}".strip()), (" " * (nw - used + 1), sel),
+                              (right, f"{style} {sel}".strip())], w, ascii_))
+        when = _review_when(it.get("when"), now)
+        title = dash_clean(it.get("title") or ("(no job recorded)" if not it.get("job") else "(no title)"))
+        tw = max(1, w - 4 - len(when) - 1)
+        t, used = _clip(title, tw)
+        out.append(dash_line([("   ", sel), (t, f"dim {sel}".strip()), (" " * (tw - used + 1), sel),
+                              (when, f"dim {sel}".strip())], w, ascii_))
+    return out
+
+
+def _fmt_cost(v) -> str:
+    return f"${v:.2f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else "-"
+
+
+def _wrap_cells(text: str, width: int) -> list[str]:
+    """Clean text, wrapped at words to `width` cells (a word wider than that is cut into pieces)."""
+    out = []
+    for para in ("" if text is None else str(text)).split("\n"):
+        line = dash_clean(para)
+        if not line.strip():
+            out.append("")
+            continue
+        words, cur = line.split(" "), ""
+        for wd in words:
+            cand = f"{cur} {wd}" if cur else wd
+            if dash_cells(cand) <= width:
+                cur = cand
+                continue
+            if cur:
+                out.append(cur)
+            while dash_cells(wd) > width:
+                part, _ = _clip(wd, width)
+                out.append(part)
+                wd = wd[len(part):]
+            cur = wd
+        out.append(cur)
+    return out
+
+
+def review_overview(item: dict, detail: dict | None, w: int, now: float, ascii_: bool = False) -> list:
+    """Unclipped segment lists for the Overview tab."""
+    job = item.get("job") or {}
+    g, _, style, label, _ = REVIEW_STATUSES[item["status"]]
+    L = [[(item.get("title") or ("(no job recorded for this branch)" if not job else "(no title)"), "bold")],
+         [(label, style), ("   ", ""), (f"{item['profile']}/{item['branch']}", "")]]
+    if job:
+        start, end = _epoch(job.get("started_at")), _epoch(job.get("finished_at"))
+        dur = fmt_dur(end - start, True) if start and end and end >= start else "-"
+        code = job.get("exit_code")
+        L += [[], [("job       ", "dim"), (job.get("id") or "-", "")],
+              [("started   ", "dim"), (_dash_clock(job.get("started_at"), now), ""), ("   duration ", "dim"), (dur, ""),
+               ("   exit ", "dim"), (str(code) if isinstance(code, int) else job.get("state") or "-",
+                                       "red" if isinstance(code, int) and code else "")],
+              [("cost      ", "dim"), (_fmt_cost(job.get("cost_usd")), ""), ("   turns ", "dim"), (_dash_count(job.get("turns")), ""),
+               ("   tool calls ", "dim"), (_dash_count(job.get("tool_calls")), ""),
+               ("   denials ", "dim"), (_dash_count(job.get("denials")), "yellow" if job.get("denials") else "")]]
+    L.append([("branch    ", "dim"), (item.get("branch") or "-", "bold")]
+             + ([("  from ", "dim"), (item["ref"], "")] if item.get("ref") else [])
+             + ([("  tip ", "dim"), (item["tip"][:12], "")] if _commit(item.get("tip")) else []))
+    L.append([("target    ", "dim"), (item.get("target") or "(detached HEAD)", "bold")]
+             + ([("  at ", "dim"), (item["head"][:12], "")] if _commit(item.get("head")) else [])
+             + [("  in ", "dim"), (item.get("workspace") or "", "dim")])
+    L.append([])
+    if item["kind"] == "branch" and detail:
+        v = detail["view"]
+        nc, nf = len(detail["commits"]), len(v["files"])
+        L.append([(f"{nc}{'+' if nc >= REVIEW_LOG_MAX else ''} commit{'s' if nc != 1 else ''}, "
+                   f"{nf} file{'s' if nf != 1 else ''} changed, ", "bold"),
+                  (f"+{v['add']}", "green"), (" ", ""), (f"{'-' if ascii_ else '−'}{v['del']}", "red")])
+        if detail.get("error"):
+            L.append([(detail["error"], "red")])
+    elif item["kind"] == "job":
+        n = job.get("commits")
+        L.append([(f"{n} commit{'s' if n != 1 else ''} in the job; " if isinstance(n, int) else "", "bold"),
+                  ("not fetched yet: f runs agentbox fetch", "yellow")])
+    if item["status"] == "diverged":
+        L.append([("the target has moved on: a fast-forward is not possible (m offers a merge commit)", "yellow")])
+    L += [[], [("the agent's own summary, not verified", "dim")]]
+    summary = job.get("summary")
+    if summary:
+        L += [[(ln, "")] for ln in _wrap_cells(summary, max(10, w))]
+    else:
+        L.append([("(no summary recorded)", "dim")])
+    return L
+
+
+def review_commit_lines(commits: list, rv: dict, w: int, h: int, focus: bool, now: float) -> list:
+    out = []
+    if not commits:
+        return [dash_line([(" no commits", "dim")], w)]
+    for i in range(rv["ctop"], min(len(commits), rv["ctop"] + h)):
+        c = commits[i]
+        sel = ("sel" if focus else "sel dim") if i == rv["csel"] else ""
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["time"])) if c.get("time") else ""
+        sw = max(1, w - 12 - len(when) - 1)
+        s, used = _clip(dash_clean(c["subject"]), sw)
+        out.append(dash_line([(" ", sel), (c["hash"][:9], f"yellow {sel}".strip()), ("  ", sel), (s, sel),
+                              (" " * (sw - used), sel), (when + " ", f"dim {sel}".strip())], w))
+    return out
+
+
+def _review_hit(text: str, query: str, style: str) -> list:
+    """Segments of text with each occurrence of query (case-insensitive) reversed."""
+    out, low, q, i = [], text.lower(), query.lower(), 0
+    if not q or len(low) != len(text):          # lower() changed the length (e.g. "İ"): no highlight
+        return [(text, style)]
+    while True:
+        j = low.find(q, i)
+        if j < 0:
+            out.append((text[i:], style))
+            return [s for s in out if s[0]]
+        out += [(text[i:j], style), (text[j:j + len(q)], f"{style} sel".strip())]
+        i = j + len(q)
+
+
+def review_diff_lines(view: dict, rv: dict, w: int, h: int, ascii_: bool) -> list:
+    lines = view.get("lines") or []
+    if not lines:
+        return [dash_line([(" no changes", "dim")], w)]
+    out, i = [], rv["dtop"]
+    q = rv.get("query") or ""
+    while len(out) < h and i < len(lines):
+        kind, text = lines[i]
+        text = dash_clean(text)
+        style = REVIEW_STYLE.get(kind, "")
+        if rv["wrap"]:
+            rest = text
+            while len(out) < h:
+                part, _ = _clip(rest, w)
+                part = part or rest[:1]
+                out.append(dash_line(_review_hit(part, q, style), w, ascii_))
+                rest = rest[len(part):]
+                if not rest:
+                    break
+        else:
+            out.append(dash_line(_review_hit(text, q, style), w, ascii_))
+        i += 1
+    return out
+
+
+def review_file_lines(view: dict, rv: dict, w: int, h: int, ascii_: bool) -> list:
+    files = view.get("files") or []
+    if not files:
+        return [dash_line([(" no files changed", "dim")], w)]
+    cur = _cur_file(view.get("starts") or [0], rv["dtop"])
+    out = []
+    for i in range(rv["ftop"], min(len(files), rv["ftop"] + h)):
+        f = files[i]
+        sel = "bold" if i == cur else ""
+        mark = (">" if ascii_ else "▸") if i == cur else " "
+        name = f"{f['old']} -> {f['path']}" if f.get("old") else f["path"]
+        cnt = [("  binary ", "dim")] if f["binary"] else [(f"{'+' + str(f['add']):>6}", "green"), (f" {'-' + str(f['del']):<6} ", "red")]
+        out.append(dash_line([(mark, sel)] + cnt + [(name, sel)], w, ascii_))
+    return out
+
+
+def review_fetch_text(item: dict) -> list:
+    argv = review_fetch_argv(item) or []
+    vm = item.get("vm")
+    if vm in ("stopped", "missing"):
+        return [[(f"The sandbox for {item['profile']} is {vm}. Fetch needs it running:", "")],
+                [("sbx drops the sandbox's git remote when it stops.", "")],
+                [("`agentbox up` starts it again; booting it from here is not offered,", "dim")],
+                [("since that relaunches the agent last started with `sbx run`.", "dim")], [],
+                [("any key closes this", "dim")]]
+    return [[("This runs:", "")], [("  " + shlex.join(["agentbox", *argv]), "bold")], [],
+            [("  fetches  ", "dim"), (item.get("ref") or "?", "bold"), (f"  (the branch job {(item.get('job') or {}).get('id') or '?'} ended on)", "dim")],
+            [("  into     ", "dim"), (item.get("branch") or "?", "bold")], [],
+            [("y", "bold"), (" to run it, any other key cancels", "")]]
+
+
+def review_merge_text(item: dict, chk: dict, typed: str | None = None) -> list:
+    cmd = shlex.join(["git", *(chk.get("argv") or [])])
+    n, target, br = chk.get("count", 0), item.get("target") or "?", item.get("branch") or "?"
+    body = [[("This runs, in ", ""), (item.get("workspace") or "?", "dim"), (":", "")], [("  " + cmd, "bold")], []]
+    if typed is None:
+        return body + [[(f"  fast-forwards {target} by {n} commit{'s' if n != 1 else ''} from {br}", "")], [],
+                       [("y", "bold"), (" to run it, any other key cancels", "")]]
+    return body + [[(f"{target} has moved on, so {br} cannot be fast-forwarded.", "yellow bold")],
+                   [(f"  makes a merge commit on {target} with {n} commit{'s' if n != 1 else ''} from {br};", "")],
+                   [("  on a conflict, git merge --abort runs at once and nothing changes.", "")], [],
+                   [("Type merge, then Enter, to run it. Esc cancels.", "")], [("  > ", "bold"), (typed, "bold"), ("_", "")]]
+
+
+def review_delete_text(item: dict) -> list:
+    return [[("This runs, in ", ""), (item.get("workspace") or "?", "dim"), (":", "")],
+            [("  " + shlex.join(["git", *(review_delete_argv(item.get("branch")) or [])]), "bold")], [],
+            [(f"  {item.get('branch')} is merged into {item.get('target')}; -d refuses an unmerged branch", "dim")], [],
+            [("y", "bold"), (" to run it, any other key cancels", "")]]
+
+
+def review_render(rv: dict, ctx: dict | None, size, now: float | None = None, ascii_: bool = False) -> list:
+    """The whole screen: size[1] lines of segments, each exactly size[0] cells wide. ctx: {"detail": the
+    selected item's review_detail or None, "view": the diff shown, "data": the collection, "loading": bool}."""
+    w, h = size
+    if w <= 0 or h <= 0:
+        return []
+    ctx = ctx or {}
+    now = time.time() if now is None else now
+    rv = {**rv, "size": (w, h)}
+    view = ctx.get("view") or review_view([], [])
+    detail = ctx.get("detail")
+    rects = review_rects(rv, len(view["files"]))
+    if rects is None:
+        msg = f"make the pane bigger: at least {REVIEW_MIN_W}x{REVIEW_MIN_H} (now {w}x{h})"
+        lines = [dash_line([], w) for _ in range(h)]
+        lines[h // 2] = dash_line([(" " * max(0, (w - len(msg)) // 2), ""), (msg, "yellow")], w, ascii_)
+        return lines
+    items = rv["items"]
+    item = items[rv["sel"]] if items else None
+    head = [(" agentbox review", "bold")]
+    if item:
+        head += [("   target ", "dim"), (item.get("target") or "(detached HEAD)", "bold"),
+                 (f"   {item['profile']}: {item.get('workspace')}", "dim")]
+    pending = sum(1 for i in items if i["status"] in ("ready", "not_fetched", "diverged"))
+    if ctx.get("data") is not None:
+        head.append((f"   {pending} to review", "yellow" if pending else "dim"))
+    if rv.get("busy"):
+        head.append(("   refreshing..." if ascii_ else "   refreshing…", "cyan"))
+    if rv.get("error"):
+        head.append((f"   {rv['error']}", "red bold"))
+    lx, ly, lw, lh = rects["list"]
+    px, py, pw, ph = rects["pane"]
+    if items:
+        left = review_list(rv, lw, lh, now, ascii_)
+    else:
+        errs = [p for p in (ctx.get("data") or {}).get("profiles") or [] if p.get("error")]
+        left = [dash_line([(" collecting…" if ctx.get("data") is None else " nothing to review", "dim")], lw, ascii_)]
+        if ctx.get("data") is not None and not (ctx["data"].get("profiles")):
+            left.append(dash_line([(" (no clone-mode profiles)", "dim")], lw, ascii_))
+        left += [dash_line([(f" {p['name']}: {p['error']}", "red")], lw, ascii_) for p in errs]
+    left += [dash_line([], lw)] * (lh - len(left))
+    # the pane
+    focus = rv["focus"] == "pane"
+    tabs = [(" ", "")]
+    for i, lb in enumerate(review_tab_labels((len(detail["commits"]), len(view["files"])) if detail else None)):
+        tabs += [(lb, ("sel" if focus else "bold") if i == rv["tab"] else "dim"), (" ", "")]
+    cx, cy, cw, ch = rects["content"]
+    if not item:
+        content = []
+    elif rv["tab"] == 0:
+        ov = review_overview(item, detail, cw - 2, now, ascii_)
+        otop = max(0, min(rv["otop"], max(0, len(ov) - ch)))
+        content = [dash_line([(" ", "")] + seg, cw, ascii_) for seg in ov[otop:otop + ch]]
+    elif rv["tab"] == 1:
+        if item["kind"] != "branch":
+            content = [dash_line([(" not fetched yet: f fetches the job's branch", "dim")], cw, ascii_)]
+        else:
+            content = review_commit_lines((detail or {}).get("commits") or [], rv, cw, ch, focus, now)
+    else:
+        if item["kind"] != "branch":
+            content = [dash_line([(" not fetched yet: f fetches the job's branch", "dim")], cw, ascii_)]
+        else:
+            fx, fy, fw, fh = rects["files"]
+            dx, dy, dw, dh = rects["diff"]
+            fl = review_file_lines(view, rv, fw, fh, ascii_)
+            fl += [dash_line([], fw)] * (fh - len(fl))
+            dl = review_diff_lines(view, rv, dw, dh, ascii_)
+            dl += [dash_line([], dw)] * (dh - len(dl))
+            rule, bar_ = ("-", "|") if ascii_ else ("─", "│")
+            if rects["side"]:
+                content = [fl[i] + [(bar_, "dim")] + dl[i] for i in range(ch)]
+            else:
+                src = f" commit {rv['source'][:9]} (a: whole diff) " if rv.get("source") else \
+                    f" {item.get('target') or 'HEAD'}...{item['branch']} "
+                src = _clip(dash_clean(src), max(0, cw - 2))[0]
+                content = fl + [dash_line([(rule * 2 + src + rule * max(0, cw - 2 - dash_cells(src)), "dim")], cw, ascii_)] + dl
+    content += [dash_line([], cw)] * (ch - len(content))
+    right = [dash_line(tabs, pw, ascii_)] + content[:ch]
+    if rects["stacked"]:
+        rule = "-" if ascii_ else "─"
+        n = len(items)
+        vis = max(1, lh // 2)
+        span = f" {rv['top'] + 1}-{min(n, rv['top'] + vis)} of {n} " if n > vis else ""
+        body = left + [dash_line([(rule * 2 + span + rule * max(0, w - 2 - len(span)), "dim")], w, ascii_)] + right
+    else:
+        bar_ = "|" if ascii_ else "│"
+        body = [left[i] + [(bar_, "dim")] + right[i] for i in range(h - 2)]
+    # overlays
+    box = None
+    mode, tgt = rv.get("mode"), rv.get("target")
+    if mode == "help":
+        help_ = [("Up Dn  j k", d) if ascii_ and i == 0 else (k, d) for i, (k, d) in enumerate(REVIEW_HELP)]
+        kw = max(dash_cells(k) for k, _ in help_)
+        box = _dash_box("keys", [[(f"{k:<{kw}}  ", "bold"), (d, "")] for k, d in help_]
+                        + [[], [("review never runs your install or tests: t opens a shell for them", "dim")],
+                           [("any key closes this", "dim")]], w, ascii_)
+    elif mode in ("fetch", "nofetch") and tgt:
+        box = _dash_box("fetch", review_fetch_text(tgt), w, ascii_)
+    elif mode in ("merge", "mergetyped") and tgt and rv.get("check"):
+        box = _dash_box("merge", review_merge_text(tgt, rv["check"], rv.get("typed", "") if mode == "mergetyped" else None),
+                        w, ascii_)
+    elif mode == "delete" and tgt:
+        box = _dash_box("delete", review_delete_text(tgt), w, ascii_)
+    elif mode == "box" and rv.get("box"):
+        title, blines = rv["box"]
+        box = _dash_box(title, [[(ln, "")] for ln in blines] + [[], [("any key closes this", "dim")]], w, ascii_)
+    if box:
+        top = max(0, (len(body) - len(box)) // 2)
+        bw = sum(dash_cells(t) for t, _ in box[0])
+        for i, ln in enumerate(box[:len(body)]):
+            body[top + i] = dash_line([(" " * max(0, (w - bw) // 2), "")] + ln, w, ascii_)
+    # footer
+    if rv.get("msg"):
+        foot = [(" " + rv["msg"], "yellow")]
+    elif mode in ("fetch", "merge", "delete"):
+        foot = [(" y", "bold"), (f" {mode}   ", ""), ("any other key", "bold"), (" cancel", "")]
+    elif mode == "mergetyped":
+        foot = [(" type merge, ", ""), ("Enter", "bold"), (" merge   ", ""), ("Esc", "bold"), (" cancel", "")]
+    elif mode == "search":
+        foot = [(" /", "bold"), (rv.get("typed", ""), ""), ("_", ""), ("   Enter", "bold"), (" find   ", "dim"),
+                ("Esc", "bold"), (" cancel", "dim")]
+    elif mode in ("help", "box", "nofetch"):
+        foot = [(" any key", "bold"), (" close", "")]
+    else:
+        st = item["status"] if item else None
+        keys = [("j/k" if ascii_ else "↑↓", "select" if rv["focus"] == "list" else "scroll"), ("Tab", "tabs")]
+        keys += {"not_fetched": [("f", "fetch")], "ready": [("m", "merge")], "diverged": [("m", "merge")],
+                 "merged": [("d", "delete")]}.get(st, [])
+        if rv["tab"] == 2:
+            keys += [("n/N", "file"), ("]/[", "hunk"), ("/", "search"), ("w", "wrap")]
+        keys += [("o", "VS Code"), ("t", "shell"), ("r", "refresh"), ("?", "help"), ("q", "quit")]
+        foot = [s for k, d in keys for s in ((f" {k}", "bold"), (f" {d}  ", "dim"))]
+    return [dash_line(head, w, ascii_)] + body + [dash_line(foot, w, ascii_)]
+
+
+class ReviewScreen(DashScreen):
+    """The curses side of `agentbox review`: draw review_render's lines, turn input into review_key's keys,
+    load what the selected item shows, run the actions."""
+
+    def __init__(self, scr, curses, collect, rex: RexStatus, ascii_: bool, profile: str | None,
+                 interval: float = 30.0, out=None):
+        super().__init__(scr, curses, collect, interval, rex, ascii_)
+        self.profile, self.cache, self.title, self.out = profile, {}, None, out or sys.stdout
+
+    def set_title(self, item):
+        text = review_title(item, self.profile)
+        if text != self.title:
+            self.title = text
+            with contextlib.suppress(OSError, ValueError):
+                self.out.write(osc_title(text))
+                self.out.flush()
+
+    def loaded(self, rv: dict) -> dict:
+        """ctx for review_key and review_render: the selected item's detail and the diff on show."""
+        item = rv["items"][rv["sel"]] if rv["items"] else None
+        if not item or item["kind"] != "branch":
+            return {"detail": None, "view": review_view([], []), "commits": [], "data": self.data}
+        key = review_key_of(item) + (item.get("tip"), item.get("head"))
+        if key not in self.cache:
+            if len(self.cache) > 16:
+                self.cache.clear()
+            self.cache[key] = review_detail(item)
+        detail = self.cache[key]
+        view = detail["view"]
+        if rv.get("source"):
+            ck = key + (rv["source"],)
+            if ck not in self.cache:
+                self.cache[ck] = review_commit_view(item, rv["source"])
+            view = self.cache[ck]
+        return {"detail": detail, "view": view, "commits": detail["commits"], "data": self.data}
+
+    def read_key(self):
+        key = super().read_key()
+        return {"\t": "tab"}.get(key, key) if isinstance(key, str) else key
+
+    def run(self) -> int:
+        self.setup()
+        rv, next_at = review_new_ui(tab=self.rexbin is not None), 0.0
+        while True:
+            res = self.coll.take()
+            if res and res[0] == "ok":
+                self.data = res[1]
+                self.cache.clear()
+                items = review_items(self.data)
+                rv = review_set_items({**rv, "error": ""}, items)
+                review_rex(self.rex, sum(1 for i in items if i["status"] in ("ready", "not_fetched", "diverged")))
+            elif res:
+                rv = {**rv, "error": f"refresh failed: {res[1]}"}
+            if res:
+                next_at = time.monotonic() + self.interval
+            if not self.coll.running and time.monotonic() >= next_at:
+                self.coll.start()
+            h, w = self.scr.getmaxyx()
+            rv = {**rv, "busy": self.coll.running, "size": (w, h)}
+            ctx = self.loaded(rv)
+            self.set_title(rv["items"][rv["sel"]] if rv["items"] else None)
+            self.draw(review_render(rv, ctx, (w, h), ascii_=self.ascii))
+            key = self.read_key()
+            if key is None:
+                continue
+            if key == "resize":
+                with contextlib.suppress(AttributeError, self.c.error):
+                    self.c.update_lines_cols()
+                h, w = self.scr.getmaxyx()
+                rv = {**rv, "size": (w, h)}
+            rv, action = review_key(rv, key, ctx)
+            if not action:
+                continue
+            kind, item = action[0], (action[1] if len(action) > 1 else None)
+            if kind == "quit":
+                return EXIT_OK
+            if kind == "refresh":
+                next_at = 0.0
+            elif kind == "merge_check":
+                rv = review_merge_prompt(rv, item, review_merge_check(item))
+            elif kind == "merge":
+                res_ = review_merge(item, action[2])
+                rv = {**rv, "msg": res_["msg"]}
+                if res_["lines"]:
+                    rv |= {"mode": "box", "box": ("merged" if res_["ok"] else "merge", res_["lines"])}
+                next_at = 0.0
+            elif kind == "delete":
+                rv = {**rv, "msg": review_delete(item)["msg"]}
+                next_at = 0.0
+            elif kind == "fetch":
+                rv = {**rv, "msg": self.run_fetch(item)}
+                next_at = 0.0
+            elif kind == "code":
+                rv = {**rv, "msg": self.open_code(item)}
+            elif kind == "shell":
+                rv = {**rv, "msg": self.open_shell(item)}
+
+    def run_fetch(self, item: dict) -> str:
+        argv = review_fetch_argv(item)
+        if argv is None:
+            return ""
+        with self.suspended():
+            print(f"\n$ {shlex.join(['agentbox', *argv])}", flush=True)
+            rc = subprocess.run(agentbox_argv(argv), env={**os.environ, "AGENTBOX_NO_OSC": "1"}).returncode
+            if rc != -signal.SIGINT:
+                with contextlib.suppress(EOFError, KeyboardInterrupt):
+                    input(f"\n[agentbox fetch exited {rc}; press Enter to return to the review] ")
+        return "fetched" if rc == 0 else f"agentbox fetch exited {rc}"
+
+    def open_code(self, item: dict) -> str:
+        code = shutil.which("code")
+        if not code:
+            return "VS Code's `code` is not on PATH: not opened (install it from VS Code's command palette)"
+        argv = review_code_argv(code, item)
+        if argv is None:
+            return "nothing to open"
+        env = {**os.environ, "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+        try:
+            subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            return f"could not run git difftool: {e.strerror or e}"
+        return "opening the diff in VS Code, one file at a time: close a file's tab for the next"
+
+    def open_shell(self, item: dict) -> str:
+        ws, name = item.get("workspace"), item.get("profile")
+        if not ws or not os.path.isdir(ws):
+            return "the workspace is not there"
+        if self.rexbin:
+            argv = rex_shell_argv(self.rexbin, ws, name, login_shell())
+            if argv is None:
+                return "could not open a shell tab"
+            try:
+                r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return f"could not run rex: {e}"
+            return "opened a shell in a new Rex tab" if r.returncode == 0 else f"rex run exited {r.returncode}"
+        shell = os.environ.get("SHELL") if _executable(os.environ.get("SHELL")) else login_shell()
+        with self.suspended():
+            print(f"\n{ws}: a shell for your install or tests; exit it to return to the review", flush=True)
+            subprocess.run([shell, "-i"], cwd=ws)
+        return "back from the shell"
+
+
+def review_ui(collect, rex: RexStatus, profile: str | None) -> int:
+    """`agentbox review`. Saves the terminal title, sets it while running, restores it on the way out, and
+    clears the `review` Rex record."""
+    import curses
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+    ascii_ = "utf" not in (locale.getpreferredencoding(False) or "").lower().replace("-", "")
+    os.environ.setdefault("ESCDELAY", "25")
+    real_err, sys.stderr = sys.stderr, io.StringIO()
+    sys.stdout.write(TITLE_PUSH)
+    sys.stdout.flush()
+    try:
+        return curses.wrapper(lambda scr: ReviewScreen(scr, curses, collect, rex, ascii_, profile).run())
+    except KeyboardInterrupt:
+        return EXIT_OK
+    finally:
+        sys.stderr = real_err
+        rex.clear("review")
+        sys.stdout.write(TITLE_POP)
+        sys.stdout.flush()
+
+
+def cmd_review(cfg: Config, name: str | None, as_json: bool = False) -> int:
+    if name:
+        prof = cfg.profile(name)
+        if prof.d["mode"] != "clone":
+            die(f"profile '{name}' is in direct mode: the agent edits {prof.primary} itself, so there is no branch"
+                f" to review. See `agentbox audit {name}`", EXIT_USAGE)
+    if as_json:
+        emit_json(review_public(review_collect(cfg, name)))
+        return EXIT_OK
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("review needs a terminal; `agentbox review --json` lists the items otherwise", EXIT_USAGE)
+    return review_ui(lambda: review_collect(cfg, name), RexStatus(rex_wanted()), name)
 
 
 def describe_tool(t: dict) -> dict:
@@ -5907,6 +7346,10 @@ def main():
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("history", help="the jobs each profile ran, newest first: branch, cost, the brief's title")
     p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("review", help="clone mode: review the agents' branches like a pull request, and merge them"
+                       " (the owner's tool; agents never run it)")
+    p.add_argument("profile", nargs="?")
+    p.add_argument("--json", action="store_true", help="the items and their statuses, no diff")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
     p = sub.add_parser("provision", help="guided setup of a new profile"); p.add_argument("name")
@@ -5940,6 +7383,8 @@ def main():
         sys.exit(cmd_doctor(cfg, a.profile, a.json, a.start))
     if a.cmd == "history":
         sys.exit(cmd_history(cfg, a.profile, a.json))
+    if a.cmd == "review":
+        sys.exit(cmd_review(cfg, a.profile, a.json))
     if a.cmd == "provision":
         sys.exit(cmd_provision(cfg, a))
     prof = cfg.profile(a.profile)

@@ -576,13 +576,19 @@ class RexTabTests(unittest.TestCase):
 
     def test_rex_run_argv(self):
         with mock.patch.object(ab, "agentbox_argv", lambda a: ["/py", "/ab", *a]):
-            self.assertEqual(ab.rex_run_argv("/r/rex", "demo"),
+            self.assertEqual(ab.rex_run_argv("/r/rex", ab.dash_argv(("up_tab", "demo"))),
                              ["/r/rex", "run", "--shell=none", "--keep-open", "--label", "agentbox up demo", "--",
                               "/py", "/ab", "up", "demo"])
+            self.assertEqual(ab.rex_run_argv("/r/rex", ab.dash_argv(("review_tab", "demo")), keep_open=False),
+                             ["/r/rex", "run", "--shell=none", "--label", "agentbox review demo", "--",
+                              "/py", "/ab", "review", "demo"])
             for bad in ("--force", "a b", "", None, "Demo", "-x"):
+                self.assertIsNone(ab.rex_run_argv("/r/rex", ab.dash_argv(("up", bad))), bad)
+                self.assertIsNone(ab.rex_run_argv("/r/rex", ab.dash_argv(("review_tab", bad))), bad)
+            for bad in (None, [], "up demo", ["up", None]):
                 self.assertIsNone(ab.rex_run_argv("/r/rex", bad), bad)
-            self.assertIsNone(ab.rex_run_argv("", "demo"))
-        argv = ab.rex_run_argv("/r/rex", "demo")
+            self.assertIsNone(ab.rex_run_argv("", ["up", "demo"]))
+        argv = ab.rex_run_argv("/r/rex", ["up", "demo"])
         self.assertEqual(argv[argv.index("--") + 1:][-2:], ["up", "demo"])
         self.assertEqual(argv[argv.index("--") + 1:][:-2], ab.agentbox_argv([]))   # the dashboard's own agentbox
 
@@ -595,19 +601,24 @@ class RexTabTests(unittest.TestCase):
         s = self.screen()
         with mock.patch.object(ab.subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, "", "")
-            self.assertEqual(s.open_tab("demo"), (True, "opened in a new Rex tab"))
+            self.assertEqual(s.open_tab(("up_tab", "demo")), (True, "opened in a new Rex tab"))
             self.assertEqual(run.call_args.args[0][:6], ["/r/rex", "run", "--shell=none", "--keep-open", "--label",
                                                          "agentbox up demo"])
             self.assertEqual(run.call_args.kwargs["timeout"], 10)
             run.return_value = subprocess.CompletedProcess([], 3, "", "warn\nno such session\n")
-            self.assertEqual(s.open_tab("demo"), (False, "rex run exited 3: no such session"))
+            self.assertEqual(s.open_tab(("up_tab", "demo")), (False, "rex run exited 3: no such session"))
             run.side_effect = subprocess.TimeoutExpired("rex", 10)
-            self.assertEqual(s.open_tab("demo"), (False, "rex run timed out after 10 s"))
+            self.assertEqual(s.open_tab(("up_tab", "demo")), (False, "rex run timed out after 10 s"))
             run.side_effect = FileNotFoundError(2, "No such file or directory")
-            self.assertEqual(s.open_tab("demo"), (False, "could not run rex: No such file or directory"))
+            self.assertEqual(s.open_tab(("up_tab", "demo")), (False, "could not run rex: No such file or directory"))
             run.reset_mock()
-            self.assertFalse(s.open_tab("--force")[0])
+            self.assertFalse(s.open_tab(("up_tab", "--force"))[0])
+            self.assertFalse(s.open_tab(("review_tab", "--force"))[0])
             run.assert_not_called()
+            run.side_effect = None
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            self.assertTrue(s.open_tab(("review_tab", "demo"))[0])
+            self.assertEqual(run.call_args.args[0][:5], ["/r/rex", "run", "--shell=none", "--label", "agentbox review demo"])
 
 
 class CollectorTests(unittest.TestCase):
