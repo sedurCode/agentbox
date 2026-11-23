@@ -285,7 +285,7 @@ class ReportTests(FetchCase):
         d = json.loads(out)
         tip = self.git(self.box, "rev-parse", "HEAD")
         self.assertEqual(d, {"profile": "p", "sandbox": "ab-p", "remote": "sandbox-ab-p", "ref": "main",
-                             "branch": "review/p", "commit": tip, "previous": None, "fast_forward_from_head": True,
+                             "branch": "review/p", "ref_source": "default", "commit": tip, "previous": None, "fast_forward_from_head": True,
                              "commits": [{"hash": tip, "subject": "add f"},
                                          {"hash": self.git(self.box, "rev-parse", "HEAD~1"), "subject": "agent one"}],
                              "commits_total": 2, "files_changed": 1, "insertions": 2, "deletions": 0,

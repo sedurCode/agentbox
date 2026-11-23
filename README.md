@@ -24,8 +24,8 @@ the VM. agentbox adds the parts you asked for on top:
   stop the sandbox under it; `wait`, `logs` and `resume` follow it.
 - **Progress**: `progress` shows what agentbox measures (time, tool calls, tokens, cost, commits) next to
   the agent's own plan, and flags a job that has gone quiet.
-- **Clone mode and `fetch`**: the agent works on its own clone, and `agentbox fetch` brings its commits to a
-  review branch on the host. It never merges.
+- **Clone mode and `fetch`**: the agent works on its own clone, and `agentbox fetch` brings the branch its
+  last job ended on to a review branch on the host. It never merges.
 - **Skill sets**: read-only git repos of agent skills, pinned to a commit you reviewed and linked into the VM.
 - **A skill for agents on the host**: `agentbox skill setup` teaches Claude Code, Codex, OpenCode and Pi on
   your machine to drive agentbox, under your ground rules (see *Agents on the host*).
@@ -53,9 +53,9 @@ unzip agentbox.zip && cd agentbox && ./install.sh     # installs agentbox itself
 agentbox provision myproj --workspace ~/src/myproj    # guided; clone mode is suggested
 agentbox run myproj --prompt-file task.md --detach    # the brief goes in a file, never on a command line
 agentbox progress myproj --watch                      # until the job ends
-agentbox fetch myproj                                 # the agent's commits, into review/myproj
-git diff HEAD...review/myproj                         # review
-git merge --ff-only review/myproj                     # only if you are happy with it
+agentbox fetch myproj                                 # the job's branch, e.g. into review/myproj-fix-login
+git diff HEAD...review/myproj-fix-login               # review (fetch prints the name)
+git merge --ff-only review/myproj-fix-login           # only if you are happy with it
 agentbox down myproj                                  # when finished; asks for confirmation (--force skips
                                                       # that and deletes the sandbox even while it is in use: for scripts)
 ```
@@ -350,7 +350,7 @@ agentbox up h750 -- --resume   # extra args go to the agent
 agentbox shell h750        # bash inside the VM
 agentbox tools h750        # what the agent can run on the host
 agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation (direct mode)
-agentbox fetch h750        # clone mode: the agent's commits, into review/h750 (see §6)
+agentbox fetch h750        # clone mode: the job's branch, into review/h750-<branch> (see §6)
 agentbox stop h750         # pause sandbox + bridge
 agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force: also kills a running job, skips sbx's
                             # confirmation - required without a TTY - and deletes the sandbox even if in use, e.g. an open VS Code session)
@@ -447,12 +447,13 @@ The whole loop, for a clone-mode profile (`provision` suggests one):
    `agentbox logs h750 -f` for what it is doing. `status` lists every profile.
 4. **Wait for it** in a script with `agentbox wait h750 --timeout 3600`; the exit status is the job's own
    (`4` = still running, `5` = lost).
-5. **Fetch**: `agentbox fetch h750` holds the sandbox up, waits for the git remote, fetches the agent's
-   `main` into `review/h750` and prints the new commits and a diffstat. If the job is still running it
-   warns you, because what you got is not its final state.
-6. **Review** on the host: `git log HEAD..review/h750` and `git diff HEAD...review/h750`. Nothing has been
-   merged, and your checked-out branch is untouched.
-7. **Merge** when happy: `git merge --ff-only review/h750`. If HEAD has moved on and a fast-forward isn't
+5. **Fetch**: `agentbox fetch h750` holds the sandbox up, waits for the git remote, fetches the branch the
+   job ended on (say `fix-uart`) into `review/h750-fix-uart` and prints the new commits and a diffstat. It
+   says which ref it chose and why; with no branch recorded it fetches `main` into `review/h750`. If the
+   job is still running it warns you, because what you got is not its final state.
+6. **Review** on the host: `git log HEAD..review/h750-fix-uart` and `git diff HEAD...review/h750-fix-uart`.
+   Nothing has been merged, and your checked-out branch is untouched.
+7. **Merge** when happy: `git merge --ff-only review/h750-fix-uart`. If HEAD has moved on and a fast-forward isn't
    possible, rebase the review branch or merge by hand. To ask for changes, run again in the same sandbox
    (`agentbox resume h750` continues the session interactively).
 8. **Finish**: `agentbox down h750` removes the sandbox, its scoped secrets and its state. Fetch first:
@@ -468,6 +469,18 @@ session of its own while it works. Once the job has ended and nothing is attache
 **If the sandbox is gone**, `fetch` says so and exits 1. Commits fetched before it was removed stay in the
 host repo under `refs/sandboxes/<sandbox>/<branch>`; keep one with
 `git branch LOCAL refs/sandboxes/ab-h750/main`, and `fetch` prints that command when such refs exist.
+
+**Which branch.** When a job ends, its wrapper records the branch the workspace is on (`git symbolic-ref
+--short -q HEAD`, nothing for a detached HEAD) and the commit at HEAD. Both are agent-controlled, so the host
+takes the branch only if it is a plain name: at most 100 characters of `A-Z a-z 0-9 . _ / -`, no leading
+`-` or `.`, no `..`, `//`, trailing `/` or `.lock`, not `HEAD` or `refs/...`, and a valid git branch name.
+Anything else counts as unknown. The commit must be 40 hex characters. They show as `branch` and `end_head`
+in `status --json` (`job.*` and `job.progress.*`) and `progress --json`, on a `branch` line in `progress`,
+and in the dashboard's details; `null` while the job runs or when unknown. `fetch` then defaults `--ref` to
+that branch and `--branch` to `review/<profile>-<ref>` (each `/` becomes `-`: `review/<profile>/<x>` can't
+coexist with a `review/<profile>` branch in git). With no branch recorded it is `main` into
+`review/<profile>`, as before. An explicit `--ref` or `--branch` always wins (`--ref` alone still goes into
+`review/<profile>`), and `--force` is never implied.
 
 ### Watching a job
 
@@ -551,13 +564,15 @@ first) the last cached totals are shown.
                      "plan": {"steps": [{"text": "write the test", "status": "done"},
                                         {"text": "make it pass", "status": "active"}],
                               "current": 2, "done": 1, "total": 2},
-                     "note": "waiting for the flash tool", "stale": false}}
+                     "note": "waiting for the flash tool", "stale": false,
+                     "branch": null, "end_head": null}}
 ```
 
 `plan` is `null` when the agent declared none, `plan.current` is the first `active` step (1-based) or
 `null`, a step's `status` is `pending`, `active` or `done`, `elapsed_s` is up to now (running) or up to
 `finished_at`, `last_event_age_s` is `null` unless the job is running, and `stale` is true when the values
-come from the host's cache because the sandbox could not be read.
+come from the host's cache because the sandbox could not be read. `branch` and `end_head` are the branch and
+commit the workspace ended on (`null` while the job runs, or when unknown; see *Which branch*).
 
 ### Dashboard
 
@@ -592,7 +607,7 @@ isn't UTF-8. Below 60x15 it asks for a bigger pane.
 | ↑ ↓, j k, click | select a profile; the wheel scrolls the list or the details; Home / End |
 | Enter, p | `agentbox progress <profile> --watch` in the same terminal; back on exit or Ctrl-C |
 | l | `agentbox logs <profile>` in `$PAGER` (default `less -R`), sanitised as `logs` always is |
-| f | shows `agentbox fetch <profile>` and asks y/N; runs it only on `y`, with no other flags |
+| f | shows `agentbox fetch <profile>`, the ref it will fetch and the review branch, and asks y/N; runs it only on `y`, with no other flags. A stopped sandbox gets a note instead: fetch needs it running, and booting it would relaunch the agent |
 | r | refresh now |
 | ? | help |
 | q, Ctrl-C | quit and give the terminal back |
@@ -652,7 +667,7 @@ starting the agent), starts the host-tool bridge, checks SSH, then runs
 
 Agents running on your own machine (Claude Code, Codex, OpenCode, Pi) can drive agentbox for you: propose
 a profile, write a brief, start and watch a job, fetch the result and tell you it is ready on
-`review/<profile>`. agentbox ships a skill that tells them how, and what they may do without asking.
+a `review/<profile>-<branch>` branch. agentbox ships a skill that tells them how, and what they may do without asking.
 
 ```bash
 agentbox skill setup           # install the skill for the agents on this machine
@@ -714,10 +729,10 @@ running is `lost` without any exec. A running sandbox with an unfinished job cos
    "bridge": {"running": true, "pid": 4242},
    "job": {"id": "20260101T120000Z-ab12cd", "state": "finished", "exit_code": 0,
            "session_id": "0b1c...", "started_at": "2026-01-01T12:00:01Z", "finished_at": "2026-01-01T12:07:45Z",
-           "vm": "running"}},
+           "vm": "running", "branch": "fix-uart", "end_head": "3f9c...", "progress": {"...": "..."}}},
   {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone",
    "job": {"id": null, "state": "none", "exit_code": null, "session_id": null, "started_at": null,
-           "finished_at": null, "vm": null}},
+           "finished_at": null, "vm": null, "branch": null, "end_head": null, "progress": null}},
   {"name": "broken", "valid": false}
 ]}
 ```
@@ -922,20 +937,22 @@ sbx adds that remote to the host repo while the sandbox runs and removes it when
 (about 30 s after the last session ends). The commits you fetched stay in your object store.
 
 ```bash
-agentbox fetch h750               # into review/h750; add --branch B, --ref R, --start, --force, --json
-git diff HEAD...review/h750       # review
-git merge --ff-only review/h750   # the only step that changes your branch, and you run it
+agentbox fetch h750               # the job's branch into review/h750-<branch>; add --ref R, --branch B, --start, --force, --json
+git diff HEAD...review/h750-fix   # review (fetch prints the branch name)
+git merge --ff-only review/h750-fix   # the only step that changes your branch, and you run it
 ```
 
 `fetch` is for clone-mode profiles only; for a direct-mode profile it exits 2 and points at `audit`. It
 refuses a stopped sandbox unless you pass `--start`, keeps one `sbx exec ... sleep` session open while it
-works (and always ends it), waits up to 60 s for the remote, then fetches `--ref` (default `main`) from the
-sandbox into `--branch` (default `review/<profile>`). It names the remote itself; it never takes one from
+works (and always ends it), waits up to 60 s for the remote, then fetches `--ref` (default: the branch the
+latest job ended on, else `main`) from the sandbox into `--branch` (default `review/<profile>-<ref>` for a
+job's branch, `review/<profile>` for `main`; see *Which branch* in §3). It names the remote itself; it never takes one from
 anything the VM printed. Both names are checked as branch names and passed to git after `--`. It refuses
 to touch a branch that is checked out in the host repo (exit 2), and refuses an update that is not a
 fast-forward of the existing review branch (exit 1) unless you pass `--force`. Everything git prints is
 passed through `safe_text`, since commit subjects and file names are agent-written. With `--json` the
-result is one document: `profile`, `sandbox`, `remote`, `ref`, `branch`, `commit`, `previous`,
+result is one document: `profile`, `sandbox`, `remote`, `ref`, `branch`, `ref_source` (`job`, `flag` or
+`default`), `commit`, `previous`,
 `fast_forward_from_head`, `commits` (at most 50, each `{hash, subject}`), `commits_total`,
 `files_changed`, `insertions`, `deletions` and `job_running`.
 
@@ -945,7 +962,7 @@ sandbox remote runs nothing from the VM's config. This holds only if no other pr
 folder writable (as a direct-mode workspace, or an `extra_workspace` without `:ro`). If one does, an
 agent there could have changed `.git/config`, so run `agentbox audit` for that profile first. The diff is run with `--no-ext-diff --no-textconv`.
 The raw equivalent, while the sandbox is running, is
-`git fetch sandbox-ab-<profile> main:review/<profile>`.
+`git fetch sandbox-ab-<profile> <branch>:review/<profile>-<branch>`.
 
 ## 7. What this protects and what it doesn't
 

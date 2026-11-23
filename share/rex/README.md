@@ -25,8 +25,9 @@ require("agentbox").setup{}
 
 The dashboard tab is a full-screen view of every profile. Select one with ↑ ↓ / j k or a click (the wheel
 scrolls); Enter or `p` runs `agentbox progress <profile> --watch` in the tab and comes back when it ends or
-on Ctrl-C; `l` shows the job's log in `$PAGER` (default `less -R`); `f` shows `agentbox fetch <profile>` and
-runs it only after `y`; `r` refreshes, `?` lists the keys, `q` quits. It never runs `--force`, `down`,
+on Ctrl-C; `l` shows the job's log in `$PAGER` (default `less -R`); `f` shows `agentbox fetch <profile>`, the
+ref it will fetch (the branch the job ended on, else `main`) and the review branch, and runs it only after
+`y` (a stopped sandbox gets a note instead); `r` refreshes, `?` lists the keys, `q` quits. It never runs `--force`, `down`,
 `fresh`, `stop`, `run` or `up`. `agentbox dashboard --watch` still gives the plain text view.
 
 The actions switch the Rex app to the session they open. Doing that from the `rex` CLI needs Rex's Remote

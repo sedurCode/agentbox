@@ -5,7 +5,8 @@
 # agentbox job wrapper, run INSIDE the sandbox, detached from the exec session:
 #   sh wrap.sh JOBDIR WORKDIR CMD [ARGS...]
 # The prompt is read from JOBDIR/prompt.md on stdin, never from an argument. Writes
-# pid, started_at, output.jsonl, stderr.log, finished_at and (last, atomically) exit_code.
+# pid, started_at, output.jsonl, stderr.log, branch and end_head (the branch WORKDIR is on - empty
+# when detached - and its HEAD commit, for `agentbox fetch`), finished_at and (last, atomically) exit_code.
 # If JOBDIR/jobprogress exists (the agent's progress reporter) the job dir goes on the END of the
 # agent's PATH and AGENTBOX_JOB_DIR names it.
 jd=$1; wd=$2; shift 2
@@ -19,6 +20,8 @@ date -u +%Y-%m-%dT%H:%M:%SZ > "$jd/started_at"
 if cd "$wd"; then
   "$@" < "$jd/prompt.md" > "$jd/output.jsonl" 2> "$jd/stderr.log"
   rc=$?
+  git symbolic-ref --short -q HEAD > "$jd/branch" 2>/dev/null || :
+  git rev-parse -q --verify 'HEAD^{commit}' > "$jd/end_head" 2>/dev/null || :
 else
   echo "agentbox: cannot cd to $wd" > "$jd/stderr.log"
   rc=126

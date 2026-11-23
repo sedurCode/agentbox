@@ -76,21 +76,21 @@ agentbox run <p> --prompt-file <brief> --detach     # prints the job id and retu
 agentbox progress <p> --json                        # poll now and then: plan, commits, tokens, stalled
 agentbox wait <p> --timeout 600                     # or block up to 10 minutes at a time
 agentbox logs <p>                                   # what the agent did, once it has finished
-agentbox fetch <p>                                  # clone mode: commits into review/<p>
-git log HEAD..review/<p>
-git diff --no-ext-diff --no-textconv HEAD...review/<p>
+agentbox fetch <p>                                  # clone mode: the job's branch into review/<p>-<branch>
+git log HEAD..review/<p>-<branch>                   # fetch prints the review branch it used
+git diff --no-ext-diff --no-textconv HEAD...review/<p>-<branch>
 ```
 
 Add `--expect-commits N` to `run` if the brief asks for N commits. Poll `progress --json` no more than
 about once a minute; prefer `wait --timeout`. A job showing `"stalled": true` has had no event for a while:
 look at `logs` and tell the owner rather than starting another job.
 
-Then report to the owner: "ready on `review/<p>`", a summary of the commits and diff in your own words,
-your view of whether it meets the brief, and the commands for them to run:
+Then report to the owner: "ready on `review/<p>-<branch>`" (the branch `fetch` printed), a summary of the
+commits and diff in your own words, your view of whether it meets the brief, and the commands for them to run:
 
 ```bash
-git diff HEAD...review/<p>
-git merge --ff-only review/<p>     # theirs to run, not yours
+git diff HEAD...review/<p>-<branch>
+git merge --ff-only review/<p>-<branch>     # theirs to run, not yours
 agentbox down <p>                  # when they are finished with the sandbox
 ```
 
@@ -109,8 +109,11 @@ Otherwise `wait` exits with the job's own exit code (`0` success, `1` agent erro
 can also be 2 to 5, read `job.exit_code` from `agentbox status --json` when it matters. On `1` and `2`
 stdout is empty, so check the exit code before parsing `--json` output.
 
-`run` refuses while a job is still running on that profile; wait for it first. `fetch` refuses a branch that
-is checked out on the host and an update that is not a fast-forward; report that instead of passing `--force`.
+`run` refuses while a job is still running on that profile; wait for it first. `fetch` with no flags fetches
+the branch the last job ended on (`job.branch` in `status --json`) into `review/<p>-<branch>` (each `/`
+becomes `-`), or `main` into `review/<p>` when none is recorded; it prints which and why. Pass `--ref` and
+`--branch` only to override that. `fetch` refuses a branch that is checked out on the host and an update
+that is not a fast-forward; report that instead of passing `--force`.
 
 ## 5. Reading results safely
 

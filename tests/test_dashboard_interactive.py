@@ -58,7 +58,8 @@ def text_of(lines):
 
 def ui_for(d, size=(120, 30), **kw):
     ui = ab.dash_new_ui(size)
-    return ab.dash_set_rows(ui, [r["name"] for r in ab.dash_sort((d or {}).get("profiles") or [])]) | kw
+    rows = ab.dash_sort((d or {}).get("profiles") or [])
+    return ab.dash_set_rows(ui, [r["name"] for r in rows], {r["name"]: r.get("vm") for r in rows}) | kw
 
 
 class ClassifyTests(unittest.TestCase):
@@ -109,7 +110,7 @@ class RenderTests(unittest.TestCase):
     def test_every_line_is_exactly_the_width_at_every_size(self):
         for size in self.SIZES:
             for d in (None, data(), ALL_STATES):
-                for mode in ("list", "help", "confirm"):
+                for mode in ("list", "help", "confirm", "nofetch"):
                     for ascii_ in (False, True):
                         with self.subTest(size=size, mode=mode, ascii_=ascii_):
                             self.render(d, size, ascii_, mode=mode, target="alpha", busy=True)
@@ -204,7 +205,7 @@ class RenderTests(unittest.TestCase):
             hist.add(d)
             hist.add(d)
             for size in ((120, 40), (70, 40)):
-                for mode in ("list", "help", "confirm"):
+                for mode in ("list", "help", "confirm", "nofetch"):
                     text = text_of(self.render(d, size, ascii_=True, history=hist, mode=mode, target="a", busy=True))
                     self.assertTrue(text.isascii(), [c for c in text if not c.isascii()])
 
@@ -597,11 +598,13 @@ class PtyTests(AgentboxTestCase):
         back = b"\x1b[?1049h"                               # curses takes the screen again
         self.press(fd, buf, (b"\r", b"press Enter to return"), (b"\r", back),
                    (b"l", b"CHILD ['logs', 'demo'] 1"), (b"j", None),
-                   (b"f", b"agentbox fetch other"), (b"y", b"press Enter to return"), (b"\r", back),
+                   (b"f", b"is stopped"), (b"y", b"fetch"), (b"k", None),   # other's sandbox is stopped: y only closes
+                   (b"f", b"agentbox fetch demo"), (b"y", b"press Enter to return"), (b"\r", back),
                    (b"q", None))
         out = self.finish(pid, fd, buf)
         self.assertIn(b"CHILD ['progress', 'demo', '--watch'] 1", out)
-        self.assertIn(b"CHILD ['fetch', 'other'] 1", out)
+        self.assertIn(b"CHILD ['fetch', 'demo'] 1", out)
+        self.assertNotIn(b"CHILD ['fetch', 'other']", out)
         self.assertNotIn(b"--force", out)
 
 if __name__ == "__main__":

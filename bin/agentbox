@@ -24,7 +24,7 @@ Docker Sandboxes (`sbx`).
     agentbox logs <profile> [--job ID] [-f] [--raw]    job output
     agentbox resume <profile> [--job ID]               attach interactively to the job's session
     agentbox progress <profile> [--job ID] [--watch [--interval S]] [--json]   how far the job is
-    agentbox fetch <profile> [--branch B] [--ref R] [--start] [--force] [--json]   clone mode: bring the commits to the host
+    agentbox fetch <profile> [--ref R] [--branch B] [--start] [--force] [--json]   clone mode: the job's branch, to review/<profile>-<branch>
     agentbox skill show|setup|status|remove   the skill for agents on this machine (status --json)
 
 Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
@@ -491,6 +491,11 @@ def skillset_location_problems(cfg: Config, path: Path) -> list[str]:
 
 def _hex40(s: str) -> bool:
     return re.fullmatch(r"[0-9a-f]{40}", s) is not None
+
+
+def _commit(v) -> str | None:
+    """v if it is a full commit id (40 lowercase hex characters), else None."""
+    return v if isinstance(v, str) and _hex40(v) else None
 
 
 def git_head_of(root: Path) -> tuple[str | None, str | None]:
@@ -2067,7 +2072,8 @@ HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resum
     "opencode": {"cmd": ["opencode", "run", "--format", "json", "--auto"], "resume": "--session"},
 }
 NO_JOB = {"id": None, "state": "none", "exit_code": None, "session_id": None,
-          "started_at": None, "finished_at": None, "vm": None}   # vm: sandbox state when last checked
+          "started_at": None, "finished_at": None, "vm": None,     # vm: sandbox state when last checked
+          "branch": None, "end_head": None}     # the branch and commit the workspace ended on (ended jobs only)
 
 
 def new_job_id() -> str:
@@ -2094,8 +2100,8 @@ def probe_script(job_id: str) -> str:
         'if [ ! -s "$d/session_id" ]; then grep -m1 -o -E \'"(session_id|sessionID)":"[^"]*"\' "$d/output.jsonl" 2>/dev/null '
         '| head -n1 | sed \'s/.*":"\\([^"]*\\)".*/\\1/\' > "$d/session_id.tmp"; '
         '[ -s "$d/session_id.tmp" ] && mv "$d/session_id.tmp" "$d/session_id" || rm -f "$d/session_id.tmp"; fi; '
-        'for f in pid started_at finished_at session_id exit_code; do '
-        '[ -f "$d/$f" ] && echo "F $f $(head -c 80 "$d/$f" | tr -d \'\\n\')"; done; true')
+        'for f in pid started_at finished_at session_id exit_code branch end_head; do '
+        '[ -f "$d/$f" ] && echo "F $f $(head -c 200 "$d/$f" | tr -d \'\\n\')"; done; true')
 
 
 def hold_script(job_id: str) -> str:
@@ -2172,10 +2178,13 @@ def save_job_record(prof: Profile, rec: dict):
 def job_summary(job_id: str, state: str, files: dict) -> dict:
     code = files.get("exit_code")
     sid = files.get("session_id")
+    ended = state != "running"
     return {"id": job_id, "state": state,
             "exit_code": (int(code) if code and code.lstrip("-").isdigit() else 1) if state == "finished" else None,
             "session_id": sid if sid and SESSION_ID_RE.match(sid) else None,
-            "started_at": _timestamp(files.get("started_at")), "finished_at": _timestamp(files.get("finished_at"))}
+            "started_at": _timestamp(files.get("started_at")), "finished_at": _timestamp(files.get("finished_at")),
+            "branch": job_branch(files.get("branch")) if ended else None,
+            "end_head": _commit(files.get("end_head")) if ended else None}
 
 
 def _timestamp(value) -> str | None:
@@ -2198,7 +2207,7 @@ def job_info(prof: Profile, job_id: str | None = None, states=_FETCH) -> dict:
     mine = rec.get("id") == job_id
     if mine and rec.get("state") in ("finished", "lost"):
         return {k: rec.get(k) for k in NO_JOB} | {"id": job_id}
-    known = {k: rec.get(k) for k in ("session_id", "started_at", "finished_at")} if mine else {}
+    known = {k: rec.get(k) for k in ("session_id", "started_at", "finished_at", "branch", "end_head")} if mine else {}
     vm = sandbox_state(prof, states)
     if vm != "running":
         # The process died with the VM. "unknown" (daemon unreachable) isn't certain: don't cache it,
@@ -2865,7 +2874,8 @@ def progress_view(prof: Profile, acc: dict, j: dict, rec: dict, now: float) -> d
             "tokens": {**tokens, "total": sum(tokens.values())},
             "cost_usd": cost, "cost_is_estimate": estimate,
             "commits": acc["commits"], "expect_commits": expect if isinstance(expect, int) else None,
-            "plan": plan, "note": acc["note"] or None, "stale": False}
+            "plan": plan, "note": acc["note"] or None, "stale": False,
+            "branch": job_branch(j.get("branch")), "end_head": _commit(j.get("end_head"))}
 
 
 def job_progress(prof: Profile, job_id: str, j: dict, states=_FETCH, finalize: bool = False):
@@ -2940,6 +2950,8 @@ def progress_lines(job_id: str, state: str, view: dict, why: str = "") -> list[s
     elif view["last_event_age_s"] is not None:
         head += f"  last activity {fmt_dur(view['last_event_age_s'], True)} ago"
     lines = [head]
+    if view.get("branch"):
+        lines.append(f"branch {view['branch']}" + (f" at {view['end_head'][:12]}" if view.get("end_head") else ""))
     plan = view["plan"]
     if plan:
         n = plan["done"] * 20 // plan["total"]
@@ -3110,6 +3122,7 @@ def cmd_progress(prof: Profile, args) -> int:
 # review branch and reports. It never merges. The remote name is built here, never read from the VM.
 FETCH_WAIT, FETCH_POLL, FETCH_HOLD = 60.0, 1.5, 300      # seconds: wait for the remote, poll gap, keep-awake session
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")     # no leading '-', no spaces, no '@{', ':', '~', '^', '*', '\\'
+JOB_BRANCH_MAX = 100        # longest branch name taken from a job's (agent-written) branch file
 LOG_CAP, STAT_CAP = 50, 30
 
 
@@ -3130,9 +3143,49 @@ def host_git(prof: Profile, *args, check: bool = True, timeout: float = 120):
     return r
 
 
+def ref_name_ok(value) -> bool:
+    """The rules check_fetch_ref applies before it asks git (which also checks the result)."""
+    return isinstance(value, str) and REF_RE.fullmatch(value) is not None and ".." not in value \
+        and "//" not in value and not value.endswith(("/", ".", ".lock")) and "/." not in value \
+        and ".lock/" not in value and len(value) <= 200
+
+
+def job_branch(value) -> str | None:
+    """The branch a job's workspace ended on, or None. The job dir is agent-writable, so only a plain
+    branch name gets through: at most JOB_BRANCH_MAX characters of [A-Za-z0-9._/-], no leading '-' or '.',
+    no '..', '//', trailing '/' or '.lock', not HEAD or refs/..., and check_fetch_ref's rules."""
+    if not isinstance(value, str) or not 0 < len(value) <= JOB_BRANCH_MAX or not ref_name_ok(value):
+        return None
+    return None if value == "HEAD" or value.startswith("refs/") else value
+
+
+def fetch_defaults(name: str, job: dict | None, ref: str | None = None, branch: str | None = None) -> dict:
+    """What `fetch <name>` fetches, and into which branch: {"ref", "branch", "source", "why"}. Explicit
+    --ref / --branch win; otherwise the ref is the branch the latest job ended on, else main. A ref from a
+    job goes to review/<name>-<ref, '/' -> '-'> (review/<name>/<x> would clash with review/<name> in git),
+    anything else to review/<name>. Shared by `fetch` and the dashboard's confirmation."""
+    job = job or {}
+    jb = job_branch(job.get("branch"))
+    jid = job.get("id") if isinstance(job.get("id"), str) and JOB_ID_RE.match(job.get("id")) else None
+    if ref is not None:
+        source, why = "flag", "given with --ref"
+    elif jb:
+        ref, source, why = jb, "job", f"the branch job {jid or '?'} ended on"
+    else:
+        ref, source = "main", "default"
+        if not jid:
+            why = "the default: no job recorded"
+        elif job.get("state") == "running":
+            why = f"the default: job {jid} is still running, and its branch is recorded when it ends"
+        else:
+            why = f"the default: no branch recorded for job {jid} (detached HEAD, or an older job)"
+    if branch is None:
+        branch = f"review/{name}-{ref.replace('/', '-')}" if source == "job" and ref != "main" else f"review/{name}"
+    return {"ref": ref, "branch": branch, "source": source, "why": why}
+
+
 def check_fetch_ref(what: str, value: str) -> str:
-    if not REF_RE.match(value) or ".." in value or "//" in value or value.endswith(("/", ".", ".lock")) \
-            or "/." in value or len(value) > 200:
+    if not ref_name_ok(value):
         die(f"{what} {value!r} is not an acceptable branch name", EXIT_USAGE)
     r = subprocess.run(["git", "check-ref-format", "--branch", value], capture_output=True, text=True,
                        stdin=subprocess.DEVNULL)
@@ -3208,11 +3261,35 @@ def fetch_job_note(prof: Profile) -> tuple[bool, str]:
         return False, ""
 
 
+def fetch_branch_free(prof: Profile, branch: str):
+    if f"refs/heads/{branch}" in checked_out_branches(prof):
+        die(f"branch {branch} is checked out in {prof.primary}; pick another with --branch", EXIT_USAGE)
+
+
+def fetch_target(prof: Profile, args) -> dict:
+    """fetch_defaults for the profile's latest job, checked, announced, plus the review branch's ref and
+    current tip. Reading the job is best effort: no job is better than a failed fetch."""
+    try:
+        job = job_info(prof)
+    except SystemExit:
+        job = None
+    t = fetch_defaults(prof.name, job, args.ref, args.branch)
+    check_fetch_ref("--ref", t["ref"])
+    check_fetch_ref("--branch", t["branch"])
+    info(f"fetching {t['ref']} ({t['why']}) into {t['branch']}")
+    full = f"refs/heads/{t['branch']}"
+    fetch_branch_free(prof, t["branch"])
+    tip = host_git(prof, "rev-parse", "--verify", "-q", f"{full}^{{commit}}", check=False)
+    return t | {"full": full, "previous": tip.stdout.strip() if tip.returncode == 0 else None}
+
+
 def cmd_fetch(prof: Profile, args) -> int:
     if prof.d["mode"] != "clone":
         die(f"profile '{prof.name}' is in direct mode: the agent edits {prof.primary} itself, so there is"
             f" nothing to fetch. Review what it changed with `agentbox audit {prof.name}`", EXIT_USAGE)
-    ref, branch = check_fetch_ref("--ref", args.ref), check_fetch_ref("--branch", args.branch)
+    for what, v in (("--ref", args.ref), ("--branch", args.branch)):
+        if v is not None:
+            check_fetch_ref(what, v)
     remote = f"sandbox-{prof.sandbox}"
     vm = sandbox_state(prof)
     if vm == "unknown":
@@ -3223,17 +3300,18 @@ def cmd_fetch(prof: Profile, args) -> int:
     if vm == "stopped" and not args.start:
         die(f"sandbox {prof.sandbox} is stopped, and sbx removes {remote} when a sandbox stops. --start boots it;"
             f" booting relaunches the agent that was last started with `sbx run`")
-    full = f"refs/heads/{branch}"
     if host_git(prof, "rev-parse", "--git-dir", check=False).returncode != 0:
         die(f"{prof.primary} is not a git repository")
-    if full in checked_out_branches(prof):
-        die(f"branch {branch} is checked out in {prof.primary}; pick another with --branch", EXIT_USAGE)
-    tip_r = host_git(prof, "rev-parse", "--verify", "-q", f"{full}^{{commit}}", check=False)
-    previous = tip_r.stdout.strip() if tip_r.returncode == 0 else None
+    if args.branch is not None:
+        fetch_branch_free(prof, args.branch)
+    # The job is looked at while the sandbox runs: a job found ended while it is stopped reads as lost.
+    target = fetch_target(prof, args) if vm == "running" else None
 
     try:
         with keep_awake(prof) as child:
             wait_for_remote(prof, remote, child)
+            target = target or fetch_target(prof, args)
+            ref, branch, full, previous = target["ref"], target["branch"], target["full"], target["previous"]
             if previous and not args.force:
                 host_git(prof, "fetch", "--no-tags", "--", remote, ref, timeout=300)
                 fetched = host_git(prof, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
@@ -3268,6 +3346,7 @@ def cmd_fetch(prof: Profile, args) -> int:
              f" (`agentbox progress {prof.name}`)")
     if args.json:
         emit_json({"profile": prof.name, "sandbox": prof.sandbox, "remote": remote, "ref": ref, "branch": branch,
+                   "ref_source": target["source"],
                    "commit": commit, "previous": previous, "fast_forward_from_head": ff, "commits": commits,
                    "commits_total": total, "files_changed": files, "insertions": ins, "deletions": dels,
                    "job_running": running})
@@ -3799,16 +3878,17 @@ def dash_layout(width: int, height: int, nrows: int) -> dict | None:
 
 def dash_new_ui(size=(80, 24)) -> dict:
     """The UI state dash_key and dash_render share. `names` is the sorted profile names, `sel` an index
-    into it, `top` / `dtop` the scroll of the list / details, `mode` list | help | confirm."""
+    into it, `top` / `dtop` the scroll of the list / details, `mode` list | help | confirm | nofetch (fetch
+    refused: the sandbox is not running), `vm` each profile's sandbox state."""
     return {"names": [], "sel": 0, "top": 0, "dtop": 0, "size": tuple(size), "mode": "list", "target": None,
-            "msg": "", "busy": False, "error": ""}
+            "msg": "", "busy": False, "error": "", "vm": {}}
 
 
-def dash_set_rows(ui: dict, names: list) -> dict:
+def dash_set_rows(ui: dict, names: list, vms: dict | None = None) -> dict:
     """New data arrived: keep the same profile selected if it is still there."""
     old = ui["names"][ui["sel"]] if ui["names"] else None
     sel = names.index(old) if old in names else min(ui["sel"], max(0, len(names) - 1))
-    return _dash_follow({**ui, "names": list(names), "sel": sel}, sel)
+    return _dash_follow({**ui, "names": list(names), "sel": sel, "vm": dict(vms or {})}, sel)
 
 
 def _dash_follow(ui: dict, sel: int) -> dict:
@@ -3834,7 +3914,9 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
     "home", "end", "pgup", "pgdn", "enter", "esc", "ctrl-c", "resize"), ("click", x, y) or
     ("wheel", +1/-1, x, y). Actions: ("quit",), ("refresh",), ("redraw",), ("progress", name),
     ("logs", name), ("confirm_fetch", name) and, only straight after a confirm_fetch and a "y",
-    ("fetch", name). The loop runs them; dash_argv says how."""
+    ("fetch", name). The loop runs them; dash_argv says how. `f` on a stopped or missing sandbox only
+    says why there is nothing to fetch: fetch needs the sandbox running, and booting it (`fetch --start`)
+    relaunches the agent, so the dashboard never offers that."""
     ui = {**ui, "msg": ""}
     n = len(ui["names"])
     name = ui["names"][ui["sel"]] if n else None
@@ -3845,8 +3927,8 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
         if key in ("y", "Y") and target:
             return ui, ("fetch", target)
         return {**ui, "msg": "fetch cancelled"}, None
-    if ui["mode"] == "help":
-        return {**ui, "mode": "list"}, ("quit",) if key in ("q", "ctrl-c") else None
+    if ui["mode"] in ("help", "nofetch"):
+        return {**ui, "mode": "list", "target": None}, ("quit",) if key in ("q", "ctrl-c") else None
     if key in ("q", "Q", "ctrl-c"):
         return ui, ("quit",)
     lay = dash_layout(*ui["size"], n)
@@ -3882,6 +3964,8 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
     if key == "l":
         return ui, ("logs", name)
     if key == "f":
+        if (ui.get("vm") or {}).get(name) in ("stopped", "missing"):
+            return {**ui, "mode": "nofetch", "target": name}, None
         return {**ui, "mode": "confirm", "target": name}, ("confirm_fetch", name)
     return ui, None
 
@@ -3988,6 +4072,9 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
     L.append([("job  ", "bold"), (job.get("id"), ""), ("  ", ""), (jstate, jstyle.get(jstate, ""))]
              + ([("  STALLED", "red bold")] if view.get("stalled") else []))
     code = job.get("exit_code")
+    if job_branch(job.get("branch")):
+        L.append([("     branch  ", ""), (job_branch(job.get("branch")), "bold"),
+                  (f"  at {job['end_head'][:12]}" if _commit(job.get("end_head")) else "", "dim")])
     L.append([(f"     started {_dash_clock(job.get('started_at'), now)}   finished {_dash_clock(job.get('finished_at'), now)}"
                f"   exit {code if _int_or_none(code) is not None else '-'}", "")])
     L.append([(f"     elapsed {_dash_dur(view.get('elapsed_s'), True)}   idle {_dash_dur(view.get('last_event_age_s'), True)}"
@@ -4025,6 +4112,27 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
     if view.get("note"):
         L.append([("note ", "bold"), (view.get("note"), ""), ("   agent's note", "dim")])
     return L
+
+
+def dash_fetch_text(row: dict, name: str, ok: bool) -> list:
+    """The body of the `f` box: what `agentbox fetch <name>` will fetch and where (resolved by
+    fetch_defaults, as fetch itself does), or - for a stopped or missing sandbox - why it can't."""
+    sandbox = row.get("sandbox") or "the sandbox"
+    if not ok:
+        if row.get("vm") == "missing":
+            return [[(f"Sandbox {sandbox} does not exist, so there is nothing to fetch.", "")], [],
+                    [("any key closes this", "dim")]]
+        return [[(f"Sandbox {sandbox} is stopped. Fetch needs it running:", "")],
+                [("sbx drops the sandbox's git remote when it stops.", "")],
+                [("Booting it (`agentbox fetch --start`) relaunches the agent", "dim")],
+                [("last started with `sbx run`, so it is not offered here.", "dim")], [],
+                [("any key closes this", "dim")]]
+    t = fetch_defaults(name, row.get("job"))
+    return [[("This runs:", "")], [("  " + shlex.join(["agentbox", "fetch", name]), "bold")], [],
+            [("  fetches  ", "dim"), (t["ref"], "bold"), (f"  ({t['why']})", "dim")],
+            [("  into     ", "dim"), (t["branch"], "bold")],
+            [("  (if the job changes before it runs, fetch follows the new job)", "dim")], [],
+            [("y", "bold"), (" to run it, any other key cancels", "")]]
 
 
 def _dash_box(title: str, body: list, w: int, ascii_: bool) -> list:
@@ -4091,9 +4199,9 @@ def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = 
         kw = max(dash_cells(k) for k, _ in help_)
         box = _dash_box("keys", [[(f"{k:<{kw}}  ", "bold"), (d, "")] for k, d in help_]
                         + [[], [("any key closes this", "dim")]], w, ascii_)
-    elif ui.get("mode") == "confirm" and ui.get("target"):
-        box = _dash_box("fetch", [[("This runs:", "")], [("  " + shlex.join(["agentbox", "fetch", ui["target"]]), "bold")],
-                                  [], [("y", "bold"), (" to run it, any other key cancels", "")]], w, ascii_)
+    elif ui.get("mode") in ("confirm", "nofetch") and ui.get("target"):
+        box = _dash_box("fetch", dash_fetch_text(next((r for r in rows if r.get("name") == ui["target"]), {}),
+                                                 ui["target"], ui["mode"] == "confirm"), w, ascii_)
     if box:
         top = max(0, (len(body) - len(box)) // 2)
         bw = sum(dash_cells(t) for t, _ in box[0])
@@ -4104,6 +4212,8 @@ def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = 
         foot = [(" " + ui["msg"], "yellow")]
     elif ui.get("mode") == "confirm":
         foot = [(" y", "bold"), (" fetch   ", ""), ("any other key", "bold"), (" cancel", "")]
+    elif ui.get("mode") == "nofetch":
+        foot = [(" any key", "bold"), (" close", "")]
     else:
         keys = (("j/k" if ascii_ else "↑↓", "select"), ("Enter", "progress"), ("l", "logs"), ("f", "fetch"),
                 ("r", "refresh"), ("?", "help"), ("q", "quit"))
@@ -4239,7 +4349,8 @@ class DashScreen:
                 self.data = res[1]
                 self.history.add(self.data)
                 dashboard_rex(self.rex, self.data)
-                ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in dash_sort(self.data.get("profiles") or [])])
+                rows = dash_sort(self.data.get("profiles") or [])
+                ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in rows], {r.get("name"): r.get("vm") for r in rows})
             elif res:
                 ui = {**ui, "error": f"refresh failed: {res[1]}"}
             if res:
@@ -5308,8 +5419,11 @@ def main():
     p.add_argument("--interval", type=float, default=5.0, metavar="S", help="seconds between --watch updates (default 5)")
     p.add_argument("--json", action="store_true", help="print the job.progress object of `status --json`")
     p = sub.add_parser("fetch", help="clone mode: fetch the agent's commits into a review branch (never merges)")
-    p.add_argument("profile"); p.add_argument("--branch"); p.add_argument("--ref", default="main", metavar="REF",
-                   help="branch to fetch from the sandbox (default main)")
+    p.add_argument("profile")
+    p.add_argument("--ref", metavar="REF", help="branch to fetch from the sandbox (default: the branch the latest"
+                   " job ended on, else main)")
+    p.add_argument("--branch", metavar="B", help="review branch to fetch into (default: review/<profile>-<ref> for"
+                   " a job's branch, review/<profile> for main)")
     p.add_argument("--start", action="store_true", help="boot the sandbox if it is stopped")
     p.add_argument("--force", action="store_true", help="overwrite the review branch even if not a fast-forward")
     p.add_argument("--json", action="store_true")
@@ -5384,7 +5498,6 @@ def main():
     if a.cmd == "progress":
         sys.exit(cmd_progress(prof, a))
     if a.cmd == "fetch":
-        a.branch = f"review/{prof.name}" if a.branch is None else a.branch
         sys.exit(cmd_fetch(prof, a))
     if a.cmd == "keepalive":
         sys.exit(cmd_keepalive(prof))

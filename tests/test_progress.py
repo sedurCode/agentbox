@@ -565,7 +565,8 @@ class StatusShapeTests(ProgressCase):
         self.set_output(job, asst("m1", usage=USAGE, tools=["Bash"]))
         p = self.status_job()["p"]["job"]["progress"]
         self.assertTrue(self.KEYS <= set(p))
-        self.assertEqual(set(p) - self.KEYS, {"tools_top", "stale"})
+        self.assertEqual(set(p) - self.KEYS, {"tools_top", "stale", "branch", "end_head"})
+        self.assertEqual((p["branch"], p["end_head"]), (None, None))         # running: not recorded yet
         self.assertEqual(set(p["tokens"]), {"input", "output", "cache_read", "cache_creation", "total"})
         self.assertEqual(p["plan"]["steps"], [{"text": "a", "status": "done"}, {"text": "b", "status": "active"},
                                               {"text": "c", "status": "pending"}])
