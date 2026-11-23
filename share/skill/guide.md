@@ -109,6 +109,11 @@ Otherwise `wait` exits with the job's own exit code (`0` success, `1` agent erro
 can also be 2 to 5, read `job.exit_code` from `agentbox status --json` when it matters. On `1` and `2`
 stdout is empty, so check the exit code before parsing `--json` output.
 
+Claude jobs run in Claude Code's auto mode (`permission_mode`, default `"auto"`): risky actions are
+refused, and `progress --json` counts them as `denials`. Report a job that keeps being denied to the owner
+rather than working around it; only the owner sets `permission_mode = "bypass"`. If `run` fails because auto
+mode is unavailable, tell the owner what it said.
+
 `run` refuses while a job is still running on that profile; wait for it first. `fetch` with no flags fetches
 the branch the last job ended on (`job.branch` in `status --json`) into `review/<p>-<branch>` (each `/`
 becomes `-`), or `main` into `review/<p>` when none is recorded; it prints which and why. Pass `--ref` and

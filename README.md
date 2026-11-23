@@ -174,6 +174,7 @@ the important keys:
 | `env` | plain env vars for the VM (not for secrets) |
 | `secrets` | sandbox-scoped credentials, see §4 |
 | `keepalive` | `true` (default). `false`: `agentbox run` doesn't hold an exec session open while a job runs, so sbx may stop the sandbox under a detached job (see *Headless jobs*) |
+| `permission_mode` | Claude only (also in `[defaults]`, where it applies to Claude profiles only): `"auto"` (default), Claude Code's auto mode, or `"bypass"`, the old `--dangerously-skip-permissions` — see *Permission mode* in §7 |
 | `stall_after` | `300` (seconds). A running job with no event for longer is shown as STALLED by `progress` and `status` (see *Watching a job*) |
 | `host_tools`, `host_tools_port` | which `[tools.*]` this sandbox may call, and a unique port per profile |
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
@@ -387,9 +388,12 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   command line. `--prompt-file` (or `-` for stdin) is preferred over `--prompt TEXT`, because
   `--prompt` text is part of *your own* `agentbox` command line on the Mac. `--agent-args ...`
   takes the rest of the line; the profile's `agent_args` (meant for interactive `up`) are not used.
-- **What runs.** `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`, or
+- **What runs.** `claude -p --output-format stream-json --verbose --permission-mode auto` (Claude Code's
+  auto mode; with `permission_mode = "bypass"` it is `--dangerously-skip-permissions` instead), or
   `opencode run --format json --auto` (plus `--model=ollama/<model>` with `local_model`); the VM is the
-  boundary, as for `up`. It runs in the primary workspace, via `setsid nohup`, so the job survives the
+  boundary, as for `up`, and auto mode is a second layer inside it (see *Permission mode* in §7). In auto
+  mode `run` waits up to 30 s for Claude's first event: if Claude Code started in another mode (auto mode
+  unavailable for the plan, model or version) it stops the job and fails, suggesting `bypass`. It runs in the primary workspace, via `setsid nohup`, so the job survives the
   exec session that started it. Both read the prompt on stdin (`opencode run` does when stdin is not a
   terminal; checked with opencode 1.19.6), so it is on no command line.
 - **Job directory** (inside the VM, `~/.agentbox/jobs/<id>/`, id like `20260101T120000Z-ab12cd`):
@@ -565,14 +569,15 @@ first) the last cached totals are shown.
                      "plan": {"steps": [{"text": "write the test", "status": "done"},
                                         {"text": "make it pass", "status": "active"}],
                               "current": 2, "done": 1, "total": 2},
-                     "note": "waiting for the flash tool", "stale": false,
+                     "note": "waiting for the flash tool", "stale": false, "denials": 0,
                      "branch": null, "end_head": null}}
 ```
 
 `plan` is `null` when the agent declared none, `plan.current` is the first `active` step (1-based) or
 `null`, a step's `status` is `pending`, `active` or `done`, `elapsed_s` is up to now (running) or up to
 `finished_at`, `last_event_age_s` is `null` unless the job is running, and `stale` is true when the values
-come from the host's cache because the sandbox could not be read. `branch` and `end_head` are the branch and
+come from the host's cache because the sandbox could not be read. `denials` counts the actions Claude
+Code's permission check refused (see *Permission mode* in §7; always 0 for opencode). `branch` and `end_head` are the branch and
 commit the workspace ended on (`null` while the job runs, or when unknown; see *Which branch*).
 
 ### Dashboard
@@ -978,6 +983,32 @@ echoed in errors all go through one `safe_text()` that turns control characters 
 C1 range, line-separator and bidi-override characters) into visible `\xNN` / `\uNNNN` escapes. Otherwise
 an escape sequence in a file name or log line could rewrite your screen or write your clipboard (OSC 52).
 `--json` output is already escaped by the JSON encoder. Tab and newline are kept.
+
+### Permission mode (Claude)
+
+The sandbox is the boundary: the agent can do anything inside the VM, and nothing outside it beyond what
+the profile grants. Inside it, Claude profiles run Claude Code in **auto mode** by default
+(`permission_mode = "auto"`): Claude Code's classifier approves routine actions and blocks risky ones (say,
+force-pushing, or deleting things outside the task), as a second layer. It does not replace the sandbox.
+`permission_mode = "bypass"` is the old behaviour, `--dangerously-skip-permissions`: no checks at all,
+for when auto mode gets in the way. `doctor` shows the mode and warns about `bypass`.
+
+- `run`: `--permission-mode auto` (or `--dangerously-skip-permissions`) on the headless argv. When auto
+  mode is not available (plan, model, settings or Claude Code version), Claude Code carries on in another
+  mode instead of failing; `run` sees that in the stream's first (`init`) event, stops the job and exits 1
+  with a hint to set `bypass`. A Claude Code too old to know the mode exits at once, and `run` reports
+  that the same way.
+- `up`, `fresh` and `resume` pass `--permission-mode=auto` (or `--dangerously-skip-permissions`) to the
+  agent after sbx's `--`, so the session starts in that mode whatever sbx's Claude agent defaults to.
+  Claude Code shows the mode in its status line; Shift+Tab cycles modes.
+- **Denials.** An action auto mode refuses comes back to the agent as an error tool result
+  ("Permission for this action was denied by the Claude Code auto mode classifier. Reason: ...");
+  the agent may try another way. agentbox counts them: `denials` in `progress --json` and
+  `job.progress` of `status --json`, a `DENIED n` line in `progress`, `n denied` on `status` lines, a
+  `denied` line in the dashboard's details, and `denied: <reason>` lines in `logs`. A job that keeps
+  being denied is not failed for it; look at its log and decide.
+- The key is refused on non-Claude profiles (opencode's `--auto` is unrelated: it approves opencode's
+  own tool permissions and stays on).
 
 ## 8. Troubleshooting
 

@@ -223,7 +223,8 @@ class RunTests(JobCase):
                                lambda s, cfg, *a, **k: (runs.append(a), subprocess.CompletedProcess(a, 0, "", ""))[1]
                                if a[0] == "run" else orig(s, cfg, *a, **k)):
             self.assertEqual(ab.cmd_resume(self.prof, self.args()), 0)
-            self.assertEqual(runs[0], ("run", "--name", "ab-p", "--", "--resume=sess-12345678"))
+            self.assertEqual(runs[0], ("run", "--name", "ab-p", "--", "--permission-mode=auto",
+                                       "--resume=sess-12345678"))
             for evil in ("--settings", "-p"):                      # an agent-written session_id file / host record
                 (self.vm.jobdir(job) / "session_id").write_text(evil)
                 rec = ab.job_record(self.prof)
@@ -420,7 +421,8 @@ class UpTests(JobCase):
                                if a[0] == "run" else orig(s, cfg, *a, **k)), contextlib.redirect_stdout(io.StringIO()):
             ab.cmd_up(self.prof, argparse.Namespace(agent_args=[]))
             ab.cmd_up(self.prof, argparse.Namespace(agent_args=["--resume", "x"]))
-        self.assertEqual(runs, [("run", "--name", "ab-p"), ("run", "--name", "ab-p", "--", "--resume", "x")])
+        self.assertEqual(runs, [("run", "--name", "ab-p", "--", "--permission-mode=auto"),
+                                ("run", "--name", "ab-p", "--", "--permission-mode=auto", "--resume", "x")])
 
 
 @needs_linux_vm

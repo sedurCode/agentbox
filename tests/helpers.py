@@ -158,9 +158,12 @@ class FakeSbx:
         return self
 
 
-FAKE_CLAUDE = """#!/bin/sh
+FAKE_CLAUDE = r"""#!/bin/sh
 cat > /dev/null
-echo '{"type":"system","subtype":"init","session_id":"sess-12345678","model":"m"}'
+[ -n "$FAKE_CLAUDE_ARGV" ] && printf '%s\n' "$@" > "$FAKE_CLAUDE_ARGV"
+if [ -n "$FAKE_CLAUDE_USAGE_ERROR" ]; then echo "$FAKE_CLAUDE_USAGE_ERROR" >&2; exit 1; fi
+m=; [ -n "$FAKE_CLAUDE_MODE" ] && m=",\"permissionMode\":\"$FAKE_CLAUDE_MODE\""
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-12345678\",\"model\":\"m\"$m}"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello there"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}'
 sleep ${FAKE_CLAUDE_SLEEP:-0}
 echo '{"type":"result","subtype":"success","result":"all done"}'

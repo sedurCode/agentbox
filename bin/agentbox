@@ -160,6 +160,13 @@ SKILLS_VM_DIR = "$HOME/.claude/skills"      # where Claude Code reads user skill
 
 # `local_model`: an agent in the sandbox using a model served on the host. Only Ollama + opencode for now;
 # `provider` is there so other servers (and agents) can be added without changing the key.
+# Claude profiles' `permission_mode`: Claude Code's auto mode (its classifier approves routine actions and
+# blocks risky ones, a second layer inside the sandbox), or "bypass", which skips every permission check.
+# Headless argv (`run`) and the interactive one (`up`, `resume`; `=` form, after sbx's `--`).
+PERMISSION_MODES = {"auto": (["--permission-mode", "auto"], ["--permission-mode=auto"]),
+                    "bypass": (["--dangerously-skip-permissions"], ["--dangerously-skip-permissions"])}
+PERMISSION_MODE_AGENTS = {"claude"}
+
 LOCAL_MODEL_PROVIDERS = {"ollama": 11434}    # provider -> default port
 LOCAL_MODEL_AGENTS = {"opencode"}
 LOCAL_MODEL_KEYS = {"provider", "model", "port", "context"}
@@ -311,6 +318,21 @@ def local_model_problems(cfg: Config, d: dict) -> list[str]:
     return out
 
 
+def permission_mode_problems(cfg: Config, name: str, d: dict) -> list[str]:
+    """What is wrong with a profile's `permission_mode` (empty if fine or not set). A value from
+    [defaults] applies to Claude profiles only; set in a non-Claude profile's own table it is an error."""
+    out = []
+    pm = d.get("permission_mode")
+    if pm is not None and not (isinstance(pm, str) and pm in PERMISSION_MODES):
+        out.append(f"permission_mode must be \"auto\" (the default: Claude Code's auto mode) or \"bypass\""
+                   f" (--dangerously-skip-permissions), got {pm!r}")
+    own = cfg.raw.get("profiles", {}).get(name)
+    if isinstance(own, dict) and "permission_mode" in own and d.get("agent") not in PERMISSION_MODE_AGENTS:
+        out.append(f"permission_mode is only for agent = \"claude\" (this profile's agent is {d.get('agent')!r});"
+                   " remove it (opencode's --auto is unrelated and always on)")
+    return out
+
+
 class Profile:
     def __init__(self, cfg: Config, name: str, d: dict):
         self.cfg, self.name, self.d = cfg, name, d
@@ -335,7 +357,7 @@ class Profile:
         sa = d["stall_after"]
         if not isinstance(sa, int) or isinstance(sa, bool) or sa < 1:
             die(f"profile '{name}': stall_after must be a positive number of seconds", EXIT_USAGE)
-        problems = local_model_problems(cfg, d)
+        problems = local_model_problems(cfg, d) + permission_mode_problems(cfg, name, d)
         if problems:
             die(f"profile '{name}': " + "\n  ".join(problems), EXIT_USAGE)
 
@@ -358,6 +380,16 @@ class Profile:
         if self.tool_names and not p:
             die(f"profile '{self.name}' lists host_tools but has no host_tools_port", EXIT_USAGE)
         return p
+
+    @property
+    def permission_mode(self) -> str | None:
+        """"auto" or "bypass" for a Claude profile; None for any other agent."""
+        return (self.d.get("permission_mode") or "auto") if self.d["agent"] in PERMISSION_MODE_AGENTS else None
+
+    def mode_args(self, interactive: bool) -> list[str]:
+        """The agent arguments that select the permission mode (none for agents without one)."""
+        pm = self.permission_mode
+        return list(PERMISSION_MODES[pm][1 if interactive else 0]) if pm else []
 
     @property
     def local_model(self) -> dict | None:
@@ -1952,7 +1984,8 @@ def cmd_up(prof: Profile, args) -> int:
     ensure_sandbox(prof)
     sync_skills(prof)
     run = ["run", "--name", prof.sandbox]
-    agent_args = list(args.agent_args or prof.d["agent_args"])
+    # the permission mode first, so the session starts in it whatever sbx's agent defaults to
+    agent_args = prof.mode_args(interactive=True) + list(args.agent_args or prof.d["agent_args"])
     if agent_args:
         run += ["--", *agent_args]
     r = sbx(cfg, *run, check=False)
@@ -2064,8 +2097,8 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$")   # never starts
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 JOB_DIR = '"$HOME/.agentbox/jobs/{id}"'
 HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resumes a session
-    "claude": {"cmd": ["claude", "-p", "--output-format", "stream-json", "--verbose",
-                       "--dangerously-skip-permissions"], "resume": "--resume"},
+    # + the permission mode: `--permission-mode auto`, or `--dangerously-skip-permissions` (Profile.mode_args)
+    "claude": {"cmd": ["claude", "-p", "--output-format", "stream-json", "--verbose"], "resume": "--resume"},
     # `opencode run` reads the prompt from stdin when it is not a terminal (and appends any message
     # words, of which we pass none), so the prompt stays off the argv here too. --auto approves tool
     # permissions (opencode 1.19: `--dangerously-skip-permissions` is a hidden alias).
@@ -2263,7 +2296,11 @@ def render_stream_line(line: str) -> str | None:
     if kind in OPENCODE_EVENTS:
         return render_opencode_event(ev)
     if kind == "system" and ev.get("subtype") == "init":
-        return safe_text(f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}")
+        mode = f" mode {_squash(ev['permissionMode'], 30)}" if isinstance(ev.get("permissionMode"), str) else ""
+        return safe_text(f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}{mode}")
+    if kind == "user":
+        denied = [f"denied: {_squash(d)}" for d in map(denial_text, tool_results(ev)) if d is not None]
+        return safe_text("\n".join(denied)) or None
     if kind == "assistant":
         parts = []
         content = (ev.get("message") or {}).get("content")
@@ -2279,6 +2316,35 @@ def render_stream_line(line: str) -> str | None:
     if kind == "result":
         return safe_text(f"[result] {ev.get('subtype', '?')}: {_squash(ev.get('result', ''))}".rstrip(": "))
     return None
+
+
+# How Claude Code (2.1.306) words a tool call its permission check refused: the tool_result (is_error) text
+# starts with one of these. The first is auto mode's classifier; the second any other refusal, such as a
+# deny rule. Read from the claude binary; the end-of-run `result` event also lists them (permission_denials).
+DENIAL_PREFIXES = ("Permission for this action was denied by the Claude Code auto mode classifier.",
+                   "Permission for this action has been denied.")
+
+
+def tool_results(ev: dict) -> list[dict]:
+    """The tool_result blocks of a stream-json `user` event."""
+    msg = ev.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
+        if isinstance(content, list) else []
+
+
+def denial_text(block: dict) -> str | None:
+    """The text of a tool_result that is a permission denial, else None."""
+    if block.get("is_error") is not True:
+        return None
+    c = block.get("content")
+    if isinstance(c, list):
+        c = next((x.get("text") for x in c if isinstance(x, dict) and x.get("type") == "text"), None)
+    if not isinstance(c, str):
+        return None
+    c = c.strip()
+    c = c[len("<tool_use_error>"):].lstrip() if c.startswith("<tool_use_error>") else c
+    return c if c.startswith(DENIAL_PREFIXES) else None
 
 
 # `opencode run --format json`: one JSON object per line, {"type", "timestamp" (ms), "sessionID", ...}.
@@ -2493,7 +2559,63 @@ def headless_cmd(prof: Profile, spec: dict) -> list[str]:
     """The agent's headless argv. The prompt is never in it: the job wrapper feeds prompt.md on stdin."""
     lm = prof.local_model
     # the model is in the generated opencode config too; on the argv a workspace opencode.json can't override it
-    return [*spec["cmd"], *([f"--model={OPENCODE_PROVIDER}/{lm['model']}"] if lm else [])]
+    return [*spec["cmd"], *prof.mode_args(interactive=False),
+            *([f"--model={OPENCODE_PROVIDER}/{lm['model']}"] if lm else [])]
+
+
+MODE_CHECK_WAIT = 30         # seconds `run` waits for Claude's init event to see the permission mode it started in
+CLAUDE_MODES = {"default", "plan", "acceptEdits", "bypassPermissions", "dontAsk", "auto"}   # init's permissionMode
+
+
+def mode_check_script(job_id: str, wait: float = MODE_CHECK_WAIT) -> str:
+    """sh run in the VM: wait for the job's stream-json init event and print `INIT <permissionMode>`
+    (empty if it has none); or, if the job ends first, `EXITED <code>`, `---` and the start of stderr.log;
+    or TIMEOUT. One exec, so `run` costs no extra sbx round trips while it waits."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    return textwrap.dedent("""\
+        d=@D@; i=0
+        while [ $i -lt @N@ ]; do
+          l=$(head -c 1048576 "$d/output.jsonl" 2>/dev/null | grep -a -m1 '"subtype":"init"')
+          if [ -n "$l" ]; then
+            m=$(printf %s "$l" | grep -o '"permissionMode":"[A-Za-z]*"' | head -n1 | cut -d'"' -f4)
+            echo "INIT $m"; exit 0
+          fi
+          if [ -e "$d/exit_code" ]; then
+            echo "EXITED $(head -c 20 "$d/exit_code" | tr -d '\\n')"; echo ---
+            head -c 2000 "$d/stderr.log" 2>/dev/null; exit 0
+          fi
+          sleep 0.2; i=$((i + 1))
+        done
+        echo TIMEOUT
+        """).replace("@D@", d).replace("@N@", str(int(wait * 5)))
+
+
+def check_auto_mode(prof: Profile, job_id: str):
+    """For an auto-mode Claude job: die - and stop the job - if Claude Code did not start in auto mode.
+    When auto mode is unavailable (plan, model, settings, version) Claude Code says so in its own UI and
+    carries on in another mode; headless, that is only visible as the init event's permissionMode. An older
+    Claude Code that does not know the mode exits at once with a usage error instead."""
+    hint = (f"To run jobs without auto mode, set permission_mode = \"bypass\" in [profiles.{prof.name}] of"
+            f" {CONFIG_FILE} (the sandbox stays the boundary; README: \"Permission mode\").")
+    r = vm_exec(prof, mode_check_script(job_id))
+    out = (r.stdout or "") if r.returncode == 0 else ""
+    first, _, rest = out.partition("\n")
+    if first.startswith("INIT "):
+        mode = first[5:].strip()
+        if mode == "auto" or mode not in CLAUDE_MODES:
+            return                                  # auto, or a Claude Code that doesn't say: carry on
+        vm_exec(prof, kill_script(job_id))
+        die(f"Claude Code started job {job_id} in {mode!r} mode, not auto mode: auto mode is not available"
+            f" here (plan, model, settings or Claude Code version), so the job was stopped. {hint}")
+    elif first.startswith("EXITED "):
+        code = first[7:].strip()
+        err = safe_text(rest.partition("---\n")[2]).strip()
+        if code != "0" and re.search(r"permission.?mode|auto mode", err, re.I):
+            die(f"job {job_id} exited at once (exit {code}): Claude Code did not accept auto mode:\n"
+                f"{err[:600]}\n{hint}")
+    elif first.strip() == "TIMEOUT":
+        info(f"could not confirm auto mode yet: no init event from Claude within {MODE_CHECK_WAIT}s;"
+             f" `agentbox logs {prof.name}` shows the mode on its [init] line")
 
 
 def cmd_run(prof: Profile, args) -> int:
@@ -2537,6 +2659,9 @@ def cmd_run(prof: Profile, args) -> int:
     if r.returncode != 0:
         die(f"the job did not start inside {prof.sandbox} (exit {r.returncode})\n{r.stderr or ''}".rstrip())
     save_job_record(prof, {"id": job_id, "agent": agent, "session_id": None, "expect_commits": expect})
+    overridden = any(a.startswith(("--permission-mode", "--dangerously-skip-permissions")) for a in args.agent_args or [])
+    if prof.permission_mode == "auto" and not overridden:      # --agent-args chose a mode: theirs to judge
+        check_auto_mode(prof, job_id)
     keep = getattr(args, "keepalive", None)
     if prof.d["keepalive"] if keep is None else keep:
         start_keepalive(prof)
@@ -2571,7 +2696,8 @@ def cmd_resume(prof: Profile, args) -> int:
     if not SESSION_ID_RE.match(sid):          # belt and braces: the id comes from an agent-writable file
         die(f"refusing to resume: malformed session id for job {job_id}")
     # `--resume=<id>` / `--session=<id>` (claude and opencode accept it) so the id can never be read as a separate option
-    return sbx(prof.cfg, "run", "--name", prof.sandbox, "--", f"{spec['resume']}={sid}", check=False).returncode
+    return sbx(prof.cfg, "run", "--name", prof.sandbox, "--", *prof.mode_args(interactive=True),
+               f"{spec['resume']}={sid}", check=False).returncode
 
 
 # ------------------------------------------------------------ job progress
@@ -2605,13 +2731,14 @@ def model_family(model) -> str | None:
 
 def new_acc(job_id: str) -> dict:
     return {"job": job_id, "offset": 0, "turns": 0, "tool_calls": 0, "tools": {}, "tokens": {},
-            "last_ts": None, "result": None, "commits": None, "plan": [], "note": "", "seen": []}
+            "last_ts": None, "result": None, "commits": None, "plan": [], "note": "", "seen": [], "denials": 0}
 
 
 def acc_ok(d, job_id: str) -> bool:
     """Is d (read from a file) a usable accumulator for this job?"""
     if not isinstance(d, dict) or d.get("job") != job_id:
         return False
+    d.setdefault("denials", 0)                  # a cache from before denials were counted
     return all(isinstance(d.get(k), type(v)) for k, v in new_acc(job_id).items() if v is not None) \
         and not isinstance(d["offset"], bool)
 
@@ -2677,6 +2804,13 @@ def ingest(acc: dict, text: str):
                 bid = block.get("id")
                 if _seen_once(seen, f"t:{bid[:200]}" if isinstance(bid, str) and bid else None):
                     _count_tool(acc, block.get("name"))
+        elif kind == "user":
+            for block in tool_results(ev):
+                if denial_text(block) is None:
+                    continue
+                bid = block.get("tool_use_id")
+                if _seen_once(seen, f"d:{bid[:200]}" if isinstance(bid, str) and bid else None):
+                    acc["denials"] += 1
         elif kind == "result":
             cost = ev.get("total_cost_usd")
             ok = isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost <= 1e6
@@ -2874,6 +3008,7 @@ def progress_view(prof: Profile, acc: dict, j: dict, rec: dict, now: float) -> d
             "tokens": {**tokens, "total": sum(tokens.values())},
             "cost_usd": cost, "cost_is_estimate": estimate,
             "commits": acc["commits"], "expect_commits": expect if isinstance(expect, int) else None,
+            "denials": acc["denials"],
             "plan": plan, "note": acc["note"] or None, "stale": False,
             "branch": job_branch(j.get("branch")), "end_head": _commit(j.get("end_head"))}
 
@@ -2939,6 +3074,8 @@ def progress_suffix(view: dict | None) -> str:
     parts = ([f"{plan['done']}/{plan['total']}"] if plan else []) + [fmt_dur(view["elapsed_s"])]
     if view["last_event_age_s"] is not None:
         parts.append(f"{fmt_dur(view['last_event_age_s'])} ago")
+    if view.get("denials"):
+        parts.append(f"{view['denials']} denied")
     return " " + " · ".join(parts)
 
 
@@ -2959,6 +3096,9 @@ def progress_lines(job_id: str, state: str, view: dict, why: str = "") -> list[s
         lines.append(f"plan [{'#' * n}{'-' * (20 - n)}] {plan['done']}/{plan['total']}{now}  (agent's plan, not verified)")
     if view["note"]:
         lines.append(f"note: {view['note']}  (agent's note)")
+    if view.get("denials"):
+        lines.append(f"DENIED {view['denials']}: Claude Code's permission check refused {view['denials']} action(s);"
+                     " see `agentbox logs` (lines starting `denied:`)")
     tools = ", ".join(f"{t['name']} {t['count']}" for t in view["tools_top"])
     cost = ""
     if view["cost_usd"] is not None:
@@ -4093,6 +4233,10 @@ def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: boo
               (f" (in {_dash_count(tok.get('input'))} out {_dash_count(tok.get('output'))}"
                f" cache {_dash_count(sum(cache) if None not in cache else None)})", "dim"),
               ("   cost ", ""), (cost, "")])
+    denials = _int_or_none(view.get("denials"))
+    if denials:
+        L.append([(f"     denied  {denials}", "yellow bold"),
+                  ("  actions refused by Claude Code's permission check (see the log: l)", "dim")])
     if view.get("stale"):
         L.append([("     (cached values: the sandbox could not be read)", "dim")])
     sw = max(8, min(60, w - 30))
@@ -4688,11 +4832,15 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
     names = [name] if name else cfg.profile_names()
     for n in names:
         rep.scope = n
-        problems = local_model_problems(cfg, cfg.merged(n))
+        merged = cfg.merged(n)
+        problems = [(p, "fix local_model in agentbox.toml (README: \"Local models with opencode\")")
+                    for p in local_model_problems(cfg, merged)]
+        problems += [(p, "fix permission_mode in agentbox.toml (README: \"Permission mode\")")
+                     for p in permission_mode_problems(cfg, n, merged)]
         if problems:
             rep.say(f"\nprofile {n}")
-            for problem in problems:
-                chk(False, problem, "fix local_model in agentbox.toml (README: \"Local models with opencode\")")
+            for problem, hint in problems:
+                chk(False, problem, hint)
             continue
         prof = cfg.profile(n)
         if not prof.enabled:
@@ -4700,6 +4848,11 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
             rep.skip("skipped (disabled)")
             continue
         rep.say(f"\nprofile {n} ({prof.sandbox})")
+        if prof.permission_mode == "bypass":
+            rep.note("warn", "permission_mode = \"bypass\": Claude runs with --dangerously-skip-permissions, so the"
+                     " sandbox is the only boundary", "remove it to use Claude Code's auto mode as a second layer")
+        elif prof.permission_mode:
+            rep.note("info", "permission_mode: auto (Claude Code's auto mode, inside the sandbox)")
         for r in prof.roots:
             chk(r.exists(), f"workspace {r}", "fix the path in agentbox.toml")
             chk(not is_within(CONFIG_FILE.resolve(), r), "config is outside the workspace",

@@ -22,6 +22,10 @@ agent = "claude"
 mode = "direct"                      # direct: host files mounted read-write
                                      # clone: agent works on its own git clone; you
                                      #        `git fetch sandbox-<name>` to review (no host tools)
+# permission_mode = "auto"           # Claude profiles only. "auto" (default): Claude Code's auto mode, a
+                                     # second layer inside the sandbox that blocks risky actions.
+                                     # "bypass": --dangerously-skip-permissions, the old behaviour, for
+                                     # when auto mode gets in the way. The sandbox is the boundary either way.
 deny = [
   # Belt and braces on top of the global policy. Deny beats allow across all kits.
   # "*.yourcompany.internal",

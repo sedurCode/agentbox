@@ -551,7 +551,7 @@ class NoExecTests(ProgressCase):
 
 class StatusShapeTests(ProgressCase):
     KEYS = {"elapsed_s", "last_event_age_s", "stalled", "turns", "tool_calls", "tokens", "cost_usd", "cost_is_estimate",
-            "commits", "expect_commits", "plan", "note"}
+            "commits", "expect_commits", "plan", "note", "denials"}
 
     def status_job(self):
         code, out, _ = self.run_main("status", "--json")
