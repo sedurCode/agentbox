@@ -25,6 +25,7 @@ Docker Sandboxes (`sbx`).
     agentbox resume <profile> [--job ID]               attach interactively to the job's session
     agentbox progress <profile> [--job ID] [--watch [--interval S]] [--json]   how far the job is
     agentbox fetch <profile> [--ref R] [--branch B] [--start] [--force] [--json]   clone mode: the job's branch, to review/<profile>-<branch>
+    agentbox history [<profile>] [--json]  the jobs each profile ran: branch, cost, title, the agent's summary
     agentbox skill show|setup|status|remove   the skill for agents on this machine (status --json)
 
 Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
@@ -2255,6 +2256,7 @@ def job_info(prof: Profile, job_id: str | None = None, states=_FETCH) -> dict:
         out = job_summary(job_id, classify_job(probe), {**known, **probe["files"]}) | {"vm": "running"}
     if mine and out["state"] != "running":
         save_job_record(prof, {**rec, **{k: out[k] for k in NO_JOB if k != "id"}, "id": job_id})
+        note_job_ended(prof, job_id, out)
     elif mine and out["session_id"] and rec.get("session_id") != out["session_id"]:
         save_job_record(prof, {**rec, "session_id": out["session_id"]})
     return out
@@ -2658,7 +2660,9 @@ def cmd_run(prof: Profile, args) -> int:
                        'while [ ! -s "$d/pid" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; [ -s "$d/pid" ]'))
     if r.returncode != 0:
         die(f"the job did not start inside {prof.sandbox} (exit {r.returncode})\n{r.stderr or ''}".rstrip())
-    save_job_record(prof, {"id": job_id, "agent": agent, "session_id": None, "expect_commits": expect})
+    record_history(prof)                            # the job this one replaces in job.json, if it never was
+    save_job_record(prof, {"id": job_id, "agent": agent, "session_id": None, "expect_commits": expect,
+                           "title": brief_title(prompt)})
     overridden = any(a.startswith(("--permission-mode", "--dangerously-skip-permissions")) for a in args.agent_args or [])
     if prof.permission_mode == "auto" and not overridden:      # --agent-args chose a mode: theirs to judge
         check_auto_mode(prof, job_id)
@@ -3253,6 +3257,179 @@ def cmd_progress(prof: Profile, args) -> int:
     except KeyboardInterrupt:
         rex.report({"state": "idle"}, prof.name)
         raise
+
+
+# ----------------------------------------------------------------- history
+# The host keeps only a profile's latest job in job.json, and the agent's final summary lives only in the VM,
+# which sbx stops ~30 s after a job ends. So when agentbox first sees a job ended (job_info, while the VM can
+# still be read), it appends one record per job to $state_dir/<sandbox>/history.jsonl: the measured numbers,
+# the brief's title and the agent's own summary. Both texts are agent-writable: safe_text'd and capped here,
+# and dash_clean'ed again wherever they are drawn.
+HISTORY_FILE, HISTORY_MAX = "history.jsonl", 200      # jobs kept per profile
+SUMMARY_MAX, TITLE_MAX = 8192, 200                    # characters
+HISTORY_PROMPT_READ, HISTORY_RESULT_READ = 16384, 1 << 20   # bytes read from prompt.md / the result line
+HISTORY_KEYS = ("id", "state", "started_at", "finished_at", "exit_code", "branch", "end_head", "turns",
+                "tool_calls", "denials", "tokens", "cost_usd", "commits", "title", "summary")
+
+
+def history_script(job_id: str) -> str:
+    """sh run in the VM: line 1 "R", line 2 the stream's last `result` event (newlines removed), line 3 "P",
+    then the head of prompt.md. The prompt is last, so nothing in it can shift the lines before it."""
+    d = JOB_DIR.format(id=check_job_id(job_id))
+    return (f'd={d}; [ -d "$d" ] || {{ echo MISSING; exit 0; }}; echo R; '
+            f'grep \'"type":"result"\' "$d/output.jsonl" 2>/dev/null | tail -n 1 | head -c {HISTORY_RESULT_READ} '
+            f'| tr -d \'\\r\\n\'; echo; echo P; head -c {HISTORY_PROMPT_READ} "$d/prompt.md" 2>/dev/null; true')
+
+
+def parse_history_out(out: str) -> dict:
+    """history_script's output -> {"summary", "title"} (each None when absent or unreadable)."""
+    res = {"summary": None, "title": None}
+    parts = out.split("\n", 3)
+    if len(parts) < 3 or parts[0] != "R" or parts[2] != "P":
+        return res
+    try:
+        ev = json.loads(parts[1]) if parts[1].startswith("{") else None
+    except (ValueError, RecursionError):
+        ev = None
+    if isinstance(ev, dict) and isinstance(ev.get("result"), str) and ev["result"].strip():
+        res["summary"] = safe_text(ev["result"].strip()[:SUMMARY_MAX])
+    res["title"] = brief_title(parts[3] if len(parts) > 3 else "")
+    return res
+
+
+def brief_title(prompt: str) -> str | None:
+    """The first Markdown heading of a brief, else its first non-empty line; the progress paragraph agentbox
+    puts in front of the brief is skipped. safe_text'd, at most TITLE_MAX characters."""
+    if not isinstance(prompt, str):
+        return None
+    prompt = prompt.removeprefix(PROGRESS_PROMPT)
+    lines = [ln.strip() for ln in prompt.splitlines()]
+    heading = next((m.group(1) for ln in lines if (m := re.match(r"#{1,6}\s+(.*\S)", ln))), None)
+    title = heading or next((ln for ln in lines if ln), None)
+    return safe_text(title.strip("# ")[:TITLE_MAX]) if title else None
+
+
+def _hist_text(v, cap: int) -> str | None:
+    return safe_text(v[:cap]) if isinstance(v, str) and v else None
+
+
+def history_record(rec: dict, details: dict | None = None) -> dict:
+    """One history line from a job.json record (an ended job, its cached progress) and what was read from
+    the VM. Every value is checked again: job.json is host-written, but the values came from the VM."""
+    details = details or {}
+    acc = rec.get("progress") if acc_ok(rec.get("progress"), rec.get("id")) else None
+    cost = (acc.get("result") or {}).get("cost") if acc else None
+    tokens = None
+    if acc:
+        tokens = {k: sum(_count(row.get(k)) for row in acc["tokens"].values() if isinstance(row, dict))
+                  for k in TOKEN_KEYS}
+        tokens["total"] = sum(tokens.values())
+    code = rec.get("exit_code")
+    return {"id": rec["id"], "state": rec.get("state") if rec.get("state") in ("finished", "lost") else "lost",
+            "started_at": _timestamp(rec.get("started_at")), "finished_at": _timestamp(rec.get("finished_at")),
+            "exit_code": code if isinstance(code, int) and not isinstance(code, bool) else None,
+            "branch": job_branch(rec.get("branch")), "end_head": _commit(rec.get("end_head")),
+            "turns": _count(acc["turns"]) if acc else None, "tool_calls": _count(acc["tool_calls"]) if acc else None,
+            "denials": _count(acc.get("denials")) if acc else None, "tokens": tokens,
+            "cost_usd": float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+            "commits": _int_or_none(acc.get("commits")) if acc else None,
+            "title": _hist_text(details.get("title") or rec.get("title"), TITLE_MAX),
+            "summary": _hist_text(details.get("summary"), SUMMARY_MAX)}
+
+
+def read_history(prof: Profile) -> list[dict]:
+    """The profile's history records, oldest first; one per job id (the first one written wins)."""
+    try:
+        text = (prof.state / HISTORY_FILE).read_text(errors="replace")
+    except OSError:
+        return []
+    out, seen = [], set()
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("id"), str) and JOB_ID_RE.match(rec["id"]) \
+                and rec["id"] not in seen:
+            seen.add(rec["id"])
+            out.append({k: rec.get(k) for k in HISTORY_KEYS})
+    return out
+
+
+def append_history(prof: Profile, entry: dict) -> bool:
+    """Add one job's record unless its id is already there; keep the last HISTORY_MAX. The file is
+    rewritten whole (owner-only) and swapped in, so a reader never sees half a line. True if written."""
+    old = read_history(prof)
+    if any(r["id"] == entry["id"] for r in old):
+        return False
+    prof.state.mkdir(parents=True, exist_ok=True)
+    keep = (old + [entry])[-HISTORY_MAX:]
+    tmp = prof.state / f".{HISTORY_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in keep))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, prof.state / HISTORY_FILE)
+    return True
+
+
+def record_history(prof: Profile, details: dict | None = None) -> bool:
+    """The recorded job, if it has ended and is not in the history yet. Never raises: history is a record
+    of what happened, and failing to write it must not fail the command that noticed the job end."""
+    try:
+        rec = job_record(prof)
+        if not (isinstance(rec.get("id"), str) and JOB_ID_RE.match(rec["id"])) or rec.get("state") not in ("finished", "lost"):
+            return False
+        if any(r["id"] == rec["id"] for r in read_history(prof)):
+            return False
+        return append_history(prof, history_record(rec, details))
+    except (Exception, SystemExit):
+        return False
+
+
+def note_job_ended(prof: Profile, job_id: str, j: dict):
+    """job_info found the recorded job ended, for the first time. While the VM is up, cache the job's final
+    progress and read its summary and title (two execs, once per job); then write its history record."""
+    details = None
+    if j.get("vm") == "running":
+        with contextlib.suppress(Exception, SystemExit):
+            cache_final_progress(prof, job_id, j)
+        with contextlib.suppress(Exception, SystemExit):
+            r = vm_exec(prof, history_script(job_id))
+            details = parse_history_out(r.stdout or "") if r.returncode == 0 else None
+    record_history(prof, details)
+
+
+def history_rows(cfg: Config, name: str | None) -> list[dict]:
+    """History records of one profile (or every profile), newest first, each with its profile's name."""
+    rows = []
+    for n in [name] if name else cfg.profile_names():
+        try:
+            prof = cfg.profile(n)
+        except SystemExit:
+            continue
+        record_history(prof)                # a job that ended before history existed, or never seen ending
+        rows += [{"profile": n} | r for r in read_history(prof)]
+    return sorted(rows, key=lambda r: (r.get("finished_at") or r.get("started_at") or "", r["id"]), reverse=True)
+
+
+def cmd_history(cfg: Config, name: str | None, as_json: bool = False) -> int:
+    if name:
+        cfg.profile(name)                   # dies for an unknown profile
+    rows = history_rows(cfg, name)
+    if as_json:
+        emit_json({"jobs": rows})
+        return EXIT_OK
+    if not rows:
+        print("no jobs recorded yet")
+        return EXIT_OK
+    for r in rows:
+        code = r.get("exit_code")
+        state = f"exit {code}" if r.get("state") == "finished" and code is not None else r.get("state") or "?"
+        cost = f"${r['cost_usd']:.2f}" if isinstance(r.get("cost_usd"), (int, float)) else "-"
+        print(f"{r['id']}  {r['profile']:<16} {state:<8} {r.get('finished_at') or '-':<20} {cost:>7}  "
+              f"{safe_text(r.get('branch') or '-'):<24} {dash_clean(r.get('title') or '')[:80]}")
+    return EXIT_OK
 
 
 # ------------------------------------------------------------------- fetch
@@ -5728,6 +5905,8 @@ def main():
     p.add_argument("--interval", type=float, default=5.0, metavar="S",
                    help="seconds between --watch / --interactive updates (default 5)")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("history", help="the jobs each profile ran, newest first: branch, cost, the brief's title")
+    p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
     p = sub.add_parser("provision", help="guided setup of a new profile"); p.add_argument("name")
@@ -5759,6 +5938,8 @@ def main():
         sys.exit(cmd_dashboard(cfg, a))
     if a.cmd == "doctor":
         sys.exit(cmd_doctor(cfg, a.profile, a.json, a.start))
+    if a.cmd == "history":
+        sys.exit(cmd_history(cfg, a.profile, a.json))
     if a.cmd == "provision":
         sys.exit(cmd_provision(cfg, a))
     prof = cfg.profile(a.profile)
