@@ -59,7 +59,8 @@ def text_of(lines):
 def ui_for(d, size=(120, 30), **kw):
     ui = ab.dash_new_ui(size)
     rows = ab.dash_sort((d or {}).get("profiles") or [])
-    return ab.dash_set_rows(ui, [r["name"] for r in rows], {r["name"]: r.get("vm") for r in rows}) | kw
+    return ab.dash_set_rows(ui, [r["name"] for r in rows], {r["name"]: r.get("vm") for r in rows},
+                            {r["name"]: ab.dash_state(r) for r in rows}) | kw
 
 
 class ClassifyTests(unittest.TestCase):
@@ -110,7 +111,7 @@ class RenderTests(unittest.TestCase):
     def test_every_line_is_exactly_the_width_at_every_size(self):
         for size in self.SIZES:
             for d in (None, data(), ALL_STATES):
-                for mode in ("list", "help", "confirm", "nofetch"):
+                for mode in ("list", "help", "confirm", "nofetch", "stop", "stopname"):
                     for ascii_ in (False, True):
                         with self.subTest(size=size, mode=mode, ascii_=ascii_):
                             self.render(d, size, ascii_, mode=mode, target="alpha", busy=True)
@@ -205,7 +206,7 @@ class RenderTests(unittest.TestCase):
             hist.add(d)
             hist.add(d)
             for size in ((120, 40), (70, 40)):
-                for mode in ("list", "help", "confirm", "nofetch"):
+                for mode in ("list", "help", "confirm", "nofetch", "stop", "stopname"):
                     text = text_of(self.render(d, size, ascii_=True, history=hist, mode=mode, target="a", busy=True))
                     self.assertTrue(text.isascii(), [c for c in text if not c.isascii()])
 
@@ -222,6 +223,44 @@ class RenderTests(unittest.TestCase):
         text = text_of(self.render(ALL_STATES, (70, 20), mode="confirm", target="alpha"))
         self.assertIn("agentbox fetch alpha", text)
         self.assertNotIn("--", text.replace("──", ""))
+
+    def test_stop_confirm_shows_the_exact_command(self):
+        lines = self.render(ALL_STATES, (100, 30), mode="stop", target="idle")
+        text = text_of(lines)
+        self.assertIn("agentbox stop idle", text)
+        self.assertIn("y to run it, any other key cancels", text)
+        self.assertNotIn("reported as lost", text)
+        self.assertNotIn("--", text.replace("──", ""))
+        self.assertIn("y stop", text_of(lines[-1:]))
+
+    def test_stop_confirm_for_a_running_job_warns_in_red_and_shows_the_typing(self):
+        lines = self.render(ALL_STATES, (100, 30), mode="stopname", target="alpha", typed="alp")
+        text = text_of(lines)
+        self.assertIn("agentbox stop alpha", text)
+        self.assertIn("Type the profile name", text)
+        self.assertIn("> alp_", text)
+        self.assertNotIn("y to run it", text)
+        red = " ".join(t for ln in lines for t, st in ln if "red" in st.split())
+        self.assertIn("A job is running here (20261123T164235Z-dbb67c)", red)
+        self.assertIn("Stopping kills it, and it will be reported as lost.", red)
+        self.assertIn("Enter stop", text_of(lines[-1:]))
+        self.assertIn("Esc cancel", text_of(lines[-1:]))
+
+    def test_stop_text(self):
+        r = {"sandbox": "ab-x", "job": {"id": "j1"}}
+        self.assertEqual(text_of(ab.dash_stop_text(r, "x")[1:2]), "  agentbox stop x")
+        typed = text_of(ab.dash_stop_text(r, "x", "日\x1b"))
+        self.assertIn("(j1)", typed)
+        self.assertIn("> 日\x1b_", typed)
+        typed = text_of(self.render(ALL_STATES, (100, 30), mode="stopname", target="alpha", typed="é\x1b[2J"))
+        self.assertNotIn("\x1b", typed)                 # the typed text is cleaned like anything else
+
+    def test_help_and_footer_list_u_and_s(self):
+        self.assertIn("u up", text_of(self.render(ALL_STATES, (120, 30))[-1:]))
+        self.assertIn("s stop", text_of(self.render(ALL_STATES, (120, 30))[-1:]))
+        text = text_of(self.render(ALL_STATES, (120, 30), mode="help"))
+        self.assertIn("start: agentbox up", text)
+        self.assertIn("stop the sandbox (asks first)", text)
 
     def test_sparklines_appear_after_two_samples(self):
         hist = ab.DashHistory()
@@ -311,32 +350,149 @@ class KeyTests(unittest.TestCase):
         self.assertEqual(self.keys("n", ui=ui)[0]["msg"], "fetch cancelled")
         self.assertEqual(self.keys("y")[1], [None])  # no question asked: y does nothing
 
-    def test_no_key_sequence_runs_anything_but_the_three_commands(self):
+    def test_no_key_sequence_runs_anything_but_the_five_commands(self):
         keys = ["f", "y", "Y", "j", "enter", "p", "l", "?", "q", "r", "n", "end", "resize", ("click", 3, 2),
-                ("wheel", 1, 80, 5), "-", "F", "\x1b"]
-        allowed = {"progress": ["progress", None, "--watch"], "logs": ["logs", None], "fetch": ["fetch", None]}
-        for seq in itertools.product(keys, repeat=3):
-            ui = self.ui
-            for k in seq:
-                before = ui["mode"]
-                ui, act = ab.dash_key(ui, k)
-                argv = ab.dash_argv(act) if act else None
-                if argv is not None:
-                    self.assertEqual(argv, [a if a is not None else act[1] for a in allowed[argv[0]]])
-                    self.assertFalse(any(a.startswith("-") and a != "--watch" for a in argv), argv)
-                    self.assertNotIn("--force", argv)
-                if act and act[0] == "fetch":            # only from the question that `f` opens
-                    self.assertEqual((before, k in ("y", "Y")), ("confirm", True))
-                if ui["mode"] == "confirm" and before != "confirm":
-                    self.assertEqual((k, act and act[0]), ("f", "confirm_fetch"))
+                ("wheel", 1, 80, 5), "-", "F", "\x1b", "u", "s", "esc", "backspace", "a"]
+        allowed = {"progress": ["progress", None, "--watch"], "logs": ["logs", None], "fetch": ["fetch", None],
+                   "up": ["up", None], "stop": ["stop", None]}
+        for start in (self.ui, self.ui | {"tab": True}, self.keys("j")[0]):
+            for seq in itertools.product(keys, repeat=3):
+                ui = start
+                for k in seq:
+                    before = ui["mode"]
+                    ui, act = ab.dash_key(ui, k)
+                    argv = ab.dash_argv(act) if act else None
+                    if argv is not None:
+                        self.assertEqual(argv, [a if a is not None else act[1] for a in allowed[argv[0]]])
+                        self.assertFalse(any(a.startswith("-") and a != "--watch" for a in argv), argv)
+                    if act and act[0] == "fetch":            # only from the question that `f` opens
+                        self.assertEqual((before, k in ("y", "Y")), ("confirm", True))
+                    if act and act[0] == "stop":             # only from the question that `s` opens
+                        self.assertEqual((before, k in ("y", "Y")), ("stop", True))
+                    if ui["mode"] == "confirm" and before != "confirm":
+                        self.assertEqual((k, act and act[0]), ("f", "confirm_fetch"))
+                    if ui["mode"] in ("stop", "stopname") and before not in ("stop", "stopname"):
+                        self.assertEqual((k, act and act[0]), ("s", "confirm_stop"))
+
+    def select(self, name):
+        return self.ui | {"sel": self.ui["names"].index(name)}
+
+    def test_up_in_every_state(self):
+        for name, warn in (("idle", False), ("cold", False), ("never", False), ("ok", False), ("alpha", True),
+                           ("stall", True), ("gone", False)):
+            with self.subTest(name=name):
+                ui, act = ab.dash_key(self.select(name), "u")
+                self.assertEqual(act, ("up", name))
+                self.assertEqual(ab.dash_argv(act), ["up", name])
+                self.assertEqual(ui["mode"], "list")
+                self.assertEqual("job is running" in ui["msg"], warn, ui["msg"])
+                ui, act = ab.dash_key(self.select(name) | {"tab": True}, "u")
+                self.assertEqual(act, ("up_tab", name))
+                self.assertEqual(ab.dash_argv(act), ["up", name])
+        ui, act = ab.dash_key(self.select("off"), "u")              # disabled
+        self.assertIsNone(act)
+        self.assertIn("disabled", ui["msg"])
+        self.assertIsNone(ab.dash_key(self.select("off") | {"tab": True}, "u")[1])
+        self.assertIsNone(ab.dash_key(ab.dash_set_rows(self.ui, []), "u")[1])    # no row
+
+    def test_up_falls_back_to_this_terminal_only_after_a_failed_tab(self):
+        ui = self.select("idle") | {"tab": True}
+        ui, act = ab.dash_key(ui | {"up_fallback": "idle"}, "u")      # the loop sets it when rex run fails
+        self.assertEqual(act, ("up", "idle"))
+        self.assertIsNone(ui["up_fallback"])
+        self.assertEqual(ab.dash_key(ui, "u")[1], ("up_tab", "idle"))   # then Rex again
+        other = self.select("cold") | {"tab": True, "up_fallback": "idle"}
+        self.assertEqual(ab.dash_key(other, "u")[1], ("up_tab", "cold"))
+
+    def test_stop_in_every_state(self):
+        self.assertIsNone(ab.dash_key(ab.dash_set_rows(self.ui, []), "s")[1])     # no row
+        for name in ("off", "cold", "never", "ok", "gone", "flaky"):          # disabled, stopped, missing, unknown
+            with self.subTest(name=name):
+                ui, act = ab.dash_key(self.select(name), "s")
+                self.assertIsNone(act)
+                self.assertEqual(ui["mode"], "list")
+                self.assertIn("not running", ui["msg"])
+        for name, mode in (("idle", "stop"), ("bad", "stop"), ("alpha", "stopname"), ("stall", "stopname")):
+            with self.subTest(name=name):
+                ui, act = ab.dash_key(self.select(name), "s")
+                self.assertEqual((act, ui["mode"], ui["target"], ui["typed"]), (("confirm_stop", name), mode, name, ""))
+                self.assertIsNone(ab.dash_argv(act))
+
+    def test_stop_without_a_job_needs_y(self):
+        ui, _ = ab.dash_key(self.select("idle"), "s")
+        self.assertEqual(self.keys("y", ui=ui)[1], [("stop", "idle")])
+        self.assertEqual(self.keys("Y", ui=ui)[1], [("stop", "idle")])
+        for no in ("n", "enter", "esc", "s", "q", "ctrl-c", " ", ("click", 1, 2), "i"):
+            ui2, acts = self.keys(no, "y", ui=ui)
+            self.assertEqual(acts, [None, None], no)
+            self.assertEqual(ui2["mode"], "list")
+        self.assertEqual(self.keys("n", ui=ui)[0]["msg"], "stop cancelled")
+        self.assertEqual(self.keys("resize", "y", ui=ui)[1], [("redraw",), ("stop", "idle")])
+
+    def typed(self, text, name="alpha"):
+        ui, _ = ab.dash_key(self.select(name), "s")
+        return self.keys(*list(text), ui=ui)
+
+    def test_stop_with_a_running_job_needs_the_name_typed(self):
+        ui, acts = self.typed("alpha")
+        self.assertEqual((ui["mode"], ui["typed"], acts), ("stopname", "alpha", [None] * 5))
+        ui2, act = ab.dash_key(ui, "enter")
+        self.assertEqual((act, ui2["mode"], ui2["typed"]), (("stop", "alpha"), "list", ""))
+        self.assertEqual(self.typed("y")[0]["mode"], "stopname")       # y is just a letter here
+        self.assertIsNone(ab.dash_key(self.typed("y")[0], "enter")[1])
+        self.assertEqual(self.typed("q")[1], [None])                    # q is typed, it doesn't quit
+
+    def test_typed_name_mismatch_cancels(self):
+        for text in ("", "alph", "alphaa", "Alpha", "alpha ", "zeta"):
+            with self.subTest(text=text):
+                ui, act = ab.dash_key(self.typed(text)[0], "enter")
+                self.assertIsNone(act)
+                self.assertEqual(ui["mode"], "list")
+                self.assertIn("did not match", ui["msg"])
+
+    def test_typed_name_esc_and_ctrl_c_cancel(self):
+        for k in ("esc", "ctrl-c"):
+            ui, acts = self.keys(k, "y", ui=self.typed("alpha")[0])
+            self.assertEqual(acts, [None, None])            # closed: the y after it does nothing
+            self.assertEqual(ui["mode"], "list")
+        self.assertEqual(ab.dash_key(self.typed("alpha")[0], "esc")[0]["msg"], "stop cancelled")
+
+    def test_typed_name_backspace(self):
+        ui, _ = self.keys("backspace", "backspace", "h", "a", ui=self.typed("alpxx")[0])
+        self.assertEqual(ui["typed"], "alpha")
+        self.assertEqual(ab.dash_key(ui, "enter")[1], ("stop", "alpha"))
+        ui, _ = self.keys("backspace", "backspace", ui=self.typed("")[0])      # nothing to delete
+        self.assertEqual((ui["typed"], ui["mode"]), ("", "stopname"))
+
+    def test_typed_name_non_ascii_and_other_keys(self):
+        ui, _ = self.typed("álpha")
+        self.assertEqual(ui["typed"], "álpha")                          # kept, so it can't match by accident
+        self.assertIsNone(ab.dash_key(ui, "enter")[1])
+        ui, _ = self.typed("al日\u200bpha")
+        self.assertEqual(ui["typed"], "al日pha")                         # a format character is not typed
+        ui, _ = self.keys("\x1b", "\x00", "up", "home", ("click", 3, 3), ("wheel", 1, 2, 2), "resize", "\u202e",
+                          ui=self.typed("al")[0])
+        self.assertEqual((ui["typed"], ui["mode"]), ("al", "stopname"))
+        ui, _ = self.typed("a" * 200)
+        self.assertEqual(len(ui["typed"]), ab.DASH_TYPED_MAX)
 
     def test_dash_argv(self):
         self.assertEqual(ab.dash_argv(("fetch", "a-b")), ["fetch", "a-b"])
         self.assertEqual(ab.dash_argv(("progress", "a")), ["progress", "a", "--watch"])
         self.assertEqual(ab.dash_argv(("logs", "a")), ["logs", "a"])
+        self.assertEqual(ab.dash_argv(("up", "a")), ["up", "a"])
+        self.assertEqual(ab.dash_argv(("up_tab", "a")), ["up", "a"])
+        self.assertEqual(ab.dash_argv(("stop", "a-1")), ["stop", "a-1"])
         for bad in (("fetch", "--force"), ("fetch", "-x"), ("fetch", None), ("fetch", "a b"), ("down", "a"),
-                    ("run", "a"), ("confirm_fetch", "a"), ("quit",), ()):
+                    ("run", "a"), ("confirm_fetch", "a"), ("quit",), (), ("fresh", "a"), ("resume", "a"),
+                    ("stop", "--force"), ("up", "--start"), ("stop", "a --force"), ("up", "-a"), ("stop", "A"),
+                    ("confirm_stop", "a"), ("stop", "a" * 42), ("up", "é")):
             self.assertIsNone(ab.dash_argv(bad), bad)
+        for kind in ("progress", "logs", "fetch", "up", "up_tab", "stop", "down", "fresh", "run", "resume"):
+            for name in ("a", "--force", "--start", "down", "fresh"):
+                argv = ab.dash_argv((kind, name)) or []
+                self.assertFalse({"--force", "--start"} & set(argv), argv)
+                self.assertNotIn(argv[:1], (["down"], ["fresh"], ["run"], ["resume"]))
 
     def test_help_overlay(self):
         ui, acts = self.keys("?")
@@ -377,6 +533,81 @@ class KeyTests(unittest.TestCase):
         lh = ab.dash_layout(70, 20, 60)["list"][3]
         self.assertEqual(act, ("redraw",))
         self.assertTrue(ui["top"] <= ui["sel"] < ui["top"] + lh)
+
+
+class RexTabTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.no_app = mock.patch.object(ab, "REX_APP_CLI", os.path.join(self.tmp.name, "nope", "rex"))
+        self.no_app.start()
+        self.addCleanup(self.no_app.stop)
+
+    def exe(self, *parts, mode=0o755):
+        path = os.path.join(self.tmp.name, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(path, mode)
+        return path
+
+    def test_lookup_order(self):
+        env_rex, path_rex, app_rex = self.exe("env", "myrex"), self.exe("bin", "rex"), self.exe("app", "rex")
+        bindir = os.path.dirname(path_rex)
+        with mock.patch.object(ab, "REX_APP_CLI", app_rex):
+            self.assertEqual(ab.rex_program({"AGENTBOX_REX": env_rex, "PATH": bindir}), env_rex)
+            self.assertEqual(ab.rex_program({"PATH": bindir}), path_rex)
+            for bad in ("myrex", "relative/rex", os.path.join(self.tmp.name, "missing"), self.tmp.name,
+                        self.exe("env", "noexec", mode=0o644), ""):
+                self.assertEqual(ab.rex_program({"AGENTBOX_REX": bad, "PATH": bindir}), path_rex, bad)
+            self.assertEqual(ab.rex_program({"PATH": os.path.join(self.tmp.name, "empty")}), app_rex)
+        self.assertIsNone(ab.rex_program({"PATH": os.path.join(self.tmp.name, "empty")}))
+        self.exe("bin2", "rex", mode=0o644)                         # on PATH but not executable
+        self.assertIsNone(ab.rex_program({"PATH": os.path.join(self.tmp.name, "bin2")}))
+
+    def test_tab_needs_session_and_block(self):
+        bindir = os.path.dirname(self.exe("bin", "rex"))
+        base = {"PATH": bindir}
+        self.assertEqual(ab.rex_tab_program(base | {"REX_SESSION": "s", "REX_BLOCK": "b"}), os.path.join(bindir, "rex"))
+        for env in (base, base | {"REX_SESSION": "s"}, base | {"REX_BLOCK": "b"},
+                    base | {"REX_SESSION": "", "REX_BLOCK": "b"}, {"REX_SESSION": "s", "REX_BLOCK": "b", "PATH": "/nonexistent"}):
+            self.assertIsNone(ab.rex_tab_program(env), env)
+
+    def test_rex_run_argv(self):
+        with mock.patch.object(ab, "agentbox_argv", lambda a: ["/py", "/ab", *a]):
+            self.assertEqual(ab.rex_run_argv("/r/rex", "demo"),
+                             ["/r/rex", "run", "--shell=none", "--keep-open", "--label", "agentbox up demo", "--",
+                              "/py", "/ab", "up", "demo"])
+            for bad in ("--force", "a b", "", None, "Demo", "-x"):
+                self.assertIsNone(ab.rex_run_argv("/r/rex", bad), bad)
+            self.assertIsNone(ab.rex_run_argv("", "demo"))
+        argv = ab.rex_run_argv("/r/rex", "demo")
+        self.assertEqual(argv[argv.index("--") + 1:][-2:], ["up", "demo"])
+        self.assertEqual(argv[argv.index("--") + 1:][:-2], ab.agentbox_argv([]))   # the dashboard's own agentbox
+
+    def screen(self):
+        s = ab.DashScreen(mock.Mock(), FakeCurses(), lambda: None, 5, ab.RexStatus(False), False)
+        s.rexbin = "/r/rex"
+        return s
+
+    def test_open_tab_reports_failures(self):
+        s = self.screen()
+        with mock.patch.object(ab.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            self.assertEqual(s.open_tab("demo"), (True, "opened in a new Rex tab"))
+            self.assertEqual(run.call_args.args[0][:6], ["/r/rex", "run", "--shell=none", "--keep-open", "--label",
+                                                         "agentbox up demo"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 10)
+            run.return_value = subprocess.CompletedProcess([], 3, "", "warn\nno such session\n")
+            self.assertEqual(s.open_tab("demo"), (False, "rex run exited 3: no such session"))
+            run.side_effect = subprocess.TimeoutExpired("rex", 10)
+            self.assertEqual(s.open_tab("demo"), (False, "rex run timed out after 10 s"))
+            run.side_effect = FileNotFoundError(2, "No such file or directory")
+            self.assertEqual(s.open_tab("demo"), (False, "could not run rex: No such file or directory"))
+            run.reset_mock()
+            self.assertFalse(s.open_tab("--force")[0])
+            run.assert_not_called()
 
 
 class CollectorTests(unittest.TestCase):
@@ -509,8 +740,10 @@ class PtyTests(AgentboxTestCase):
         import fcntl
         import pty
         import struct
-        self.write_config(f'[profiles.demo]\nworkspace = "{self.ws}"\n[profiles.other]\nworkspace = "{self.ws}"\n')
-        fake = data(row("demo", j=job()), row("other", vm="stopped", j=job("finished", exit_code=2)))
+        self.write_config(f'[profiles.demo]\nworkspace = "{self.ws}"\n[profiles.other]\nworkspace = "{self.ws}"\n'
+                          f'[profiles.idle]\nworkspace = "{self.ws}"\n')
+        fake = data(row("demo", j=job()), row("other", vm="stopped", j=job("finished", exit_code=2)),
+                    row("idle", j=dict(ab.NO_JOB)))
         pid, fd = pty.fork()
         if pid == 0:                                       # the child: run main() on the pty
             code = 98
@@ -518,6 +751,7 @@ class PtyTests(AgentboxTestCase):
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
                 os.environ.update(TERM="xterm-256color", REX_SESSION="test", **(env or {}))
                 os.environ.pop("AGENTBOX_NO_OSC", None)
+                os.environ.pop("REX_BLOCK", None)                  # not in a Rex block: `u` runs here
                 os.environ.pop("NO_COLOR", None)
 
                 def collect(cfg):
@@ -606,6 +840,28 @@ class PtyTests(AgentboxTestCase):
         self.assertIn(b"CHILD ['fetch', 'demo'] 1", out)
         self.assertNotIn(b"CHILD ['fetch', 'other']", out)
         self.assertNotIn(b"--force", out)
+    def test_stop_asks_first_and_needs_the_name_for_a_running_job(self):
+        pid, fd = self.spawn(child_cmd=True)
+        buf = bytearray()
+        self.assertTrue(self.read_until(fd, b"other", buf), buf[-2000:])
+        back = b"\x1b[?1049h"
+        self.press(fd, buf,
+                   (b"s", b"Type the profile name"), (b"dem", None), (b"x", None), (b"\r", b"did not match"),
+                   (b"s", b"reported as lost"), (b"\x1b", b"stop cancelled"),
+                   (b"s", b"Type the profile name"), (b"demx", None), (b"\x7f", None), (b"o", None),
+                   (b"\r", b"press Enter to return"), (b"\r", back),
+                   (b"j", None), (b"s", b"not running"),                      # other's sandbox is stopped
+                   (b"j", None), (b"s", b"agentbox stop idle"), (b"n", b"stop cancelled"),
+                   (b"s", b"agentbox stop idle"), (b"y", b"press Enter to return"), (b"\r", back),
+                   (b"u", b"press Enter to return"), (b"\r", back),
+                   (b"q", None))
+        out = self.finish(pid, fd, buf)
+        self.assertEqual(out.count(b"CHILD ['stop', 'demo'] 1"), 1)
+        self.assertEqual(out.count(b"CHILD ['stop', 'idle'] 1"), 1)
+        self.assertIn(b"CHILD ['up', 'idle'] 1", out)
+        self.assertNotIn(b"CHILD ['stop', 'other']", out)
+        self.assertNotIn(b"--force", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3868,6 +3868,7 @@ DASH_SPARK, DASH_SPARK_ASCII = "▁▂▃▄▅▆▇█", "_.-:=+*#"
 DASH_HELP = [("↑ ↓  j k", "select a profile (or click it)"), ("Home End", "first / last profile"),
              ("wheel", "scroll the list or the details"), ("Enter  p", "watch the job: agentbox progress --watch"),
              ("l", "the job's log in a pager ($PAGER)"), ("f", "fetch the job's commits (asks first)"),
+             ("u", "start: agentbox up (in a new Rex tab inside Rex)"), ("s", "stop the sandbox (asks first)"),
              ("r", "refresh now"), ("?", "this help"), ("q  Ctrl-C", "quit")]
 DASH_HISTORY, DASH_HISTORY_JOBS = 120, 64            # samples per job, jobs remembered
 
@@ -4016,19 +4017,23 @@ def dash_layout(width: int, height: int, nrows: int) -> dict | None:
     return {"stacked": True, "list": (0, 1, width, lh), "detail": (0, lh + 2, width, body - lh - 1)}
 
 
-def dash_new_ui(size=(80, 24)) -> dict:
+def dash_new_ui(size=(80, 24), tab: bool = False) -> dict:
     """The UI state dash_key and dash_render share. `names` is the sorted profile names, `sel` an index
     into it, `top` / `dtop` the scroll of the list / details, `mode` list | help | confirm | nofetch (fetch
-    refused: the sandbox is not running), `vm` each profile's sandbox state."""
+    refused: the sandbox is not running) | stop (y/N) | stopname (the name typed so far is `typed`),
+    `vm` each profile's sandbox state, `states` its dash_state. `tab`: `u` opens a Rex tab (rex_tab_program
+    found one); `up_fallback` names the profile whose tab failed to open, so its next `u` runs here."""
     return {"names": [], "sel": 0, "top": 0, "dtop": 0, "size": tuple(size), "mode": "list", "target": None,
-            "msg": "", "busy": False, "error": "", "vm": {}}
+            "msg": "", "busy": False, "error": "", "vm": {}, "states": {}, "typed": "", "tab": tab,
+            "up_fallback": None}
 
 
-def dash_set_rows(ui: dict, names: list, vms: dict | None = None) -> dict:
+def dash_set_rows(ui: dict, names: list, vms: dict | None = None, states: dict | None = None) -> dict:
     """New data arrived: keep the same profile selected if it is still there."""
     old = ui["names"][ui["sel"]] if ui["names"] else None
     sel = names.index(old) if old in names else min(ui["sel"], max(0, len(names) - 1))
-    return _dash_follow({**ui, "names": list(names), "sel": sel, "vm": dict(vms or {})}, sel)
+    return _dash_follow({**ui, "names": list(names), "sel": sel, "vm": dict(vms or {}),
+                         "states": dict(states or {})}, sel)
 
 
 def _dash_follow(ui: dict, sel: int) -> dict:
@@ -4056,7 +4061,10 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
     ("logs", name), ("confirm_fetch", name) and, only straight after a confirm_fetch and a "y",
     ("fetch", name). The loop runs them; dash_argv says how. `f` on a stopped or missing sandbox only
     says why there is nothing to fetch: fetch needs the sandbox running, and booting it (`fetch --start`)
-    relaunches the agent, so the dashboard never offers that."""
+    relaunches the agent, so the dashboard never offers that.
+    `u` gives ("up_tab", name) when ui["tab"] (the loop opens a Rex tab), else ("up", name) (run here).
+    `s` on a running sandbox gives ("confirm_stop", name) and opens a question; ("stop", name) comes only
+    from it: a "y" if no job is running there, else the profile name typed exactly and Enter."""
     ui = {**ui, "msg": ""}
     n = len(ui["names"])
     name = ui["names"][ui["sel"]] if n else None
@@ -4067,6 +4075,13 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
         if key in ("y", "Y") and target:
             return ui, ("fetch", target)
         return {**ui, "msg": "fetch cancelled"}, None
+    if ui["mode"] == "stop":
+        target, ui = ui["target"], {**ui, "mode": "list", "target": None}
+        if key in ("y", "Y") and target:
+            return ui, ("stop", target)
+        return {**ui, "msg": "stop cancelled"}, None
+    if ui["mode"] == "stopname":
+        return _dash_type_name(ui, key)
     if ui["mode"] in ("help", "nofetch"):
         return {**ui, "mode": "list", "target": None}, ("quit",) if key in ("q", "ctrl-c") else None
     if key in ("q", "Q", "ctrl-c"):
@@ -4107,16 +4122,52 @@ def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
         if (ui.get("vm") or {}).get(name) in ("stopped", "missing"):
             return {**ui, "mode": "nofetch", "target": name}, None
         return {**ui, "mode": "confirm", "target": name}, ("confirm_fetch", name)
+    vm, state = (ui.get("vm") or {}).get(name), (ui.get("states") or {}).get(name)
+    busy = state in ("working", "stalled")
+    if key == "u":
+        if vm == "disabled" or state == "disabled":
+            return {**ui, "msg": f"{name} is disabled in agentbox.toml: not starting it"}, None
+        warn = f"a job is running in {name}: up attaches to its sandbox" if busy else ""
+        if ui.get("tab") and ui.get("up_fallback") != name:
+            return {**ui, "msg": warn}, ("up_tab", name)
+        return {**ui, "msg": warn, "up_fallback": None}, ("up", name)
+    if key == "s":
+        if vm != "running":
+            return {**ui, "msg": f"{name}'s sandbox is {vm or 'unknown'}, not running: nothing to stop"}, None
+        return {**ui, "mode": "stopname" if busy else "stop", "target": name, "typed": ""}, ("confirm_stop", name)
+    return ui, None
+
+
+DASH_TYPED_MAX = 64
+
+
+def _dash_type_name(ui: dict, key) -> tuple[dict, tuple | None]:
+    """The `stopname` question: printable characters add to ui["typed"], backspace removes one, Enter
+    stops only if what was typed is exactly the profile name; Esc, Ctrl-C or a mismatch cancel."""
+    target, typed = ui["target"], ui.get("typed", "")
+    done = {**ui, "mode": "list", "target": None, "typed": ""}
+    if key == "enter":
+        if target and typed == target:
+            return done, ("stop", target)
+        return {**done, "msg": "stop cancelled: the name did not match"}, None
+    if key in ("esc", "ctrl-c"):
+        return {**done, "msg": "stop cancelled"}, None
+    if key == "backspace":
+        return {**ui, "typed": typed[:-1]}, None
+    if (isinstance(key, str) and len(key) == 1 and unicodedata.category(key)[0] != "C"
+            and len(typed) < DASH_TYPED_MAX):
+        return {**ui, "typed": typed + key}, None
     return ui, None
 
 
 def dash_argv(action) -> list[str] | None:
-    """The agentbox arguments for an action that runs a command, or None. These three are the only
-    commands the dashboard ever runs, and never with another flag."""
+    """The agentbox arguments for an action that runs a command, or None. These are the only commands
+    the dashboard ever runs (progress, logs, fetch, up, stop), and never with another flag."""
     kind, name = (tuple(action) + (None, None))[:2]
     if not isinstance(name, str) or not NAME_RE.match(name):
         return None
-    return {"progress": ["progress", name, "--watch"], "logs": ["logs", name], "fetch": ["fetch", name]}.get(kind)
+    return {"progress": ["progress", name, "--watch"], "logs": ["logs", name], "fetch": ["fetch", name],
+            "up": ["up", name], "up_tab": ["up", name], "stop": ["stop", name]}.get(kind)
 
 
 def _dash_clock(iso, now: float) -> str:
@@ -4279,6 +4330,21 @@ def dash_fetch_text(row: dict, name: str, ok: bool) -> list:
             [("y", "bold"), (" to run it, any other key cancels", "")]]
 
 
+def dash_stop_text(row: dict, name: str, typed: str | None = None) -> list:
+    """The body of the `s` box: the exact command and, while a job runs there (typed is not None), a red
+    warning and the name typed so far."""
+    sandbox = row.get("sandbox") or "the sandbox"
+    body = [[("This runs:", "")], [("  " + shlex.join(["agentbox", "stop", name]), "bold")], [],
+            [(f"  stops {sandbox}; its files stay, and `agentbox up {name}` starts it again", "dim")], []]
+    if typed is None:
+        return body + [[("y", "bold"), (" to run it, any other key cancels", "")]]
+    jid = (row.get("job") or {}).get("id")
+    return body + [[("A job is running here" + (f" ({jid})" if jid else "") + ".", "red bold")],
+                   [("Stopping kills it, and it will be reported as lost.", "red bold")], [],
+                   [("Type the profile name, then Enter, to stop it. Esc cancels.", "")],
+                   [("  > ", "bold"), (typed, "bold"), ("_", "")]]
+
+
 def _dash_box(title: str, body: list, w: int, ascii_: bool) -> list:
     """A framed box (list of segment lists) at most w cells wide, for the help and confirm overlays."""
     inner = min(w - 4, max([dash_cells(dash_clean(title)) + 2] + [sum(dash_cells(dash_clean(t)) for t, _ in ln) for ln in body]))
@@ -4346,6 +4412,10 @@ def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = 
     elif ui.get("mode") in ("confirm", "nofetch") and ui.get("target"):
         box = _dash_box("fetch", dash_fetch_text(next((r for r in rows if r.get("name") == ui["target"]), {}),
                                                  ui["target"], ui["mode"] == "confirm"), w, ascii_)
+    elif ui.get("mode") in ("stop", "stopname") and ui.get("target"):
+        box = _dash_box("stop", dash_stop_text(next((r for r in rows if r.get("name") == ui["target"]), {}),
+                                               ui["target"], ui.get("typed", "") if ui["mode"] == "stopname" else None),
+                        w, ascii_)
     if box:
         top = max(0, (len(body) - len(box)) // 2)
         bw = sum(dash_cells(t) for t, _ in box[0])
@@ -4358,9 +4428,13 @@ def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = 
         foot = [(" y", "bold"), (" fetch   ", ""), ("any other key", "bold"), (" cancel", "")]
     elif ui.get("mode") == "nofetch":
         foot = [(" any key", "bold"), (" close", "")]
+    elif ui.get("mode") == "stop":
+        foot = [(" y", "bold"), (" stop   ", ""), ("any other key", "bold"), (" cancel", "")]
+    elif ui.get("mode") == "stopname":
+        foot = [(" type the profile name, ", ""), ("Enter", "bold"), (" stop   ", ""), ("Esc", "bold"), (" cancel", "")]
     else:
         keys = (("j/k" if ascii_ else "↑↓", "select"), ("Enter", "progress"), ("l", "logs"), ("f", "fetch"),
-                ("r", "refresh"), ("?", "help"), ("q", "quit"))
+                ("u", "up"), ("s", "stop"), ("r", "refresh"), ("?", "help"), ("q", "quit"))
         foot = [s for k, d in keys for s in ((f" {k}", "bold"), (f" {d}  ", "dim"))]
     return [dash_line(head, w, ascii_)] + body + [dash_line(foot, w, ascii_)]
 
@@ -4399,6 +4473,41 @@ def agentbox_argv(args: list[str]) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), *args]
 
 
+REX_APP_CLI = "/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
+
+
+def _executable(path) -> bool:
+    return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def rex_program(env=None) -> str | None:
+    """The `rex` CLI: $AGENTBOX_REX if it is an absolute path to an executable, else `rex` on PATH, else
+    the one inside Rex.app. None if there is none."""
+    env = os.environ if env is None else env
+    if _executable(env.get("AGENTBOX_REX")):
+        return env["AGENTBOX_REX"]
+    found = shutil.which("rex", path=env.get("PATH") or os.defpath)
+    if found and _executable(os.path.abspath(found)):
+        return os.path.abspath(found)
+    return REX_APP_CLI if _executable(REX_APP_CLI) else None
+
+
+def rex_tab_program(env=None) -> str | None:
+    """The rex CLI if the dashboard runs inside a Rex block (REX_SESSION and REX_BLOCK set), else None."""
+    env = os.environ if env is None else env
+    return rex_program(env) if env.get("REX_SESSION") and env.get("REX_BLOCK") else None
+
+
+def rex_run_argv(rex: str, name: str) -> list[str] | None:
+    """`rex run` opening `agentbox up <name>` in a new tab of this Rex session. The only rex command the
+    dashboard runs; the agentbox part comes from dash_argv, so the name is checked the same way."""
+    argv = dash_argv(("up", name))
+    if argv is None or not rex:
+        return None
+    return [rex, "run", "--shell=none", "--keep-open", "--label", shlex.join(["agentbox", *argv]), "--",
+            *agentbox_argv(argv)]
+
+
 def dash_pager() -> list[str]:
     try:
         argv = shlex.split(os.environ.get("PAGER") or "")
@@ -4413,6 +4522,7 @@ class DashScreen:
 
     def __init__(self, scr, curses, collect, interval: float, rex: RexStatus, ascii_: bool):
         self.scr, self.c, self.coll, self.interval, self.rex, self.ascii = scr, curses, DashCollector(collect), interval, rex, ascii_
+        self.rexbin = rex_tab_program()
         self.history, self.data, self.attrs = DashHistory(), None, {}
 
     def setup(self):
@@ -4468,7 +4578,8 @@ class DashScreen:
         except c.error:
             return None                         # timeout: no key
         if isinstance(ch, str):
-            return {"\n": "enter", "\r": "enter", "\x03": "ctrl-c", "\x1b": "esc"}.get(ch, ch)
+            return {"\n": "enter", "\r": "enter", "\x03": "ctrl-c", "\x1b": "esc", "\x7f": "backspace",
+                    "\b": "backspace"}.get(ch, ch)
         if ch == c.KEY_MOUSE:
             try:
                 _, x, y, _, bstate = c.getmouse()
@@ -4482,11 +4593,11 @@ class DashScreen:
                 return ("click", x, y)
             return None
         return {c.KEY_UP: "up", c.KEY_DOWN: "down", c.KEY_HOME: "home", c.KEY_END: "end", c.KEY_PPAGE: "pgup",
-                c.KEY_NPAGE: "pgdn", c.KEY_ENTER: "enter", c.KEY_RESIZE: "resize"}.get(ch)
+                c.KEY_NPAGE: "pgdn", c.KEY_ENTER: "enter", c.KEY_RESIZE: "resize", c.KEY_BACKSPACE: "backspace"}.get(ch)
 
     def run(self) -> int:
         self.setup()
-        ui, next_at = dash_new_ui(), 0.0
+        ui, next_at = dash_new_ui(tab=self.rexbin is not None), 0.0
         while True:
             res = self.coll.take()
             if res and res[0] == "ok":
@@ -4494,7 +4605,8 @@ class DashScreen:
                 self.history.add(self.data)
                 dashboard_rex(self.rex, self.data)
                 rows = dash_sort(self.data.get("profiles") or [])
-                ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in rows], {r.get("name"): r.get("vm") for r in rows})
+                ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in rows],
+                                   {r.get("name"): r.get("vm") for r in rows}, {r.get("name"): dash_state(r) for r in rows})
             elif res:
                 ui = {**ui, "error": f"refresh failed: {res[1]}"}
             if res:
@@ -4519,8 +4631,34 @@ class DashScreen:
                 return EXIT_OK
             if action[0] == "refresh":
                 next_at = 0.0                   # starts now, unless one is already running
-            elif action[0] in ("progress", "logs", "fetch"):
-                ui = {**ui, "msg": self.suspend(action)}
+            elif action[0] in ("progress", "logs", "fetch", "up", "stop"):
+                msg = self.suspend(action)
+                ui = {**ui, "msg": "; ".join(m for m in (msg, ui["msg"]) if m)}
+                if action[0] in ("up", "stop"):
+                    next_at = 0.0               # the sandbox changed: show it now
+            elif action[0] == "up_tab":
+                ok, msg = self.open_tab(action[1])
+                if ok:
+                    ui = {**ui, "msg": "; ".join(m for m in (msg, ui["msg"]) if m)}
+                    next_at = 0.0
+                else:
+                    ui = {**ui, "msg": f"{msg} - press u again to run it here", "up_fallback": action[1]}
+
+    def open_tab(self, name: str) -> tuple[bool, str]:
+        """`agentbox up <name>` in a new tab of this Rex session (Rex focuses it). Returns (ok, footer message)."""
+        argv = rex_run_argv(self.rexbin, name)
+        if argv is None:
+            return False, "could not open a Rex tab"
+        try:
+            r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return False, "rex run timed out after 10 s"
+        except OSError as e:
+            return False, f"could not run rex: {e.strerror or e}"
+        if r.returncode != 0:
+            why = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1][:120]
+            return False, f"rex run exited {r.returncode}" + (f": {why}" if why else "")
+        return True, "opened in a new Rex tab"
 
     def suspend(self, action) -> str:
         """Leave curses, run the action's command in this terminal, come back. Returns a footer message."""
