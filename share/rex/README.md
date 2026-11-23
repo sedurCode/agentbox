@@ -19,9 +19,15 @@ require("agentbox").setup{}
 |---|---|
 | `agentbox_open` | pick a profile; session `ab:<profile>` with Agent (`agentbox up`/`resume` typed, not run), Progress and Shell tabs |
 | `agentbox_run` | pick a profile and a prompt file; `run --detach`, then `progress --watch` in a Job tab |
-| `agentbox_dashboard` | session `agentbox` running `agentbox dashboard --watch` |
+| `agentbox_dashboard` | session `agentbox` running `agentbox dashboard --interactive` (keys below) |
 | `agentbox_fetch` | `agentbox fetch <profile>` in a visible tab |
 | `agentbox_down` | `agentbox down <profile>` in a visible tab (sbx asks for confirmation there) |
+
+The dashboard tab is a full-screen view of every profile. Select one with ↑ ↓ / j k or a click (the wheel
+scrolls); Enter or `p` runs `agentbox progress <profile> --watch` in the tab and comes back when it ends or
+on Ctrl-C; `l` shows the job's log in `$PAGER` (default `less -R`); `f` shows `agentbox fetch <profile>` and
+runs it only after `y`; `r` refreshes, `?` lists the keys, `q` quits. It never runs `--force`, `down`,
+`fresh`, `stop`, `run` or `up`. `agentbox dashboard --watch` still gives the plain text view.
 
 The actions switch the Rex app to the session they open. Doing that from the `rex` CLI needs Rex's Remote
 Control setting.
@@ -36,8 +42,8 @@ No keys are bound by default. Suggested bindings (use Rex's key-binding syntax i
 
 ## Status
 
-Inside Rex (`REX_SESSION` set, output on a terminal), `agentbox progress --watch`, `dashboard --watch` and
-`wait` report job state with OSC 7501, so it shows in the tab and in View Activity: `working` (with plan
+Inside Rex (`REX_SESSION` set, output on a terminal), `agentbox progress --watch`, `dashboard --watch` or
+`--interactive`, and `wait` report job state with OSC 7501, so it shows in the tab and in View Activity: `working` (with plan
 progress), `blocked` when the job has stalled, `done`, `error`, `idle`. Every record's id is the profile
 name. The dashboard keeps one record per profile that follows its latest job, also after sbx has stopped
 the sandbox (read from the state agentbox keeps on the host; a stopped sandbox is never booted): `done` or

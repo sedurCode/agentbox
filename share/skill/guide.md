@@ -16,6 +16,8 @@ The owner set these rules. Follow them even when a task seems to ask for more.
 
 - `agentbox status`, `dashboard`, `progress`, `logs`, `doctor`, `tools`, and their `--json` forms.
   Leave out `--start`: on `logs` and `doctor` it boots a stopped sandbox.
+  `dashboard --interactive` is the owner's full-screen view and needs a terminal; don't run it yourself
+  (its `f` key fetches, after asking the owner).
 - `git log`, `git diff`, `git status` on the host (but see the direct-mode warning in section 5).
 - `sbx ls`.
 

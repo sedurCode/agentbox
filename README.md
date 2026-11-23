@@ -564,6 +564,7 @@ come from the host's cache because the sandbox could not be read.
 ```bash
 agentbox dashboard                  # one snapshot
 agentbox dashboard --watch          # redraw every 5 s until Ctrl-C (--interval S, at least 2)
+agentbox dashboard --interactive    # (-i) full-screen: every profile, its job and plan; keys below
 agentbox dashboard --json
 ```
 
@@ -574,6 +575,30 @@ costs one extra `sbx exec` (CPU is sampled over half a second inside the VM) on 
 The VM's output is parsed as numbers and drawn by agentbox, never printed raw. Colour is used only on a
 terminal and not if `NO_COLOR` is set.
 
+`--interactive` (`-i`) is a full-screen terminal view (Python's `curses`, nothing to install) and needs a
+terminal; it can't be combined with `--watch` or `--json`. A list of every profile, not only the running
+ones, sorted working first, then those needing attention (stalled, failed, lost), then finished, then the
+rest. Each row has a state mark, the agent, and the job's elapsed time or how long ago it finished. Beside it
+(or below it in a narrow pane) the selected profile's details: the VM with CPU, memory and disk bars, the
+job (id, state, start and finish, exit code, elapsed, idle, turns, tool calls, the most-used tools, commits,
+tokens, cost with `~` when estimated), small charts of tokens and tool calls per refresh since the dashboard
+started (kept in memory only), and the agent's plan, which is the agent's own claim, not verified. Data is
+collected in the background every `--interval` seconds, so keys and resizing stay responsive while `sbx` is
+slow. It uses the terminal's own colours and background, honours `NO_COLOR`, and draws ASCII if the locale
+isn't UTF-8. Below 60x15 it asks for a bigger pane.
+
+| key | |
+|---|---|
+| ↑ ↓, j k, click | select a profile; the wheel scrolls the list or the details; Home / End |
+| Enter, p | `agentbox progress <profile> --watch` in the same terminal; back on exit or Ctrl-C |
+| l | `agentbox logs <profile>` in `$PAGER` (default `less -R`), sanitised as `logs` always is |
+| f | shows `agentbox fetch <profile>` and asks y/N; runs it only on `y`, with no other flags |
+| r | refresh now |
+| ? | help |
+| q, Ctrl-C | quit and give the terminal back |
+
+The dashboard never offers `--force`, `down`, `fresh`, `stop`, `run` or `up`.
+
 ### Using agentbox from Rex
 
 [Rex](https://www.superlogical.com/rex/docs) users get palette actions and job status from
@@ -581,9 +606,9 @@ terminal and not if `NO_COLOR` is set.
 [`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
-  a job from a prompt file, open the dashboard, fetch for review, remove a sandbox. Two lines in
+  a job from a prompt file, open the interactive dashboard, fetch for review, remove a sandbox. Two lines in
   `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
-- **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` and `wait`
+- **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` / `--interactive` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
   idle. Each record is named after its profile; the dashboard keeps one per profile, and a finished job's
   done or error stays after the sandbox stops, until that profile's next job. Only host-side state goes in
