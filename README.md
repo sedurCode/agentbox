@@ -394,7 +394,8 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   terminal; checked with opencode 1.19.6), so it is on no command line.
 - **Job directory** (inside the VM, `~/.agentbox/jobs/<id>/`, id like `20260101T120000Z-ab12cd`):
   `prompt.md`, `wrap.sh` (the wrapper), `jobprogress` and `progress.tsv` (see *Watching a job*), `start_head`, `pid`, `started_at`, `output.jsonl` (the stream),
-  `stderr.log`, `finished_at`, `exit_code` (written last, atomically, by the wrapper) and
+  `stderr.log`, `branch` and `end_head` (the branch and commit the workspace ended on; see *Which branch*),
+  `finished_at`, `exit_code` (written last, atomically, by the wrapper) and
   `session_id` (the stream's first `session_id`, or `sessionID` for opencode). The host keeps only
   `~/.local/state/agentbox/ab-<profile>/job.json` (current job id, session id, and the result once seen).
 - **Job state** comes from those files only: `finished` if `exit_code` exists; `running` if the
