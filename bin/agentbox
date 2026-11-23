@@ -2057,6 +2057,10 @@ JOB_DIR = '"$HOME/.agentbox/jobs/{id}"'
 HEADLESS_AGENTS = {         # agent -> headless command, and the flag that resumes a session
     "claude": {"cmd": ["claude", "-p", "--output-format", "stream-json", "--verbose",
                        "--dangerously-skip-permissions"], "resume": "--resume"},
+    # `opencode run` reads the prompt from stdin when it is not a terminal (and appends any message
+    # words, of which we pass none), so the prompt stays off the argv here too. --auto approves tool
+    # permissions (opencode 1.19: `--dangerously-skip-permissions` is a hidden alias).
+    "opencode": {"cmd": ["opencode", "run", "--format", "json", "--auto"], "resume": "--session"},
 }
 NO_JOB = {"id": None, "state": "none", "exit_code": None, "session_id": None,
           "started_at": None, "finished_at": None, "vm": None}   # vm: sandbox state when last checked
@@ -2083,8 +2087,8 @@ def probe_script(job_id: str) -> str:
         f'd={d}; echo "D $d"; [ -d "$d" ] || {{ echo MISSING; exit 0; }}; '
         'p=$(cat "$d/pid" 2>/dev/null); case $p in *[!0-9]*|"") p=;; esac; '
         '[ -n "$p" ] && [ -r "/proc/$p/cmdline" ] && echo "CMD $(tr \'\\0\' \' \' < "/proc/$p/cmdline")"; '
-        'if [ ! -s "$d/session_id" ]; then grep -m1 -o \'"session_id":"[^"]*"\' "$d/output.jsonl" 2>/dev/null '
-        '| head -n1 | sed \'s/.*"session_id":"\\([^"]*\\)".*/\\1/\' > "$d/session_id.tmp"; '
+        'if [ ! -s "$d/session_id" ]; then grep -m1 -o -E \'"(session_id|sessionID)":"[^"]*"\' "$d/output.jsonl" 2>/dev/null '
+        '| head -n1 | sed \'s/.*":"\\([^"]*\\)".*/\\1/\' > "$d/session_id.tmp"; '
         '[ -s "$d/session_id.tmp" ] && mv "$d/session_id.tmp" "$d/session_id" || rm -f "$d/session_id.tmp"; fi; '
         'for f in pid started_at finished_at session_id exit_code; do '
         '[ -f "$d/$f" ] && echo "F $f $(head -c 80 "$d/$f" | tr -d \'\\n\')"; done; true')
@@ -2215,13 +2219,14 @@ def public_job(info_: dict) -> dict:
 
 
 def session_id_from_stream(text: str) -> str | None:
-    """First session id in a claude stream-json transcript (its system/init message)."""
+    """First session id in a transcript: claude stream-json's `session_id` (its system/init message) or
+    opencode's `sessionID` (on every event)."""
     for line in text.splitlines():
         try:
             obj = json.loads(line)
         except ValueError:
             continue
-        sid = obj.get("session_id") if isinstance(obj, dict) else None
+        sid = (obj.get("session_id") or obj.get("sessionID")) if isinstance(obj, dict) else None
         if isinstance(sid, str) and SESSION_ID_RE.match(sid):
             return sid
     return None
@@ -2242,6 +2247,8 @@ def render_stream_line(line: str) -> str | None:
     if not isinstance(ev, dict):
         return None
     kind = ev.get("type")
+    if kind in OPENCODE_EVENTS:
+        return render_opencode_event(ev)
     if kind == "system" and ev.get("subtype") == "init":
         return safe_text(f"[init] session {ev.get('session_id', '?')} model {ev.get('model', '?')}")
     if kind == "assistant":
@@ -2258,6 +2265,35 @@ def render_stream_line(line: str) -> str | None:
         return safe_text("\n".join(parts)) or None
     if kind == "result":
         return safe_text(f"[result] {ev.get('subtype', '?')}: {_squash(ev.get('result', ''))}".rstrip(": "))
+    return None
+
+
+# `opencode run --format json`: one JSON object per line, {"type", "timestamp" (ms), "sessionID", ...}.
+# step_start / step_finish (with the step's tokens) frame each model call, tool_use comes once per finished
+# tool call, text once per finished text part, reasoning only with --thinking, error for a session error.
+# Read from opencode 1.19.6's `run` command; tests/fixtures/opencode-run.jsonl is one such stream.
+OPENCODE_EVENTS = {"step_start", "step_finish", "tool_use", "text", "reasoning", "error"}
+
+
+def _part(ev: dict) -> dict:
+    return ev["part"] if isinstance(ev.get("part"), dict) else {}
+
+
+def render_opencode_event(ev: dict) -> str | None:
+    kind, part = ev.get("type"), _part(ev)
+    if kind == "text" and str(part.get("text", "")).strip():
+        return safe_text(f"assistant: {_squash(part['text'])}")
+    if kind == "reasoning" and str(part.get("text", "")).strip():
+        return safe_text(f"thinking: {_squash(part['text'])}")
+    if kind == "tool_use":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        failed = " [failed]" if state.get("status") == "error" else ""
+        return safe_text(f"tool: {_squash(part.get('tool', '?'), 60)} "
+                         f"{_squash(json.dumps(state.get('input', {})), 120)}{failed}")
+    if kind == "error":
+        err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        return safe_text(f"[error] {_squash(err.get('name', '?'), 60)}: {_squash(data.get('message', ''))}".rstrip(": "))
     return None
 
 
@@ -2440,6 +2476,13 @@ PROGRESS_PROMPT = ('Progress reporting: before you start, record your plan with 
                    '`jobprogress note "<status>"` for anything the user should know. Keep it accurate: the user watches it.')
 
 
+def headless_cmd(prof: Profile, spec: dict) -> list[str]:
+    """The agent's headless argv. The prompt is never in it: the job wrapper feeds prompt.md on stdin."""
+    lm = prof.local_model
+    # the model is in the generated opencode config too; on the argv a workspace opencode.json can't override it
+    return [*spec["cmd"], *([f"--model={OPENCODE_PROVIDER}/{lm['model']}"] if lm else [])]
+
+
 def cmd_run(prof: Profile, args) -> int:
     agent = prof.d["agent"]
     spec = HEADLESS_AGENTS.get(agent)
@@ -2470,7 +2513,7 @@ def cmd_run(prof: Profile, args) -> int:
     if report:
         vm_write(prof, job_id, "jobprogress", (SHARE_DIR / "jobprogress").read_text())
     sync_skills(prof, background=False)             # the exec above started the VM, if it was stopped
-    cmd = [*spec["cmd"], *(args.agent_args or [])]
+    cmd = [*headless_cmd(prof, spec), *(args.agent_args or [])]
     d = JOB_DIR.format(id=job_id)
     # start_head: HEAD before the agent runs, so `progress` can count the commits it makes
     r = vm_exec(prof, (f'd={d}; S=; command -v setsid >/dev/null 2>&1 && S=setsid; '
@@ -2514,7 +2557,7 @@ def cmd_resume(prof: Profile, args) -> int:
     sid = j["session_id"]
     if not SESSION_ID_RE.match(sid):          # belt and braces: the id comes from an agent-writable file
         die(f"refusing to resume: malformed session id for job {job_id}")
-    # `--resume=<id>` (claude accepts it) so the id can never be read as a separate option
+    # `--resume=<id>` / `--session=<id>` (claude and opencode accept it) so the id can never be read as a separate option
     return sbx(prof.cfg, "run", "--name", prof.sandbox, "--", f"{spec['resume']}={sid}", check=False).returncode
 
 
@@ -2580,8 +2623,9 @@ def _count(v) -> int:
 
 
 def ingest(acc: dict, text: str):
-    """Fold complete stream-json lines into the totals. stream-json repeats a message id across
-    content-block events (each repeats the usage), so a message id counts - and bills - once."""
+    """Fold complete stream-json lines (claude) or opencode JSON events into the totals. stream-json
+    repeats a message id across content-block events (each repeats the usage), so a message id counts -
+    and bills - once. The two formats share no event type, so each line says which one it is."""
     seen = set(acc["seen"])
     for line in text.split("\n"):
         line = line.strip()
@@ -2597,7 +2641,9 @@ def ingest(acc: dict, text: str):
         if ts is not None and (acc["last_ts"] is None or ts > acc["last_ts"]):
             acc["last_ts"] = ts
         kind = ev.get("type")
-        if kind == "assistant" and isinstance(ev.get("message"), dict):
+        if kind in OPENCODE_EVENTS:
+            ingest_opencode(acc, ev, seen)
+        elif kind == "assistant" and isinstance(ev.get("message"), dict):
             msg = ev["message"]
             mid = msg.get("id")
             key = f"m:{mid[:200]}" if isinstance(mid, str) and mid else None
@@ -2616,22 +2662,53 @@ def ingest(acc: dict, text: str):
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
                 bid = block.get("id")
-                key = f"t:{bid[:200]}" if isinstance(bid, str) and bid else None
-                if key is not None:
-                    if key in seen:
-                        continue
-                    if len(seen) < MAX_SEEN_IDS:
-                        seen.add(key)
-                acc["tool_calls"] += 1
-                name = str(block.get("name"))[:64] if isinstance(block.get("name"), str) else "?"
-                if name not in acc["tools"] and len(acc["tools"]) >= MAX_TOOL_NAMES:
-                    name = "(other)"
-                acc["tools"][name] = acc["tools"].get(name, 0) + 1
+                if _seen_once(seen, f"t:{bid[:200]}" if isinstance(bid, str) and bid else None):
+                    _count_tool(acc, block.get("name"))
         elif kind == "result":
             cost = ev.get("total_cost_usd")
             ok = isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost <= 1e6
             acc["result"] = {"cost": float(cost) if ok else None}
     acc["seen"] = sorted(seen)
+
+
+def _seen_once(seen: set, key: str | None) -> bool:
+    """True the first time `key` is seen (None: no id, always counted)."""
+    if key is None:
+        return True
+    if key in seen:
+        return False
+    if len(seen) < MAX_SEEN_IDS:
+        seen.add(key)
+    return True
+
+
+def _count_tool(acc: dict, name):
+    acc["tool_calls"] += 1
+    name = name[:64] if isinstance(name, str) else "?"
+    if name not in acc["tools"] and len(acc["tools"]) >= MAX_TOOL_NAMES:
+        name = "(other)"
+    acc["tools"][name] = acc["tools"].get(name, 0) + 1
+
+
+def ingest_opencode(acc: dict, ev: dict, seen: set):
+    """One `opencode run --format json` event (see OPENCODE_EVENTS). A turn is a step (one model call),
+    counted at its step_start; its tokens come with its step_finish. opencode's own cost is ignored: it
+    is 0 for a local model, and anything else has no price here, so cost stays null."""
+    kind, part = ev.get("type"), _part(ev)
+    pid = part.get("id")
+    key = f"o:{pid[:200]}" if isinstance(pid, str) and pid else None
+    if kind == "step_start" and _seen_once(seen, key):
+        acc["turns"] += 1
+    elif kind == "step_finish" and isinstance(part.get("tokens"), dict) and _seen_once(seen, key):
+        t = part["tokens"]
+        cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
+        row = acc["tokens"].setdefault("other", dict.fromkeys(TOKEN_KEYS, 0))
+        # reasoning tokens are output the model generated; opencode counts them apart
+        for k, n in (("input", _count(t.get("input"))), ("output", _count(t.get("output")) + _count(t.get("reasoning"))),
+                     ("cache_read", _count(cache.get("read"))), ("cache_creation", _count(cache.get("write")))):
+            row[k] = row.get(k, 0) + n
+    elif kind == "tool_use" and _seen_once(seen, key):
+        _count_tool(acc, part.get("tool"))
 
 
 def parse_plan(lines: list[str]) -> tuple[list[dict], str]:

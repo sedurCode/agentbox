@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import AgentboxTestCase, FakeSbx, ab
+from helpers import AgentboxTestCase, FakeSbx, ab, needs_linux_vm
+from test_jobs import JobCase
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 LM = 'local_model = { provider = "ollama", model = "gemma4:12b", port = 11434 }'
 
 
@@ -266,6 +268,132 @@ class ProvisionTests(AgentboxTestCase):
         code, out, err = self.run_main("provision", "loc", "--yes", "--workspace", str(self.ws), "--agent", "opencode")
         self.assertEqual(code, 0, out + err)
         self.assertNotIn("local_model", tomllib.loads(self.conf.read_text())["profiles"]["loc"])
+
+
+class HeadlessArgvTests(AgentboxTestCase):
+    def test_opencode_argv_has_json_auto_and_model_but_no_prompt(self):
+        self.write_config(f'[profiles.lm]\nworkspace = "{self.ws}"\nagent = "opencode"\n{LM}\n'
+                          f'[profiles.oc]\nworkspace = "{self.ws}"\nagent = "opencode"\n')
+        cfg = ab.Config()
+        argv = ab.headless_cmd(cfg.profile("lm"), ab.HEADLESS_AGENTS["opencode"])
+        self.assertEqual(argv, ["opencode", "run", "--format", "json", "--auto", "--model=ollama/gemma4:12b"])
+        self.assertEqual(ab.headless_cmd(cfg.profile("oc"), ab.HEADLESS_AGENTS["opencode"]),
+                         ["opencode", "run", "--format", "json", "--auto"])
+        self.assertEqual(ab.HEADLESS_AGENTS["opencode"]["resume"], "--session")
+
+
+FAKE_OPENCODE = """#!/bin/sh
+printf '%s\\n' "$@" > "$HOME/opencode.argv"
+cat > "$HOME/opencode.stdin"
+cat "$FIXTURE"
+"""
+
+
+class OpencodeJobTests(JobCase):
+    def setUp(self):
+        super().setUp()
+        conf = self.cfg_dir / "agentbox.toml"
+        conf.write_text(conf.read_text() + f'[profiles.lm]\nworkspace = "{self.ws}"\nagent = "opencode"\n{LM}\n')
+        self.prof = ab.Config().profile("lm")
+        bindir = self.tmp / "vmbin"
+        (bindir / "opencode").write_text(FAKE_OPENCODE)
+        (bindir / "opencode").chmod(0o755)
+        self.vm.env["FIXTURE"] = str(FIXTURES / "opencode-run.jsonl")
+        p = mock.patch.object(ab, "sandbox_states", lambda cfg: {"ab-lm": "running"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    @needs_linux_vm
+    def test_prompt_goes_in_on_stdin_never_on_argv(self):
+        job = self.start()
+        self.finish(job)
+        for call in self.vm.calls:
+            self.assertNotIn("SECRET-PROMPT-TEXT", " ".join(map(str, call)))
+        argv = (self.vm.home / "opencode.argv").read_text().split("\n")[:-1]
+        self.assertEqual(argv, ["run", "--format", "json", "--auto", "--model=ollama/gemma4:12b"])
+        self.assertTrue((self.vm.home / "opencode.stdin").read_text().endswith("SECRET-PROMPT-TEXT summarise the repo"))
+        j = ab.job_info(self.prof, job)
+        self.assertEqual((j["state"], j["exit_code"], j["session_id"]), ("finished", 0, "ses_df6fc58a9ffe9yzVQI7jmnorDr"))
+
+    @needs_linux_vm
+    def test_resume_uses_the_session_flag(self):
+        job = self.start()
+        self.finish(job)
+        runs = []
+        orig = type(self.vm).__call__
+        with mock.patch.object(type(self.vm), "__call__",
+                               lambda s, cfg, *a, **k: (runs.append(a), ab.subprocess.CompletedProcess(a, 0, "", ""))[1]
+                               if a[0] == "run" else orig(s, cfg, *a, **k)):
+            self.assertEqual(ab.cmd_resume(self.prof, self.args()), 0)
+        self.assertEqual(runs[0], ("run", "--name", "ab-lm", "--", "--session=ses_df6fc58a9ffe9yzVQI7jmnorDr"))
+
+    @needs_linux_vm
+    def test_progress_and_status_json(self):
+        job = self.start()
+        self.finish(job)
+        code, out, err = self.run_main("progress", "lm", "--json")
+        self.assertEqual(code, 0, err)
+        prog = json.loads(out)
+        self.assertEqual((prog["turns"], prog["tool_calls"], prog["tools_top"]), (2, 1, [{"name": "bash", "count": 1}]))
+        self.assertEqual(prog["tokens"], {"input": 2500, "output": 52, "cache_read": 0, "cache_creation": 0, "total": 2552})
+        self.assertIsNone(prog["cost_usd"])
+        code, out, _ = self.run_main("status", "--json")
+        row = next(p for p in json.loads(out)["profiles"] if p["name"] == "lm")
+        self.assertEqual(row["local_model"]["model"], "gemma4:12b")
+        self.assertEqual(row["job"]["progress"]["turns"], 2)
+
+
+class ParserTests(unittest.TestCase):
+    """The opencode parser against a stream opencode 1.19.6 really wrote (see tests/fixtures/README.md)."""
+
+    def ingest(self, text):
+        acc = ab.new_acc("j")
+        ab.ingest(acc, text)
+        return acc
+
+    def test_recorded_run(self):
+        acc = self.ingest((FIXTURES / "opencode-run.jsonl").read_text())
+        self.assertEqual((acc["turns"], acc["tool_calls"], acc["tools"]), (2, 1, {"bash": 1}))
+        self.assertEqual(acc["tokens"], {"other": {"input": 2500, "output": 52, "cache_read": 0, "cache_creation": 0}})
+        self.assertEqual(acc["last_ts"], 1795447564.963)               # ms timestamps
+        self.assertIsNone(acc["result"])
+        self.assertIsNone(ab.estimate_cost(acc))                        # no price for a local model: null, not 0
+
+    def test_chunks_and_repeats_count_once(self):
+        lines = (FIXTURES / "opencode-run.jsonl").read_text().splitlines(keepends=True)
+        acc = ab.new_acc("j")
+        for i in range(0, len(lines), 2):
+            ab.ingest(acc, "".join(lines[i:i + 2]))
+        ab.ingest(acc, "".join(lines))                                  # a re-read of the same events
+        self.assertEqual((acc["turns"], acc["tool_calls"], acc["tokens"]["other"]["input"]), (2, 1, 2500))
+
+    def test_missing_and_junk_fields_stay_harmless(self):
+        acc = self.ingest("\n".join(json.dumps(e) for e in (
+            {"type": "step_start"}, {"type": "step_start", "part": "x"},
+            {"type": "step_finish", "part": {"tokens": {"input": "9", "output": -1, "cache": [1]}}},
+            {"type": "step_finish", "part": {"tokens": None}},
+            {"type": "tool_use", "part": {"tool": {"x": 1}}}, {"type": "tool_use"},
+            {"type": "text", "part": None}, {"type": "error"}, {"type": "error", "error": "boom"},
+            {"type": "reasoning", "timestamp": "never"})) + "\n")
+        self.assertEqual((acc["turns"], acc["tool_calls"], acc["tools"]), (2, 2, {"?": 2}))
+        self.assertEqual(sum(acc["tokens"]["other"].values()), 0)
+        self.assertIsNone(acc["last_ts"])
+
+    def test_logs_render_and_session_id(self):
+        text = (FIXTURES / "opencode-run.jsonl").read_text()
+        shown = [r for r in map(ab.render_stream_line, text.splitlines()) if r]
+        self.assertEqual(shown, ['tool: bash {"command": "ls", "description": "List files"}',
+                                 "assistant: I'll list the files.", "assistant: The directory contains hello.txt."])
+        self.assertEqual(ab.session_id_from_stream(text), "ses_df6fc58a9ffe9yzVQI7jmnorDr")
+        err = ab.render_stream_line((FIXTURES / "opencode-error.jsonl").read_text().strip())
+        self.assertTrue(err.startswith("[error] APIError: Cannot connect to API"))
+        for junk in ({"type": "error"}, {"type": "tool_use", "part": {"state": "x"}}, {"type": "text", "part": {"text": "\x1b]52;c;x\x07"}}):
+            self.assertNotIn("\x1b", ab.render_stream_line(json.dumps(junk)) or "")
+
+    def test_failed_tool_call_is_marked(self):
+        ev = {"type": "tool_use", "part": {"id": "p1", "tool": "read", "state": {"status": "error", "input": {"filePath": "x"}}}}
+        self.assertTrue(ab.render_stream_line(json.dumps(ev)).endswith("[failed]"))
+        self.assertEqual(self.ingest(json.dumps(ev) + "\n")["tools"], {"read": 1})
 
 
 if __name__ == "__main__":
