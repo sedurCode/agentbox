@@ -62,6 +62,8 @@ import subprocess
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path, PurePosixPath
 
 import tomllib
@@ -152,6 +154,19 @@ BUILTIN_SKILLS = {"code-review", "security-review", "simplify", "init", "claude-
 SKILL_TEXT_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml")
 SKILLS_VM_DIR = "$HOME/.claude/skills"      # where Claude Code reads user skills inside the VM
 
+# `local_model`: an agent in the sandbox using a model served on the host. Only Ollama + opencode for now;
+# `provider` is there so other servers (and agents) can be added without changing the key.
+LOCAL_MODEL_PROVIDERS = {"ollama": 11434}    # provider -> default port
+LOCAL_MODEL_AGENTS = {"opencode"}
+LOCAL_MODEL_KEYS = {"provider", "model", "port", "context"}
+# Ollama model names ("gemma4:12b", "hf.co/user/repo:Q4_K_M"): no spaces, quotes, `$`, `;`... It ends up
+# in a JSON file and in an argv (always after `--model=`), never in a shell command.
+LOCAL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}"
+                            r"(:[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$")
+LOCAL_MODEL_MIN_CONTEXT = 32768             # below this an agent's system prompt + tools + a few files don't fit
+OPENCODE_PROVIDER = "ollama"                # provider id in the generated opencode config
+OPENCODE_CONFIG_VM = "/home/agent/.agentbox/opencode.json"
+
 
 # ----------------------------------------------------------------- helpers
 # Exit codes (documented in the README): scripts can rely on these.
@@ -225,6 +240,10 @@ class Config:
         return sorted(self.raw.get("profiles", {}).keys())
 
     def profile(self, name: str) -> "Profile":
+        return Profile(self, name, self.merged(name))
+
+    def merged(self, name: str) -> dict:
+        """The profile's settings: built-ins, then [defaults], then the profile (lists are unioned)."""
         profs = self.raw.get("profiles", {})
         if name not in profs:
             die(f"unknown profile '{name}'. Known: {', '.join(self.profile_names()) or '(none)'}", EXIT_USAGE)
@@ -239,7 +258,53 @@ class Config:
                     seen.add(v)
                     out.append(v)
             merged[key] = out
-        return Profile(self, name, merged)
+        return merged
+
+    def host_tools_ports(self) -> dict[int, list[str]]:
+        """Every host_tools_port in the file -> where it is set ("defaults" or profile names)."""
+        out: dict[int, list[str]] = {}
+        tables = [("defaults", self.raw.get("defaults", {}))] + list(self.raw.get("profiles", {}).items())
+        for where, t in tables:
+            v = t.get("host_tools_port") if isinstance(t, dict) else None
+            if isinstance(v, int) and not isinstance(v, bool) and v:
+                out.setdefault(v, []).append(where)
+        return out
+
+
+def local_model_problems(cfg: Config, d: dict) -> list[str]:
+    """What is wrong with a profile's `local_model` (empty if it is fine or not set)."""
+    lm = d.get("local_model")
+    if lm is None:
+        return []
+    if not isinstance(lm, dict):
+        return ["local_model must be a table: local_model = { provider = \"ollama\", model = \"...\", port = 11434 }"]
+    out = []
+    extra = sorted(set(lm) - LOCAL_MODEL_KEYS)
+    if extra:
+        out.append(f"local_model: unknown key(s) {', '.join(map(str, extra))} (known: {', '.join(sorted(LOCAL_MODEL_KEYS))})")
+    provider = lm.get("provider")
+    if provider not in LOCAL_MODEL_PROVIDERS:
+        out.append(f"local_model.provider must be one of: {', '.join(LOCAL_MODEL_PROVIDERS)} (got {provider!r})")
+    model = lm.get("model")
+    if not isinstance(model, str) or not LOCAL_MODEL_RE.match(model):
+        out.append(f"local_model.model must be a model name like \"gemma4:12b\" (letters, digits and . _ - / :),"
+                   f" got {model!r}")
+    port = lm.get("port", LOCAL_MODEL_PROVIDERS.get(provider, 0))
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        out.append(f"local_model.port must be a number from 1 to 65535 (got {port!r})")
+    else:
+        users = cfg.host_tools_ports().get(port, [])
+        if users:
+            out.append(f"local_model.port {port} is also host_tools_port in {', '.join(users)}: the host-tool bridge"
+                       " and the model server need different ports")
+    ctx = lm.get("context", LOCAL_MODEL_MIN_CONTEXT)
+    if not isinstance(ctx, int) or isinstance(ctx, bool) or not 2048 <= ctx <= 10_000_000:
+        out.append(f"local_model.context must be a number of tokens from 2048 to 10000000 (got {ctx!r})")
+    agent = d.get("agent")
+    if agent not in LOCAL_MODEL_AGENTS:
+        out.append(f"local_model is only supported with agent = \"opencode\" for now (this profile's agent is"
+                   f" {agent!r}); remove local_model or switch the agent")
+    return out
 
 
 class Profile:
@@ -266,6 +331,9 @@ class Profile:
         sa = d["stall_after"]
         if not isinstance(sa, int) or isinstance(sa, bool) or sa < 1:
             die(f"profile '{name}': stall_after must be a positive number of seconds", EXIT_USAGE)
+        problems = local_model_problems(cfg, d)
+        if problems:
+            die(f"profile '{name}': " + "\n  ".join(problems), EXIT_USAGE)
 
     # all host paths the sandbox can see (and so the agent can write to, unless :ro)
     @property
@@ -286,6 +354,16 @@ class Profile:
         if self.tool_names and not p:
             die(f"profile '{self.name}' lists host_tools but has no host_tools_port", EXIT_USAGE)
         return p
+
+    @property
+    def local_model(self) -> dict | None:
+        """The validated `local_model`, with defaults filled in; None when the profile has none."""
+        lm = self.d.get("local_model")
+        if lm is None:
+            return None
+        return {"provider": lm["provider"], "model": lm["model"],
+                "port": lm.get("port", LOCAL_MODEL_PROVIDERS[lm["provider"]]),
+                "context": lm.get("context", LOCAL_MODEL_MIN_CONTEXT)}
 
     def agent_ref(self) -> str:
         a = self.d["agent"]
@@ -803,6 +881,29 @@ def tool_summary(cfg: Config, names: list[str]) -> str:
     return "\n".join(lines)
 
 
+def opencode_config(lm: dict) -> dict:
+    """opencode's config for a model on the host: an OpenAI-compatible provider at the host's Ollama
+    (`/v1`), and that model as the default (`small_model` too, so session titles stay local). Format:
+    opencode 1.x (`provider.<id>.npm/options/models`; checked against opencode 1.19.6 and
+    opencode.ai/v1/docs/providers). `limit` tells opencode when to compact; Ollama's own context
+    setting has to be at least as large (see `doctor`)."""
+    ref = f"{OPENCODE_PROVIDER}/{lm['model']}"
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {OPENCODE_PROVIDER: {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Ollama on the host (agentbox)",
+            "options": {"baseURL": f"http://host.docker.internal:{lm['port']}/v1"},
+            "models": {lm["model"]: {"name": lm["model"], "tool_call": True,
+                                     "limit": {"context": lm["context"], "output": min(8192, lm["context"] // 4)}}},
+        }},
+        "model": ref,
+        "small_model": ref,
+        "autoupdate": False,
+        "share": "disabled",
+    }
+
+
 def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
     """Per-sandbox mixin: network allow/deny, env, host-tool client, instructions.
     Stored in the state dir (not a workspace), so the agent can't edit it."""
@@ -839,6 +940,23 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
             " run `hosttool list` for details. Run it from inside the workspace - paths are checked against it.",
             tool_summary(cfg, prof.tool_names),
             "Host tools are deliberately narrow. If you need something they don't allow, ask the user.",
+        ]
+    lm = prof.local_model
+    if lm:
+        # The one host port this sandbox may reach for the model. Opt-in per profile: sbx's global policy
+        # keeps the host's localhost closed otherwise.
+        if f"localhost:{lm['port']}" not in allow:
+            allow.append(f"localhost:{lm['port']}")
+        files["home/.agentbox/opencode.json"] = json.dumps(opencode_config(lm), indent=2) + "\n"
+        env["OPENCODE_CONFIG"] = OPENCODE_CONFIG_VM
+        env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
+        env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"     # models.dev isn't on the allow-list; the model is in the config
+        instructions += [
+            "",
+            "## Local model",
+            f"You are running on {lm['model']}, served by {lm['provider']} on the user's machine at"
+            f" http://host.docker.internal:{lm['port']}/v1. That port is the only one on the host you can reach."
+            f" Your context window is about {lm['context']} tokens: read files in parts and keep tool output short.",
         ]
     mounts = prof.skill_mounts()
     if mounts:
@@ -3128,6 +3246,7 @@ def profile_status(prof: Profile, states=_FETCH) -> dict:
             "sandbox_exists": sandbox_exists(prof) if states is None else prof.sandbox in states,
             "host_tools": prof.tool_names,
             "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
+            "local_model": prof.local_model,
             "bridge": {"running": pid is not None, "pid": pid},
             "skills": skills_status(prof)}
 
@@ -3506,10 +3625,11 @@ class Report:
             item["data"] = data
         self.items.append(item)
 
-    def chk(self, cond, msg, hint=""):
+    def chk(self, cond, msg, hint="") -> bool:
         self.ok &= bool(cond)
         self.add("pass" if cond else "fail", msg, "" if cond else hint)
         self.say(("  ok   " if cond else "  FAIL ") + msg + ("" if cond else f"\n         -> {hint}"))
+        return bool(cond)
 
     def note(self, kind: str, msg: str, hint: str = "", details=(), data=None):
         """kind: info | warn. Never fails the run."""
@@ -3522,6 +3642,121 @@ class Report:
 
     def result(self) -> dict:
         return {"ok": self.ok, "checks": self.items}
+
+
+# ------------------------------------------------------------ local models (host side)
+OLLAMA_CONTEXT_HINT = ("Ollama's context length is a server setting: set OLLAMA_CONTEXT_LENGTH=32768 (or more) in the"
+                       " environment of `ollama serve` (the Mac app: Settings > Context length), or `PARAMETER num_ctx"
+                       " 32768` in a Modelfile. Prompts past it are cut silently, and an agent's system prompt and tool"
+                       " definitions alone take thousands of tokens. Match local_model.context to it.")
+
+
+def ollama_api(port: int, path: str, body: dict | None = None, timeout: float = 3.0):
+    """JSON from Ollama's native API on the host's 127.0.0.1 (never through a proxy). Raises OSError or
+    ValueError. The answers are the model server's, so treat them as data."""
+    req = urllib.request.Request(f"http://127.0.0.1:{int(port)}{path}",
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json"} if body is not None else {})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read(4 << 20))
+
+
+def ollama_tag_names(tags) -> list[str]:
+    models = tags.get("models") if isinstance(tags, dict) else None
+    return [m["name"] for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)] \
+        if isinstance(models, list) else []
+
+
+def ollama_has_model(names: list[str], model: str) -> bool:
+    return model in names or (":" not in model.rsplit("/", 1)[-1] and f"{model}:latest" in names)
+
+
+def ollama_capabilities(show) -> list[str]:
+    caps = show.get("capabilities") if isinstance(show, dict) else None
+    return [c for c in caps if isinstance(c, str)] if isinstance(caps, list) else []
+
+
+def ollama_context(show, ps, model: str) -> tuple[int | None, int | None]:
+    """(the model's own maximum context, the context Ollama really gives it or None if unknown).
+    The real one is in /api/ps while the model is loaded, or in the model's num_ctx parameter."""
+    info_ = show.get("model_info") if isinstance(show, dict) else None
+    native = next((v for k, v in info_.items() if k.endswith(".context_length") and _count(v)), None) \
+        if isinstance(info_, dict) else None
+    real = None
+    for m in (ps.get("models") if isinstance(ps, dict) and isinstance(ps.get("models"), list) else []):
+        if isinstance(m, dict) and m.get("name") in (model, f"{model}:latest") and _count(m.get("context_length")):
+            real = m["context_length"]
+    params = show.get("parameters") if isinstance(show, dict) else None
+    if real is None and isinstance(params, str):
+        hit = re.search(r"(?m)^\s*num_ctx\s+(\d{1,9})\s*$", params)
+        real = int(hit.group(1)) if hit else None
+    return native, real
+
+
+def ollama_tool_models(port: int) -> list[str] | None:
+    """The host's Ollama models (what `ollama list` shows) that report the `tools` capability; None if
+    Ollama does not answer."""
+    try:
+        names = ollama_tag_names(ollama_api(port, "/api/tags"))
+    except (OSError, ValueError):
+        return None
+    out = []
+    for n in names[:50]:
+        try:
+            if "tools" in ollama_capabilities(ollama_api(port, "/api/show", {"model": n})):
+                out.append(n)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def doctor_local_model(rep: "Report", prof: Profile):
+    """From the host: is the model server up, does it have the model, can the model call tools, and is
+    the context long enough for an agent."""
+    lm = prof.local_model
+    port, model = lm["port"], lm["model"]
+    rep.note("info", f"local model {model} via {lm['provider']} on host port {port}: the sandbox may reach"
+                     f" localhost:{port} on this machine (and nothing else on it, unless host_tools are set)")
+    try:
+        tags = ollama_api(port, "/api/tags")
+    except (OSError, ValueError) as e:
+        rep.chk(False, f"Ollama answers on 127.0.0.1:{port}",
+                f"start Ollama (the app, or `ollama serve`); if it listens elsewhere, fix local_model.port ({e})")
+        return
+    rep.chk(True, f"Ollama answers on 127.0.0.1:{port}")
+    names = ollama_tag_names(tags)
+    if not rep.chk(ollama_has_model(names, model), f"Ollama has {model}",
+                   f"`ollama pull {model}` (it has: {_capped(names, 10) or 'no models'})"):
+        return
+    try:
+        show = ollama_api(port, "/api/show", {"model": model})
+    except (OSError, ValueError) as e:
+        rep.chk(False, f"Ollama describes {model}", f"`ollama show {model}` ({e})")
+        return
+    caps = ollama_capabilities(show)
+    rep.chk("tools" in caps, f"{model} supports tool calls",
+            f"opencode needs a model with the `tools` capability (it reports: {', '.join(caps) or 'none'});"
+            " `agentbox provision` lists the ones you have")
+    try:
+        ps = ollama_api(port, "/api/ps")
+    except (OSError, ValueError):
+        ps = None
+    native, real = ollama_context(show, ps, model)
+    if native is not None and native < LOCAL_MODEL_MIN_CONTEXT:
+        rep.note("warn", f"{model} has a context window of {native} tokens, under {LOCAL_MODEL_MIN_CONTEXT}:"
+                         " too small for agent work", "pick a model with a longer context")
+    if real is None:
+        rep.note("info", f"could not see the context length Ollama gives {model} (it shows once the model is loaded)",
+                 OLLAMA_CONTEXT_HINT)
+    elif real < LOCAL_MODEL_MIN_CONTEXT:
+        rep.note("warn", f"Ollama runs {model} with a {real}-token context, under {LOCAL_MODEL_MIN_CONTEXT}",
+                 OLLAMA_CONTEXT_HINT)
+    elif real < lm["context"]:
+        rep.note("warn", f"Ollama runs {model} with a {real}-token context, but local_model.context is"
+                         f" {lm['context']}: opencode will overfill it", OLLAMA_CONTEXT_HINT)
+    else:
+        rep.note("info", f"Ollama runs {model} with a {real}-token context")
 
 
 def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool = False) -> int:
@@ -3537,8 +3772,14 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
         rep.note("warn", "forward_ssh_agent = true: the agent can use your SSH keys (push, ssh to servers)")
     names = [name] if name else cfg.profile_names()
     for n in names:
-        prof = cfg.profile(n)
         rep.scope = n
+        problems = local_model_problems(cfg, cfg.merged(n))
+        if problems:
+            rep.say(f"\nprofile {n}")
+            for problem in problems:
+                chk(False, problem, "fix local_model in agentbox.toml (README: \"Local models with opencode\")")
+            continue
+        prof = cfg.profile(n)
         if not prof.enabled:
             rep.say(f"\nprofile {n} ({prof.sandbox}): skipped (disabled)")
             rep.skip("skipped (disabled)")
@@ -3584,6 +3825,8 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
         if rv.returncode != 0:
             rv = sbx(cfg, "kit", "validate", kit_dir, check=False, capture=True)
         chk(rv.returncode == 0, "generated kit validates", (rv.stderr or rv.stdout or "").strip()[:400])
+        if prof.local_model:
+            doctor_local_model(rep, prof)
         if prof.tool_names:
             try:
                 Bridge(prof)
@@ -3803,6 +4046,11 @@ def profile_block(name: str, d: dict, notes: dict) -> str:
         if d.get(key):
             lines += [toml_comment(n) for n in notes.get(key, [])]
             lines.append(f"{key} = {toml_list(d[key])}")
+    lm = d.get("local_model")
+    if lm:
+        lines += [toml_comment(n) for n in notes.get("local_model", [])]
+        lines.append(f"local_model = {{ provider = {toml_str(lm['provider'])}, model = {toml_str(lm['model'])},"
+                     f" port = {int(lm['port'])} }}")
     if d.get("instructions"):
         lines.append("instructions = '''\n" + d["instructions"] + "'''")
     return "\n".join(lines) + "\n"
@@ -3917,7 +4165,47 @@ def cmd_provision(cfg: Config, args) -> int:
         if raw not in BUILTIN_AGENTS and not kit_installed(raw):
             raise ValueError(f"'{raw}' is neither a built-in agent nor a kit in {KITS_DIR}")
         return raw
-    agent = pick("Agent (claude|copilot|codex|gemini|shell|<kit>)", args.agent, "claude", v_agent, "--agent")
+    agent = pick("Agent (claude|copilot|codex|gemini|opencode|shell|<kit>)", args.agent, "claude", v_agent, "--agent")
+
+    # --- local model (opencode only, for now)
+    local_model = None
+    if args.local_model is not None and agent not in LOCAL_MODEL_AGENTS:
+        fail(f"--local-model works with --agent {' or '.join(sorted(LOCAL_MODEL_AGENTS))} only (agent is '{agent}')")
+    if agent in LOCAL_MODEL_AGENTS:
+        want = args.local_model is not None
+        if not want and not yes:
+            say("\nopencode can use a model served by Ollama on this machine. The sandbox then may reach that one\n"
+                "port on your localhost (and nothing else on it). Small local models are much weaker agents than Claude.")
+            want = input("Use a local Ollama model? [y/N]: ").strip().lower() in ("y", "yes")
+        if want:
+            def v_port(raw):
+                try:
+                    port = int(str(raw))
+                except ValueError:
+                    raise ValueError("must be a number")
+                if not 1 <= port <= 65535:
+                    raise ValueError("must be from 1 to 65535")
+                return port
+            port = pick("Ollama port", args.local_model_port, LOCAL_MODEL_PROVIDERS["ollama"], v_port,
+                        "--local-model-port")
+            tool_models = ollama_tool_models(port)
+            if tool_models is None:
+                say(f"  Ollama does not answer on 127.0.0.1:{port} (start it to see your models; `doctor` checks again)")
+            elif tool_models:
+                for m in tool_models:
+                    say(f"  suggest {m}: installed, supports tool calls")
+            else:
+                say("  none of your Ollama models reports tool support: `ollama pull` one that does")
+
+            def v_model(raw):
+                if not LOCAL_MODEL_RE.match(raw):
+                    raise ValueError(f"'{raw}' is not an Ollama model name")
+                return raw
+            model = pick("Model", args.local_model, (tool_models or [None])[0], v_model, "--local-model")
+            local_model = {"provider": "ollama", "model": model, "port": port}
+            problems = local_model_problems(cfg, {"agent": agent, "local_model": local_model})
+            if problems:
+                fail("; ".join(problems))
 
     # --- what the workspace looks like
     found = detect_workspace(ws)
@@ -4025,7 +4313,11 @@ def cmd_provision(cfg: Config, args) -> int:
          "skills": [s for s in skills if s not in skill_default],
          "allow": [h for h in allow if h not in defaults.get("allow", [])], "instructions": instr}
     notes = {"kits": [f"{k}: {r}" for k, r in kit_sug if k in d["kits"]],
-             "allow": [f"{h}: {r}" for h, r in allow_sug if h in d["allow"]]}
+             "allow": [f"{h}: {r}" for h, r in allow_sug if h in d["allow"]],
+             "local_model": ["opencode uses this Ollama model on the host; the sandbox may reach that port"
+                             " (`agentbox doctor` checks it)"]}
+    if local_model:
+        d["local_model"] = local_model
     try:
         block = profile_block(name, d, notes)
     except ValueError as e:
@@ -4231,6 +4523,8 @@ def main():
     for flag in ("kit", "skills", "allow", "extra"):
         p.add_argument(f"--{flag}", action="append")
     p.add_argument("--instructions")
+    p.add_argument("--local-model", metavar="MODEL", help="opencode: use this Ollama model on the host")
+    p.add_argument("--local-model-port", metavar="PORT", help="the host's Ollama port (default 11434)")
     p.add_argument("--yes", action="store_true", help="take every default, never prompt")
     p.add_argument("--dry-run", action="store_true", help="print the TOML block, change nothing")
     p.add_argument("--up", action="store_true", help="start the sandbox afterwards")
