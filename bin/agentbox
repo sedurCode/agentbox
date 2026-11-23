@@ -24,6 +24,7 @@ Docker Sandboxes (`sbx`).
     agentbox resume <profile> [--job ID]               attach interactively to the job's session
     agentbox progress <profile> [--job ID] [--watch [--interval S]] [--json]   how far the job is
     agentbox fetch <profile> [--branch B] [--ref R] [--start] [--force] [--json]   clone mode: bring the commits to the host
+    agentbox skill show|setup|status|remove   the skill for agents on this machine (status --json)
 
 Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
 `wait` also 4 = timeout, 5 = job lost (otherwise it exits with the job's own exit code).
@@ -3905,6 +3906,118 @@ def cmd_provision(cfg: Config, args) -> int:
     return rc
 
 
+# ------------------------------------------------------------ skill for agents on the host
+# The guide ships with agentbox (share/skill/guide.md) and `skill show` prints it. `skill setup` only
+# writes a small SKILL.md stub that tells the agent to run `skill show`, so upgrading agentbox updates
+# what agents are told without touching their skill folders. A stub carries SKILL_MARKER; a file
+# without it was not written by agentbox and is never overwritten or removed ("foreign").
+SKILL_GUIDE = SHARE_DIR / "skill" / "guide.md"
+SKILL_MARKER = "<!-- agentbox-skill-stub:"
+SKILL_STUB = f"""---
+name: agentbox
+description: Drive agentbox from the host - set up sandbox profiles, write task briefs, start and watch \
+sandboxed agent jobs, fetch their commits for review. Use when the user mentions agentbox, a sandbox, sbx, \
+or asks to "run this in a box".
+---
+{SKILL_MARKER} written by `agentbox skill setup`; edits are overwritten, `agentbox skill remove` deletes it -->
+
+# agentbox
+
+Before doing anything with agentbox, run this and follow what it prints:
+
+```bash
+agentbox skill show
+```
+
+It prints the owner's ground rules and how to use agentbox from the host, for the installed version.
+If `agentbox` is not on PATH, try `~/.local/bin/agentbox skill show`.
+"""
+
+
+def skill_locations() -> list[tuple[str, Path]]:
+    """(label, SKILL.md path) per place an agent looks for user skills; read from the environment on each call."""
+    home = Path.home()
+    claude = os.environ.get("CLAUDE_CONFIG_DIR")
+    locs = [("claude", Path(claude).expanduser() if claude else home / ".claude"),
+            ("agents", home / ".agents")]               # Codex, OpenCode, Pi
+    codex = os.environ.get("CODEX_HOME")
+    if codex:                                           # Codex also reads $CODEX_HOME/skills
+        locs.append(("codex", Path(codex).expanduser()))
+    return [(label, base / "skills" / "agentbox" / "SKILL.md") for label, base in locs]
+
+
+def skill_state(path: Path) -> str:
+    """current | outdated | missing | foreign. A symlink (the file or its folder) is never ours."""
+    if path.parent.is_symlink() or path.is_symlink():
+        return "foreign"
+    if not path.exists():
+        return "missing"
+    try:
+        text = path.read_text(errors="replace") if path.is_file() else ""
+    except OSError:
+        return "foreign"
+    if SKILL_MARKER not in text:
+        return "foreign"
+    return "current" if text == SKILL_STUB else "outdated"
+
+
+def skill_rows() -> list[dict]:
+    return [{"agent": label, "path": str(p), "state": skill_state(p)} for label, p in skill_locations()]
+
+
+def write_skill_stub(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".SKILL.md.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "x") as f:
+            f.write(SKILL_STUB)
+        os.chmod(tmp, 0o644)        # agents read it; nothing in it is private
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def cmd_skill(args) -> int:
+    if args.action == "show":
+        try:
+            sys.stdout.write(SKILL_GUIDE.read_text())
+        except OSError as e:
+            die(f"cannot read the guide at {SKILL_GUIDE}: {e.strerror} - reinstall agentbox")
+        return EXIT_OK
+    if args.action == "status":
+        rows = skill_rows()
+        if args.json:
+            emit_json({"guide": str(SKILL_GUIDE), "locations": rows})
+        else:
+            for r in rows:
+                print(f"{r['agent']:<7} {r['state']:<9} {r['path']}")
+        return EXIT_OK
+    rc = EXIT_OK
+    for label, path in skill_locations():
+        state = skill_state(path)
+        if state == "foreign":
+            info(f"{label}: left alone (foreign: not written by agentbox) {path}")
+        elif args.action == "setup":
+            if state == "current":
+                print(f"{label}: current {path}")
+                continue
+            try:
+                write_skill_stub(path)
+            except OSError as e:
+                info(f"{label}: cannot write {path}: {e.strerror}")
+                rc = EXIT_FAIL
+                continue
+            print(f"{label}: {'installed' if state == 'missing' else 'updated'} {path}")
+        elif state == "missing":
+            print(f"{label}: not installed {path}")
+        else:
+            path.unlink()
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()             # only if empty: other files there aren't ours
+            print(f"{label}: removed {path}")
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(prog="agentbox", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3964,8 +4077,16 @@ def main():
     p.add_argument("--yes", action="store_true", help="take every default, never prompt")
     p.add_argument("--dry-run", action="store_true", help="print the TOML block, change nothing")
     p.add_argument("--up", action="store_true", help="start the sandbox afterwards")
+    p = sub.add_parser("skill", help="the agentbox skill for agents on this machine (Claude Code, Codex, OpenCode, Pi)")
+    p.add_argument("action", choices=("show", "setup", "status", "remove"),
+                   help="show: print the guide; setup: install SKILL.md stubs; status; remove: delete our stubs")
+    p.add_argument("--json", action="store_true", help="status: one JSON document")
     a = ap.parse_args()
 
+    if a.cmd == "skill":     # host-side only: needs no config and touches no sandbox
+        if a.json and a.action != "status":
+            die("--json is only for `skill status`", EXIT_USAGE)
+        sys.exit(cmd_skill(a))
     os.umask(0o077)          # everything agentbox creates (token, kit, logs) is owner-only
     cfg = Config()
     secure_state(cfg)
