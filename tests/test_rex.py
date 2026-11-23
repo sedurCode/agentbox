@@ -224,23 +224,23 @@ class ProgressWatchTests(CommandCase):
             args = argparse.Namespace(job=None, watch=watch, interval=1.0, json=as_json)
             return self.run_cmd(ab.cmd_progress, self.prof, args, tty=tty)
 
-    def test_reports_root_record_only_on_change(self):
+    def test_reports_the_profile_record_only_on_change(self):
         plan = {"steps": [{"text": EVIL, "status": "active"}], "current": 1, "done": 0, "total": 1}
         code, out = self.watch([job("running")] * 4 + [job("finished", 0)],
                                [view(plan=plan), view(plan=plan), view(stalled=True, age=420),
                                 view(stalled=True, age=420), view()])
         self.assertEqual(code, 0)
-        self.assertEqual(records(out), [{"state": "working", "app": "agentbox", "progress": "0"},
-                                        {"state": "blocked", "kind": "other", "app": "agentbox",
+        self.assertEqual(records(out), [{"state": "working", "app": "agentbox", "id": "p", "progress": "0"},
+                                        {"state": "blocked", "kind": "other", "app": "agentbox", "id": "p",
                                          "msg": "no event for 7 min"},
-                                        {"state": "done", "app": "agentbox"}])
+                                        {"state": "done", "app": "agentbox", "id": "p"}])
         self.assertNotIn("\x1b]52", out)
 
     def test_failure_and_lost(self):
         _, out = self.watch([job("finished", 4)], [view()])
-        self.assertEqual(records(out)[-1], {"state": "error", "app": "agentbox", "msg": "exit 4"})
+        self.assertEqual(records(out)[-1], {"state": "error", "app": "agentbox", "id": "p", "msg": "exit 4"})
         _, out = self.watch([job("lost")], [view()])
-        self.assertEqual(records(out)[-1], {"state": "error", "app": "agentbox", "msg": "job lost"})
+        self.assertEqual(records(out)[-1], {"state": "error", "app": "agentbox", "id": "p", "msg": "job lost"})
 
     def test_doubtful_lost_keeps_the_last_state(self):
         flaky = job("lost") | {"probe_failed": True}
@@ -280,15 +280,38 @@ class WaitTests(CommandCase):
     def test_working_then_final(self):
         code, out = self.wait([job("running"), job("running"), job("finished", 3)])
         self.assertEqual(code, 3)
-        self.assertEqual(records(out), [{"state": "working", "app": "agentbox"},
-                                        {"state": "error", "app": "agentbox", "msg": "exit 3"}])
+        self.assertEqual(records(out), [{"state": "working", "app": "agentbox", "id": "p"},
+                                        {"state": "error", "app": "agentbox", "id": "p", "msg": "exit 3"}])
         _, out = self.wait([job("running"), job("finished", 0)])
         self.assertEqual([r["state"] for r in records(out)], ["working", "done"])
         _, out = self.wait([job("lost")])
-        self.assertEqual(records(out), [{"state": "error", "app": "agentbox", "msg": "job lost"}])
+        self.assertEqual(records(out), [{"state": "error", "app": "agentbox", "id": "p", "msg": "job lost"}])
 
     def test_not_a_tty(self):
         self.assertEqual(records(self.wait([job("running"), job("finished", 0)], tty=False)[1]), [])
+
+
+class ProfileIdTests(CommandCase):
+    """progress --watch and wait name the profile, so notify.lua can tell one job from another."""
+
+    def test_progress_and_wait_report_the_profile_id(self):
+        with mock.patch.object(ab, "job_info", lambda *a, **k: job("finished", 0)), \
+                mock.patch.object(ab, "job_progress", lambda *a, **k: (view(), "")):
+            _, a = self.run_cmd(ab.cmd_progress, self.prof,
+                                argparse.Namespace(job=None, watch=True, interval=1.0, json=False))
+            _, b = self.run_cmd(ab.cmd_wait, self.prof, argparse.Namespace(job=None, timeout=None))
+        self.assertEqual(records(a), [{"state": "done", "app": "agentbox", "id": "p"}])
+        self.assertEqual(records(b), [{"state": "done", "app": "agentbox", "id": "p"}])
+
+    def test_profile_name_too_long_for_an_id_is_skipped(self):
+        cfg = self.write_config(f'[profiles.{"a" * 40}]\nworkspace = "{self.ws}"\n')
+        prof = cfg.profile("a" * 40)
+        with mock.patch.object(ab, "job_info", lambda *a, **k: job("finished", 0)), \
+                mock.patch.object(ab, "job_progress", lambda *a, **k: (view(), "")):
+            _, a = self.run_cmd(ab.cmd_progress, prof,
+                                argparse.Namespace(job=None, watch=True, interval=1.0, json=False))
+            _, b = self.run_cmd(ab.cmd_wait, prof, argparse.Namespace(job=None, timeout=None))
+        self.assertEqual((records(a), records(b)), ([], []))
 
 
 class DashboardTests(CommandCase):

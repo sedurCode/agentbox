@@ -2243,7 +2243,7 @@ def cmd_wait(prof: Profile, args) -> int:
     try:
         return _wait(prof, args, rex)
     except KeyboardInterrupt:
-        rex.report({"state": "idle"})
+        rex.report({"state": "idle"}, prof.name)
         raise
 
 
@@ -2255,21 +2255,21 @@ def _wait(prof: Profile, args, rex: RexStatus) -> int:
         j = job_info(prof, job_id)
         if j["state"] == "finished":
             cache_final_progress(prof, job_id, j)
-            rex.report(rex_fields(j))
+            rex.report(rex_fields(j), prof.name)
             info(f"job {job_id} finished (exit {j['exit_code']})"
                  + (f"; `agentbox fetch {prof.name}` brings its commits to the host" if prof.d["mode"] == "clone" else ""))
             return job_exit_status(j)
         if j["state"] == "lost":
             doubts += 1                     # one flaky probe isn't "lost"
             if not j.get("probe_failed") or doubts >= 3:
-                rex.report(rex_fields(j))
+                rex.report(rex_fields(j), prof.name)
                 info(f"job {job_id} lost (its process is gone; sandbox {j['vm']})")
                 return EXIT_LOST
         else:
             doubts = 0
-            rex.report(rex_fields(j))
+            rex.report(rex_fields(j), prof.name)
         if deadline is not None and time.monotonic() >= deadline:
-            rex.report({"state": "idle"})   # no longer watched
+            rex.report({"state": "idle"}, prof.name)   # no longer watched
             info(f"job {job_id} still running after {args.timeout:g}s")
             return EXIT_TIMEOUT
         time.sleep(min(next(delays), max(0.0, deadline - time.monotonic()) if deadline else 1e9))
@@ -2829,7 +2829,7 @@ def rex_fields(j: dict, view: dict | None = None) -> dict:
 
 class RexStatus:
     """Writes OSC 7501 reports to stdout when `rex_wanted`, each record only when it changes.
-    Records are keyed by id; None is the terminal's root record."""
+    Records are keyed by id (agentbox always passes the profile name); None is the terminal's root record."""
 
     def __init__(self, on: bool):
         self.on, self.last = on, {}
@@ -2894,13 +2894,13 @@ def cmd_progress(prof: Profile, args) -> int:
             if j["state"] == "lost" and j.get("probe_failed") and doubts < 3:
                 time.sleep(args.interval)       # the Rex record keeps its last state until this is certain
                 continue
-            rex.report(rex_fields(j, view))
+            rex.report(rex_fields(j, view), prof.name)
             if j["state"] == "running":
                 time.sleep(args.interval)
                 continue
             return job_exit_status(j)
     except KeyboardInterrupt:
-        rex.report({"state": "idle"})
+        rex.report({"state": "idle"}, prof.name)
         raise
 
 
