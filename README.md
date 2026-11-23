@@ -614,11 +614,14 @@ isn't UTF-8. Below 60x15 it asks for a bigger pane.
 | Enter, p | `agentbox progress <profile> --watch` in the same terminal; back on exit or Ctrl-C |
 | l | `agentbox logs <profile>` in `$PAGER` (default `less -R`), sanitised as `logs` always is |
 | f | shows `agentbox fetch <profile>`, the ref it will fetch and the review branch, and asks y/N; runs it only on `y`, with no other flags. A stopped sandbox gets a note instead: fetch needs it running, and booting it would relaunch the agent |
+| u | `agentbox up <profile>`: the agent's session takes this terminal, and the dashboard comes back when it exits (sbx keeps the sandbox running). Inside Rex (`REX_SESSION` and `REX_BLOCK` set, and a `rex` CLI found: `$AGENTBOX_REX` if it's an absolute path, else `rex` on `PATH`, else the one in Rex.app) it opens in a new Rex tab instead, with `rex run`; if that fails, the next `u` runs it here. Refused for a disabled profile; allowed, with a warning, while a job runs there (`up` attaches to its sandbox) |
+| s | stop a running sandbox: shows `agentbox stop <profile>` and runs it on `y`, with no other flags. If a job is running there, the job is killed and reported as lost, so the profile name must be typed exactly, then Enter; Esc or anything else cancels |
 | r | refresh now |
 | ? | help |
 | q, Ctrl-C | quit and give the terminal back |
 
-The dashboard never offers `--force`, `down`, `fresh`, `stop`, `run` or `up`.
+The dashboard runs only `progress --watch`, `logs`, `fetch`, `up` and `stop`, each with only the profile name;
+it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 
 ### Using agentbox from Rex
 
@@ -627,7 +630,7 @@ The dashboard never offers `--force`, `down`, `fresh`, `stop`, `run` or `up`.
 [`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
-  a job from a prompt file, open the interactive dashboard, fetch for review, remove a sandbox. Two lines in
+  a job from a prompt file, open the interactive dashboard, fetch for review, stop a sandbox, remove a sandbox. Two lines in
   `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
 - **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` / `--interactive` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,

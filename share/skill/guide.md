@@ -182,6 +182,7 @@ Only if the environment variable `REX_SESSION` is set and `rex` is on `PATH`: in
 `agentbox progress <p> --watch` in a Rex split so the owner can see the job, and wait for the job with
 `agentbox wait`. Inside Rex both report the job's state to the tab and to View Activity by themselves.
 agentbox ships Rex palette actions in `share/rex/` (category "agentbox"): `agentbox_open`, `agentbox_run`,
-`agentbox_dashboard`, `agentbox_fetch` and `agentbox_down`. If the owner has them set up, point them at
-those rather than building sessions yourself; `agentbox_down` still needs their go-ahead like `down`.
+`agentbox_dashboard`, `agentbox_fetch`, `agentbox_stop` and `agentbox_down`. If the owner has them set up, point them at
+those rather than building sessions yourself; `agentbox_stop` and `agentbox_down` still need their go-ahead
+like `stop` and `down`.
 Otherwise ignore this section.

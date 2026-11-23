@@ -21,14 +21,18 @@ require("agentbox").setup{}
 | `agentbox_run` | pick a profile and a prompt file; `run --detach`, then `progress --watch` in a Job tab |
 | `agentbox_dashboard` | session `agentbox` running `agentbox dashboard --interactive` (keys below) |
 | `agentbox_fetch` | `agentbox fetch <profile>` in a visible tab |
+| `agentbox_stop` | pick a running sandbox; `agentbox stop <profile>` in a visible tab. If a job runs there, the picker says it will be lost and the profile name must be typed exactly. Never `--force` |
 | `agentbox_down` | `agentbox down <profile>` in a visible tab (sbx asks for confirmation there) |
 
 The dashboard tab is a full-screen view of every profile. Select one with ↑ ↓ / j k or a click (the wheel
 scrolls); Enter or `p` runs `agentbox progress <profile> --watch` in the tab and comes back when it ends or
 on Ctrl-C; `l` shows the job's log in `$PAGER` (default `less -R`); `f` shows `agentbox fetch <profile>`, the
 ref it will fetch (the branch the job ended on, else `main`) and the review branch, and runs it only after
-`y` (a stopped sandbox gets a note instead); `r` refreshes, `?` lists the keys, `q` quits. It never runs `--force`, `down`,
-`fresh`, `stop`, `run` or `up`. `agentbox dashboard --watch` still gives the plain text view.
+`y` (a stopped sandbox gets a note instead); `u` opens `agentbox up <profile>` in a new tab of this session
+(with `rex run`; the `rex` CLI is `$AGENTBOX_REX`, else `rex` on `PATH`, else the one in Rex.app; if that fails,
+the next `u` runs it in the dashboard's own tab); `s` stops a running sandbox after `y`, or, if a job runs
+there (it will be lost), after the profile name is typed; `r` refreshes, `?` lists the keys, `q` quits. It never runs
+`--force`, `--start`, `down`, `fresh`, `run` or `resume`. `agentbox dashboard --watch` still gives the plain text view.
 
 The actions switch the Rex app to the session they open. Doing that from the `rex` CLI needs Rex's Remote
 Control setting.
