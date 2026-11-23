@@ -535,11 +535,13 @@ terminal and not if `NO_COLOR` is set.
   `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
 - **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
-  idle; the dashboard keeps one record per running profile. Only host-side state goes in (job state, exit
-  code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
+  idle. Each record is named after its profile; the dashboard keeps one per profile, and a finished job's
+  done or error stays after the sandbox stops, until that profile's next job. Only host-side state goes in
+  (job state, exit code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
   terminal with `REX_SESSION` set, never with `--json`; `AGENTBOX_NO_OSC=1` turns them off.
 - **Notifications**: `rex do ~/.local/share/agentbox/share/rex/notify.lua --all`, in a tab you keep open,
-  posts a macOS notification when a job needs you, finishes or fails.
+  posts a macOS notification when a job needs you, finishes or fails, once per job however many tabs
+  watch it.
 
 ### VS Code inside the sandbox
 
