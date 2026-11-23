@@ -115,6 +115,16 @@ agent = "shell"                      # agent-less shell for poking around
 workspace = "~/src/scratch"
 mode = "clone"
 
+# opencode on a model served by Ollama on this Mac (README: "Local models with opencode").
+# The sandbox may then reach localhost:<port> on the host - that one port, nothing else.
+# `agentbox doctor <profile>` checks Ollama has the model, that it supports tools and the context length.
+# [profiles.scratch-local]
+# agent = "opencode"
+# workspace = "~/src/scratch"
+# mode = "clone"
+# local_model = { provider = "ollama", model = "gemma4:12b", port = 11434 }   # optional: context = 32768
+# stall_after = 900                  # local models can go minutes without an event
+
 # ---------------------------------------------------------------------------
 # Host tools. Each one is a FIXED argv run on the host with no shell.
 # The sandbox can only fill in typed {params}; nothing else.

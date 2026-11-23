@@ -164,7 +164,7 @@ the important keys:
 | key | meaning |
 |---|---|
 | `enabled` | `true` (default). `false` marks a template: `doctor` and `status` print "skipped (disabled)", `up`/`code`/`fresh` refuse it, `down`/`stop`/`tools`/`audit` still work |
-| `agent` | `claude`, `copilot`, `codex`, `gemini`, `shell` (built-in) or a sandbox kit name/path (`junie`) |
+| `agent` | `claude`, `copilot`, `codex`, `gemini`, `opencode`, `shell` (built-in) or a sandbox kit name/path (`junie`) |
 | `workspace` | primary project, mounted read-write at the same absolute path |
 | `extra_workspaces` | more mounts, append `:ro` for read-only |
 | `mode` | `direct` (default) or `clone` (agent gets its own git clone, host tree untouched; you `agentbox fetch <profile>` to review). Host tools need `direct`. |
@@ -177,6 +177,7 @@ the important keys:
 | `stall_after` | `300` (seconds). A running job with no event for longer is shown as STALLED by `progress` and `status` (see *Watching a job*) |
 | `host_tools`, `host_tools_port` | which `[tools.*]` this sandbox may call, and a unique port per profile |
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
+| `local_model` | `opencode` only: a model served by Ollama on the host, `{ provider = "ollama", model = "...", port = 11434 }` — see *Local models with opencode* |
 
 Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing ones are kept):
 
@@ -298,6 +299,49 @@ the agent again if it had already read its skill directory.
   paths changed. A skill whose folder isn't mounted yet is reported as "not linked", not linked dangling.
 - The generated kit's instructions name the mounted sets and tell the agent they are read-only.
 
+### Local models with opencode
+
+A profile can run [opencode](https://opencode.ai) in the sandbox on a model that
+[Ollama](https://ollama.com) serves on your Mac, so nothing leaves the machine. Claude profiles are
+unaffected.
+
+```toml
+[profiles.webapp-local]
+agent = "opencode"
+workspace = "~/gits/webapp"
+mode = "clone"
+local_model = { provider = "ollama", model = "gemma4:12b", port = 11434 }
+stall_after = 900      # local models can think for minutes without an event (see *Watching a job*)
+```
+
+`agentbox provision webapp-local --agent opencode` asks for this and suggests the models in your `ollama list`
+that report tool support (`--local-model MODEL`, `--local-model-port PORT` without prompts).
+
+- **Keys.** `provider` is `ollama` (the only one so far). `model` is the Ollama name, letters, digits and
+  `. _ - / :` only. `port` defaults to `11434` and must differ from every profile's `host_tools_port`.
+  `context` (default `32768`) is the context window opencode assumes; set it to what Ollama really gives the
+  model. Any other agent with `local_model` is refused.
+- **What it sets up**, in the generated kit (the state dir, not the workspace): `localhost:<port>` on the
+  sandbox's allow-list, and an opencode config at `/home/agent/.agentbox/opencode.json` (`OPENCODE_CONFIG`
+  points at it) with an OpenAI-compatible provider at `http://host.docker.internal:<port>/v1` and this model as
+  the default. `OPENCODE_DISABLE_MODELS_FETCH` and `OPENCODE_DISABLE_AUTOUPDATE` are set, since neither
+  models.dev nor npm is on the allow-list. Headless jobs also pass `--model=ollama/<model>`, so an
+  `opencode.json` in the repo can't switch them to another provider. Changing `local_model` needs
+  `agentbox fresh`.
+- **The trade-off.** sbx's global policy keeps the host's localhost closed. With `local_model` the sandbox can
+  reach exactly one host port, the model server's, and the agent can send it anything Ollama's API accepts:
+  prompts, but also `pull`, `delete` or `create` of models (Ollama has no authentication). Only use it with a
+  server you are happy to expose to the agent like that, and don't run anything else on that port.
+- **Context length.** Ollama decides how much context a model gets: `OLLAMA_CONTEXT_LENGTH` in the environment
+  of `ollama serve` (in the Mac app, Settings > Context length) or `PARAMETER num_ctx` in a Modelfile. Past it,
+  prompts are cut silently, and an agent's system prompt and tool definitions alone take thousands of tokens.
+  Use at least 32k. `agentbox doctor <profile>` checks from the host that Ollama answers on the port, has the
+  model and reports the `tools` capability, and warns when the model's window, or the one Ollama runs it with
+  (visible while it is loaded), is under 32k.
+- **Expectations.** A model that fits on a laptop is a much weaker agent than Claude: it loses track of long
+  tasks, calls tools wrongly and claims success it didn't reach. Give it small, well-specified tasks with tests,
+  and check the measured numbers and the commits, not its summary.
+
 ## 3. Daily use
 
 ```bash
@@ -325,14 +369,14 @@ Use `Shift+Tab` / `/permissions` in Claude Code if you want prompts back.
 For scripted or long unattended runs (VoiceDev's gateway, CI-like use) `agentbox up -- -p "..."` is
 fragile: it needs an attached terminal, so the `sbx run` client dies on daemon timeouts and the
 output is lost. `agentbox run` starts the agent *inside* the VM, detached from any session, and
-keeps its state in files you can poll. Supported agent: `claude` (profiles with `agent = "claude"`).
+keeps its state in files you can poll. Supported agents: `claude` and `opencode`.
 
 ```bash
 agentbox run h750 --prompt-file task.md --detach     # prints the job id, returns at once
 agentbox wait h750 --timeout 3600                    # block; exit status = the job's exit status
 agentbox logs h750 -f                                # follow, one human line per event
 agentbox logs h750 --raw                             # the raw stream-json lines
-agentbox resume h750                                 # interactive `claude --resume=<session id>`
+agentbox resume h750                                 # interactive `claude --resume=<session id>` (opencode: --session=)
 agentbox progress h750 [--watch]                     # how far along it is (see *Watching a job*)
 agentbox run h750 --prompt-file task.md              # without --detach: run, then follow logs, then exit with the job's status
 agentbox run h750 --prompt-file - --agent-args --model opus < task.md
@@ -343,13 +387,15 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   command line. `--prompt-file` (or `-` for stdin) is preferred over `--prompt TEXT`, because
   `--prompt` text is part of *your own* `agentbox` command line on the Mac. `--agent-args ...`
   takes the rest of the line; the profile's `agent_args` (meant for interactive `up`) are not used.
-- **What runs.** `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
-  (the VM is the boundary, as for `up`), in the primary workspace, via `setsid nohup`, so the job
-  survives the exec session that started it.
+- **What runs.** `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`, or
+  `opencode run --format json --auto` (plus `--model=ollama/<model>` with `local_model`); the VM is the
+  boundary, as for `up`. It runs in the primary workspace, via `setsid nohup`, so the job survives the
+  exec session that started it. Both read the prompt on stdin (`opencode run` does when stdin is not a
+  terminal; checked with opencode 1.19.6), so it is on no command line.
 - **Job directory** (inside the VM, `~/.agentbox/jobs/<id>/`, id like `20260101T120000Z-ab12cd`):
   `prompt.md`, `wrap.sh` (the wrapper), `jobprogress` and `progress.tsv` (see *Watching a job*), `start_head`, `pid`, `started_at`, `output.jsonl` (the stream),
   `stderr.log`, `finished_at`, `exit_code` (written last, atomically, by the wrapper) and
-  `session_id` (taken from the stream's init message). The host keeps only
+  `session_id` (the stream's first `session_id`, or `sessionID` for opencode). The host keeps only
   `~/.local/state/agentbox/ab-<profile>/job.json` (current job id, session id, and the result once seen).
 - **Job state** comes from those files only: `finished` if `exit_code` exists; `running` if the
   `pid` file's process is alive **and** `/proc/<pid>/cmdline` runs this job's `wrap.sh` (so a
@@ -357,7 +403,7 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   matches its own command line. A **VM reboot, `stop`, or `down` loses a running job**: its state
   becomes `lost` (the files may remain after a reboot; the process doesn't).
 - **Session ids** are validated (`[A-Za-z0-9][A-Za-z0-9_-]{7,79}`, so never an option-looking `-...`) wherever they
-  are read from the VM, and passed as the single argument `--resume=<id>`.
+  are read from the VM, and passed as the single argument `--resume=<id>` (opencode: `--session=<id>`).
 - **Why `resume`, not `--continue`:** `claude --continue` doesn't find a `-p` session; `--resume <id>`
   does, and agentbox records the id. `resume` refuses while the job is still running, and for agents
   without a resume flag.
@@ -384,7 +430,7 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   group, or its children and then the wrapper if there is no `setsid`, after checking the pid is really this job's wrapper) and removes the sandbox anyway.
 
 Exit codes for `wait` (and the final status of a foreground `run`): the **job's own exit code**
-(claude: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still
+(claude and opencode: `0` success, `1` error) when it finished; `4` = `--timeout` expired with the job still
 running; `5` = job lost. Codes 1-3 keep their meaning from the table above for agentbox's own
 errors, so a job that exits with 2-5 is ambiguous: read `status --json` (`job.exit_code`) if you need to tell.
 
@@ -446,6 +492,10 @@ tokens in 912  out 41200  cache read 3811000  cache write 210000
   job with no event for more than `stall_after` seconds (profile key, default `300`) is **STALLED**.
 - *turns* (assistant messages), *tool calls* (`tool_use` blocks, top five by name) and *tokens*. stream-json
   repeats a message id, and its usage, across content-block events, so every message id counts once.
+  opencode's `--format json` stream is read too: a turn is a step (`step_start`, one model call), its tokens
+  come with `step_finish` (reasoning tokens count as output), a tool call is a `tool_use` event. Its cost is
+  not used: it is 0 for a local model, so `cost_usd` stays `null`. opencode writes an event only when a part
+  is finished, so a slow local model writing a long answer looks idle; raise `stall_after` for those profiles.
 - *cost*: the exact `total_cost_usd` from the agent's final `result` once the job is over. While it runs,
   an estimate from the token totals and the `PRICES` table in `bin/agentbox` (per model family: opus, sonnet,
   haiku, fable), shown with `~` and "estimate". Those prices **need checking against current pricing**; a model
@@ -876,7 +926,7 @@ The raw equivalent, while the sandbox is running, is
 
 | | |
 |---|---|
-| Protected | host filesystem outside mounts; host Docker; LAN, private IPs and host localhost (except the bridge port); other sandboxes; API keys/OAuth tokens (proxy-injected); SSH keys; git push rights; egress to non-allowed hosts |
+| Protected | host filesystem outside mounts; host Docker; LAN, private IPs and host localhost (except the bridge port and a `local_model` port); other sandboxes; API keys/OAuth tokens (proxy-injected); SSH keys; git push rights; egress to non-allowed hosts |
 | Not protected | anything in a rw mount (incl. `.git/`); data sent to allowed hosts (an agent can upload your code to any host you allow — keep allow-lists short); what host tools do with agent-supplied files; tokens you choose to put in the VM (Junie login, `env`) |
 
 Text that comes out of the VM is agent-controlled, so agentbox never prints it raw: file names and git
