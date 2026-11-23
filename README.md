@@ -539,9 +539,8 @@ terminal and not if `NO_COLOR` is set.
   done or error stays after the sandbox stops, until that profile's next job. Only host-side state goes in
   (job state, exit code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
   terminal with `REX_SESSION` set, never with `--json`; `AGENTBOX_NO_OSC=1` turns them off.
-- **Notifications**: `rex do ~/.local/share/agentbox/share/rex/notify.lua --all`, in a tab you keep open,
-  posts a macOS notification when a job needs you, finishes or fails, once per job however many tabs
-  watch it.
+- **Notifications**: Rex notifies by itself while in the background (Settings > Notifications > Program
+  Activity), once per tab that reports, so a job watched from two tabs notifies twice.
 
 ### VS Code inside the sandbox
 

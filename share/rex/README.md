@@ -47,11 +47,7 @@ the sandbox (read from the state agentbox keeps on the host; a stopped sandbox i
 
 ## Notifications
 
-`notify.lua` posts a macOS notification when a profile's record becomes blocked, done or error. It keeps
-the state per profile, not per tab, so a job watched from several tabs (the dashboard and a
-`progress --watch` tab, say) notifies once; the next job (`working`) or an `idle` report re-arms it. Start
-it in a tab you keep open:
-
-```sh
-rex do ~/.local/share/agentbox/share/rex/notify.lua --all
-```
+Rex posts macOS notifications for agentbox's records by itself, only while Rex is in the background; set
+them up under Settings > Notifications > Program Activity. Rex notifies once per tab that reports, so a job
+watched from both a `progress --watch` tab and the dashboard notifies twice. If that's too much, turn off
+notifications for one state (blocked, done or error) in Rex's settings.

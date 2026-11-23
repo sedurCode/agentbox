@@ -292,7 +292,7 @@ class WaitTests(CommandCase):
 
 
 class ProfileIdTests(CommandCase):
-    """progress --watch and wait name the profile, so notify.lua can tell one job from another."""
+    """progress --watch and wait name the profile, so Rex's Activity view labels each record with its profile."""
 
     def test_progress_and_wait_report_the_profile_id(self):
         with mock.patch.object(ab, "job_info", lambda *a, **k: job("finished", 0)), \

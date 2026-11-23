@@ -2767,9 +2767,9 @@ def progress_lines(job_id: str, state: str, view: dict, why: str = "") -> list[s
 
 # --------------------------------------------------------------------- rex
 # Rex (a terminal multiplexer) shows a per-terminal status record that a program reports with OSC 7501:
-# ESC ] 7501 ; key=value:key=value ESC \. share/rex/notify.lua turns app=agentbox records into
-# notifications. A report carries ONLY state agentbox derives on the host - job state, the stalled
-# flag, exit code, profile name, plan counts, and agentbox's own wording. Never VM text: no agent
+# ESC ] 7501 ; key=value:key=value ESC \. Rex shows the records in the tab, in View Activity and in
+# its own notifications. A report carries ONLY state agentbox derives on the host - job state, the
+# stalled flag, exit code, profile name, plan counts, and agentbox's own wording. Never VM text: no agent
 # output, plan step text, notes, commit messages or sbx stderr.
 OSC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 OSC_VALUE_RE = re.compile(r"^[A-Za-z0-9_.,+/=-]+$")

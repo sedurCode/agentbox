@@ -29,9 +29,11 @@ cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
 cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
 mkdir -p "$DEST/share/skill"
 cp -R "$SRC/share/skill/." "$DEST/share/skill/"
-# Rex actions and notifications; ~/.config/rex/ is never touched (see share/rex/README.md)
+# Rex actions; ~/.config/rex/ is never touched (see share/rex/README.md)
 mkdir -p "$DEST/share/rex"
 cp -R "$SRC/share/rex/." "$DEST/share/rex/"
+# an earlier install shipped notify.lua; Rex's own notifications replace it
+rm -f "$DEST/share/rex/notify.lua"
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
