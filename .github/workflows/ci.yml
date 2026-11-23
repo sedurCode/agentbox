@@ -29,3 +29,4 @@ jobs:
           sh -n share/agentbox-launcher
           sh -n share/jobwrap
           sh -n share/jobprogress
+          if command -v luac >/dev/null; then luac -p share/rex/*.lua; else echo "luac not found: skipping the Lua syntax check"; fi

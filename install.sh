@@ -29,6 +29,9 @@ cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
 cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
 mkdir -p "$DEST/share/skill"
 cp -R "$SRC/share/skill/." "$DEST/share/skill/"
+# Rex actions and notifications; ~/.config/rex/ is never touched (see share/rex/README.md)
+mkdir -p "$DEST/share/rex"
+cp -R "$SRC/share/rex/." "$DEST/share/rex/"
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
@@ -53,5 +56,10 @@ fi
 chmod 700 "$CFG"
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "add $BIN to PATH";; esac
+echo "Rex: to add the agentbox actions, put these two lines in ~/.config/rex/init.lua:"
+if [ "$DEST" = "$HOME/.local/share/agentbox" ]; then rexpath='os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;"'
+else rexpath="\"$DEST/share/rex/?.lua;\""; fi
+echo "  package.path = $rexpath .. package.path"
+echo "  require(\"agentbox\").setup{}"
 echo "agents on this machine (Claude Code, Codex, OpenCode, Pi): \`agentbox skill setup\` installs the agentbox skill"
 echo "done. next: sbx login, then edit $CFG/agentbox.toml, then: agentbox doctor"
