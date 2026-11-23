@@ -26,6 +26,8 @@ the VM. agentbox adds the parts you asked for on top:
   the agent's own plan, and flags a job that has gone quiet.
 - **Clone mode and `fetch`**: the agent works on its own clone, and `agentbox fetch` brings the branch its
   last job ended on to a review branch on the host. It never merges.
+- **`review`**: a pull-request page in the terminal for those branches (summary, commits, files, diff), where
+  you fetch, fast-forward merge and clean up. It is your tool: agents never run it.
 - **Skill sets**: read-only git repos of agent skills, pinned to a commit you reviewed and linked into the VM.
 - **A skill for agents on the host**: `agentbox skill setup` teaches Claude Code, Codex, OpenCode and Pi on
   your machine to drive agentbox, under your ground rules (see *Agents on the host*).
@@ -53,9 +55,10 @@ unzip agentbox.zip && cd agentbox && ./install.sh     # installs agentbox itself
 agentbox provision myproj --workspace ~/src/myproj    # guided; clone mode is suggested
 agentbox run myproj --prompt-file task.md --detach    # the brief goes in a file, never on a command line
 agentbox progress myproj --watch                      # until the job ends
-agentbox fetch myproj                                 # the job's branch, e.g. into review/myproj-fix-login
-git diff HEAD...review/myproj-fix-login               # review (fetch prints the name)
-git merge --ff-only review/myproj-fix-login           # only if you are happy with it
+agentbox review myproj                                # fetch (f), read the summary, commits and diff, merge (m)
+                                                      # or by hand: agentbox fetch myproj, then
+                                                      # git diff HEAD...review/myproj-fix-login and
+                                                      # git merge --ff-only review/myproj-fix-login
 agentbox down myproj                                  # when finished; asks for confirmation (--force skips
                                                       # that and deletes the sandbox even while it is in use: for scripts)
 ```
@@ -352,6 +355,8 @@ agentbox shell h750        # bash inside the VM
 agentbox tools h750        # what the agent can run on the host
 agentbox audit h750        # what changed in hooks/build/IDE/agent config since creation (direct mode)
 agentbox fetch h750        # clone mode: the job's branch, into review/h750-<branch> (see §6)
+agentbox review h750       # clone mode: review those branches like a pull request, and merge (see §6)
+agentbox history h750      # the jobs it ran: when, exit, cost, branch, the brief's title (--json)
 agentbox stop h750         # pause sandbox + bridge
 agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force: also kills a running job, skips sbx's
                             # confirmation - required without a TTY - and deletes the sandbox even if in use, e.g. an open VS Code session)
@@ -616,11 +621,12 @@ isn't UTF-8. Below 60x15 it asks for a bigger pane.
 | f | shows `agentbox fetch <profile>`, the ref it will fetch and the review branch, and asks y/N; runs it only on `y`, with no other flags. A stopped sandbox gets a note instead: fetch needs it running, and booting it would relaunch the agent |
 | u | `agentbox up <profile>`: the agent's session takes this terminal, and the dashboard comes back when it exits (sbx keeps the sandbox running). Inside Rex (`REX_SESSION` and `REX_BLOCK` set, and a `rex` CLI found: `$AGENTBOX_REX` if it's an absolute path, else `rex` on `PATH`, else the one in Rex.app) it opens in a new Rex tab instead, with `rex run`; if that fails, the next `u` runs it here. Refused for a disabled profile; allowed, with a warning, while a job runs there (`up` attaches to its sandbox) |
 | s | stop a running sandbox: shows `agentbox stop <profile>` and runs it on `y`, with no other flags. If a job is running there, the job is killed and reported as lost, so the profile name must be typed exactly, then Enter; Esc or anything else cancels |
+| v | `agentbox review <profile>` for a clone-mode profile: in a new Rex tab inside Rex (as `u`), else in this terminal, back when you quit it. A profile with branches ready to review, or job branches not fetched yet, has a ◆ in the list and "N commits ready to review" in its details (the same statuses `review` shows) |
 | r | refresh now |
 | ? | help |
 | q, Ctrl-C | quit and give the terminal back |
 
-The dashboard runs only `progress --watch`, `logs`, `fetch`, `up` and `stop`, each with only the profile name;
+The dashboard runs only `progress --watch`, `logs`, `fetch`, `up`, `stop` and `review`, each with only the profile name;
 it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 
 ### Using agentbox from Rex
@@ -630,7 +636,9 @@ it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 [`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
-  a job from a prompt file, open the interactive dashboard, fetch for review, stop a sandbox, remove a sandbox. Two lines in
+  a job from a prompt file, open the interactive dashboard, fetch for review, review (`agentbox review` in a
+  "Review" window of the profile's session; the picker shows "2 ready · 1 not fetched"), stop a sandbox,
+  remove a sandbox. Two lines in
   `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
 - **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` / `--interactive` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
@@ -638,6 +646,9 @@ it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
   done or error stays after the sandbox stops, until that profile's next job. Only host-side state goes in
   (job state, exit code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
   terminal with `REX_SESSION` set, never with `--json`; `AGENTBOX_NO_OSC=1` turns them off.
+- **Review**: while `agentbox review` runs inside Rex it sets the tab's title to `review: <profile>/<branch>`
+  and keeps one `review` record, `idle` with "N to review" while anything waits for you, cleared when nothing
+  does or when it quits. It is never `blocked`, `done` or `error`, so it never notifies.
 - **Notifications**: Rex notifies by itself while in the background (Settings > Notifications > Program
   Activity), once per tab that reports, so a job watched from two tabs notifies twice.
 
@@ -707,7 +718,7 @@ skill from any you mount *into* sandboxes with `[skillsets]`.
 
 ### Scripting agentbox
 
-`status`, `dashboard`, `doctor`, `tools`, `progress` and `fetch` take `--json`: stdout is then exactly one JSON document, the human
+`status`, `dashboard`, `doctor`, `tools`, `progress`, `fetch`, `history` and `review` take `--json`: stdout is then exactly one JSON document, the human
 text is unchanged without the flag, and diagnostics still go to stderr. No secret values appear
 in any of them (`doctor` reports token-like variables by name, class and length only).
 
@@ -965,13 +976,76 @@ result is one document: `profile`, `sandbox`, `remote`, `ref`, `branch`, `ref_so
 `fast_forward_from_head`, `commits` (at most 50, each `{hash, subject}`), `commits_total`,
 `files_changed`, `insertions`, `deletions` and `job_running`.
 
-This is the one place agentbox runs git on the host. That is safe because in clone mode the host
+`fetch` and `review` (below) are the only places agentbox runs git on the host. That is safe because in clone mode the host
 repo is mounted read-only, so the agent cannot have written its `.git/config`, and fetching from the
 sandbox remote runs nothing from the VM's config. This holds only if no other profile mounts the same
 folder writable (as a direct-mode workspace, or an `extra_workspace` without `:ro`). If one does, an
 agent there could have changed `.git/config`, so run `agentbox audit` for that profile first. The diff is run with `--no-ext-diff --no-textconv`.
 The raw equivalent, while the sandbox is running, is
 `git fetch sandbox-ab-<profile> <branch>:review/<profile>-<branch>`.
+
+### Reviewing and merging: `agentbox review`
+
+```bash
+agentbox review h750        # full screen; needs a terminal and a clone-mode profile
+agentbox review             # every clone-mode profile's items together
+agentbox review --json      # the items and their statuses (no diff): what the Rex action reads
+agentbox history h750       # the jobs behind them, newest first (--json)
+```
+
+`review` is the owner's merge tool, a pull-request page in the terminal (Python's `curses`, like
+`dashboard -i`). Agents never run it. On the left, one item per review branch (`review/<p>` and
+`review/<p>-*`) and per recorded job whose branch has not been fetched yet, actionable ones first, newest
+first: profile and branch, the brief's title, when, and a status:
+
+| status | meaning | key |
+|---|---|---|
+| not fetched | the job ended on a branch, and no review branch has it yet | `f` runs `agentbox fetch <p>` (shown first; `y` runs it, in this terminal) |
+| ready | the review branch has commits the target lacks, and a fast-forward is possible | `m` merges |
+| diverged | the target has moved on: no fast-forward | `m` offers a merge commit |
+| merged | the branch's tip is already in the target | `d` deletes the review branch |
+
+The **target** is the branch checked out in the profile's primary workspace (in the header). On the right,
+three tabs (Tab, or 1 2 3): **Overview** (the brief's title, job id, start, duration, exit, cost, turns, tool
+calls, denials, branch and tip, "N commits, M files changed, +a −d", and the agent's final summary under
+"the agent's own summary, not verified"), **Commits** (hash, subject, date; Enter shows that commit's diff,
+`a` goes back) and **Files and diff**: a file list with +/− counts (at the left on wide panes) and the
+merge-base diff `target...branch`, as a pull request shows it. ↑ ↓ PgUp PgDn and the wheel scroll it, `n`/`N`
+jump between files, `]`/`[` between hunks, `/` searches, `w` wraps long lines (otherwise they are cut, with
+`…`). Additions are green, deletions red, hunk headers cyan, file headers bold, in the terminal's own colours.
+← → (or a click) move between the list and the tab; `?` lists every key.
+
+- **`m` merge** (ready or diverged) shows the exact command and the commit count, and checks the workspace
+  first. It refuses, saying why, if tracked files have staged or unstaged changes (untracked files are fine:
+  git refuses by itself if one would be overwritten), if a merge, rebase, cherry-pick or revert is in progress,
+  or if the branch or the target moved since the list was read. A fast-forward is
+  `git merge --ff-only -- <branch>` after `y`. A diverged branch gets `git merge --no-ff --no-edit -- <branch>`,
+  and only after you type `merge` and Enter; if that conflicts, `git merge --abort` runs at once and the
+  conflicted files are listed. Afterwards it shows the target's new tip.
+- **`d` delete** (merged only): `git branch -d -- <branch>` after `y`; lower-case `-d`, so git itself
+  refuses a branch that isn't merged.
+- **`o`** opens the diff in VS Code, one file at a time (`git difftool` with `code --wait --diff`, on
+  temporary copies outside the repo), if `code` is on `PATH`; otherwise it says so.
+- **`t`** opens a shell in the workspace, so you can run your install or tests after a merge: a new Rex tab
+  (`rex run --cwd <workspace> --label "<p> shell"`, your login shell) inside Rex, else `$SHELL` in this
+  terminal until you exit it. `review` itself never runs a project script, install or test.
+- `r` refreshes, `q` quits and gives the terminal back (and its title).
+
+It never rebases, resets, forces, pushes or checks out. git runs with argv lists, `--no-pager`,
+`-c core.quotePath=true -c diff.noprefix=false`, and `--no-color --no-ext-diff --no-textconv` for anything it
+draws; file names are read from `--numstat -z` and other NUL-separated output. Diffs, file names, commit
+messages, the summary and the title are agent-written, so all of it is cleaned before it is drawn: no
+escape sequence reaches your terminal. A file's diff shows at most 20,000 lines, then "(N more lines; open
+in VS Code)"; binary files show as "binary". Branch names are checked as branch names before git sees them.
+A merge runs your repo's own hooks (e.g. `post-merge`), as `git merge` does in a terminal.
+
+**History.** When agentbox first sees a job ended (in `wait`, `progress`, `status`, `fetch`, the dashboard...)
+while the sandbox is still up, it appends one record to `$state_dir/<sandbox>/history.jsonl` (owner-only,
+the last 200 jobs): id, times, exit code, branch and end commit, turns, tool calls, denials, tokens, cost,
+commits, the brief's title (its first Markdown heading, else its first line; at most 200 characters) and the
+agent's final summary (the `result` of its stream, at most 8 KB). This is what `review` shows, because sbx
+stops the VM, and the summary with it, about 30 s after a job ends. A job that was lost, or never seen
+ending while its VM was up, gets a record with what is known.
 
 ## 7. What this protects and what it doesn't
 

@@ -21,6 +21,7 @@ require("agentbox").setup{}
 | `agentbox_run` | pick a profile and a prompt file; `run --detach`, then `progress --watch` in a Job tab |
 | `agentbox_dashboard` | session `agentbox` running `agentbox dashboard --interactive` (keys below) |
 | `agentbox_fetch` | `agentbox fetch <profile>` in a visible tab |
+| `agentbox_review` | pick a clone-mode profile, or "All profiles" (each shows its counts, e.g. "2 ready · 1 not fetched", from `agentbox review --json`); `agentbox review [<profile>]` in a window labelled "Review" in session `ab:<profile>` (or `agentbox` for all), created if needed. If that session already has a Review window, it is selected instead of opening another |
 | `agentbox_stop` | pick a running sandbox; `agentbox stop <profile>` in a visible tab. If a job runs there, the picker says it will be lost and the profile name must be typed exactly. Never `--force` |
 | `agentbox_down` | `agentbox down <profile>` in a visible tab (sbx asks for confirmation there) |
 
@@ -31,8 +32,16 @@ ref it will fetch (the branch the job ended on, else `main`) and the review bran
 `y` (a stopped sandbox gets a note instead); `u` opens `agentbox up <profile>` in a new tab of this session
 (with `rex run`; the `rex` CLI is `$AGENTBOX_REX`, else `rex` on `PATH`, else the one in Rex.app; if that fails,
 the next `u` runs it in the dashboard's own tab); `s` stops a running sandbox after `y`, or, if a job runs
-there (it will be lost), after the profile name is typed; `r` refreshes, `?` lists the keys, `q` quits. It never runs
-`--force`, `--start`, `down`, `fresh`, `run` or `resume`. `agentbox dashboard --watch` still gives the plain text view.
+there (it will be lost), after the profile name is typed; `v` opens `agentbox review <profile>` for a clone-mode profile
+(in a new tab of this session, as `u` does; a ◆ in the list marks a profile with branches to review); `r` refreshes,
+`?` lists the keys, `q` quits. It never runs `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
+
+`agentbox review` is the owner's merge tool (agents never run it): a pull-request page for clone mode's review
+branches with Overview, Commits and Files and diff tabs, `f` fetch, `m` merge (`git merge --ff-only`, or a merge
+commit after typing `merge`), `d` delete a merged branch, `o` VS Code, and `t`, which opens a shell in the
+profile's workspace in a new tab (`rex run --cwd <workspace> --label "<profile> shell"`, your login shell) so you
+can run your install or tests after a merge. While it runs, the tab's title is `review: <profile>/<branch>`
+(restored when it quits). See the main README, "Reviewing and merging". `agentbox dashboard --watch` still gives the plain text view.
 
 The actions switch the Rex app to the session they open. Doing that from the `rex` CLI needs Rex's Remote
 Control setting.
@@ -50,7 +59,9 @@ No keys are bound by default. Suggested bindings (use Rex's key-binding syntax i
 Inside Rex (`REX_SESSION` set, output on a terminal), `agentbox progress --watch`, `dashboard --watch` or
 `--interactive`, and `wait` report job state with OSC 7501, so it shows in the tab and in View Activity: `working` (with plan
 progress), `blocked` when the job has stalled, `done`, `error`, `idle`. Every record's id is the profile
-name. The dashboard keeps one record per profile that follows its latest job, also after sbx has stopped
+name, except `agentbox review`'s: one record with id `review`, `idle` with "N to review" while branches wait
+for you, cleared when none do or when it quits. It is never `blocked`, `done` or `error`, so Rex never
+notifies about an open review. The dashboard keeps one record per profile that follows its latest job, also after sbx has stopped
 the sandbox (read from the state agentbox keeps on the host; a stopped sandbox is never booted): `done` or
 `error` stays until the profile's next job starts, and a job that died with its sandbox shows `error`
 ("sandbox stopped"). The record is cleared when the profile has no job, is disabled or is removed. `AGENTBOX_NO_OSC=1` turns the reports off. A report holds only host-side state

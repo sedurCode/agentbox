@@ -14,10 +14,13 @@ The owner set these rules. Follow them even when a task seems to ask for more.
 
 **Run without asking.** These only read:
 
-- `agentbox status`, `dashboard`, `progress`, `logs`, `doctor`, `tools`, and their `--json` forms.
+- `agentbox status`, `dashboard`, `progress`, `logs`, `doctor`, `tools`, `history`, `review --json`, and
+  their `--json` forms.
   Leave out `--start`: on `logs` and `doctor` it boots a stopped sandbox.
   `dashboard --interactive` is the owner's full-screen view and needs a terminal; don't run it yourself
   (its `f` key fetches, after asking the owner).
+- `agentbox review` (without `--json`) is the owner's merge tool: never run it, and never press its keys
+  for them. Point them at it instead.
 - `git log`, `git diff`, `git status` on the host (but see the direct-mode warning in section 5).
 - `sbx ls`.
 
@@ -33,7 +36,7 @@ the result when it finishes?". A yes covers what you asked about, not the next j
 **Never:**
 
 - Pass `--force` to anything.
-- Merge, rebase onto, or push anything. The owner merges the review branch.
+- Merge, rebase onto, or push anything. The owner merges the review branch (with `agentbox review`, or git).
 - Read secrets or `.env` files, or run commands that print secret values (keychain, `op`, `sbx secret`).
 - Put a secret value or task text on a command line. Command lines are visible in the process list; the
   brief goes in a file and is passed with `--prompt-file`.
@@ -89,7 +92,8 @@ Then report to the owner: "ready on `review/<p>-<branch>`" (the branch `fetch` p
 commits and diff in your own words, your view of whether it meets the brief, and the commands for them to run:
 
 ```bash
-git diff HEAD...review/<p>-<branch>
+agentbox review <p>                         # theirs: the summary, commits and diff, and the merge (m)
+git diff HEAD...review/<p>-<branch>         # or by hand
 git merge --ff-only review/<p>-<branch>     # theirs to run, not yours
 agentbox down <p>                  # when they are finished with the sandbox
 ```
@@ -182,7 +186,7 @@ Only if the environment variable `REX_SESSION` is set and `rex` is on `PATH`: in
 `agentbox progress <p> --watch` in a Rex split so the owner can see the job, and wait for the job with
 `agentbox wait`. Inside Rex both report the job's state to the tab and to View Activity by themselves.
 agentbox ships Rex palette actions in `share/rex/` (category "agentbox"): `agentbox_open`, `agentbox_run`,
-`agentbox_dashboard`, `agentbox_fetch`, `agentbox_stop` and `agentbox_down`. If the owner has them set up, point them at
+`agentbox_dashboard`, `agentbox_fetch`, `agentbox_review`, `agentbox_stop` and `agentbox_down`. If the owner has them set up, point them at
 those rather than building sessions yourself; `agentbox_stop` and `agentbox_down` still need their go-ahead
 like `stop` and `down`.
 Otherwise ignore this section.
