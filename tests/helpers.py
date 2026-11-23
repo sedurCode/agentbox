@@ -148,6 +148,8 @@ class FakeSbx:
             for marker, (rc, out) in self.exec_out.items():
                 if marker in args[-1]:
                     return done(rc, out)
+            if "claude_activity" in args[-1]:       # VM_SESSIONS_SCRIPT (status --json): no sessions
+                return done(0, "")
         raise AssertionError(f"unexpected sbx call: {args!r}")
 
     def install(self, case):

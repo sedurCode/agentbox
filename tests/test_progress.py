@@ -494,7 +494,10 @@ class NoExecTests(ProgressCase):
         self.assertEqual(self.view()["cost_usd"], 1.5)
         self.assertEqual(self.vm.calls[mark:], [], "no sbx call at all for a finished, cached job")
         self.run_main("status", "--json")
-        self.assertEqual(self.vm.calls[mark:], [("ls", "--json")])        # the one listing, nothing in the VM
+        calls = self.vm.calls[mark:]                                         # the one listing, and nothing in
+        self.assertEqual(calls[0], ("ls", "--json"))                         # the VM but the sessions probe
+        self.assertEqual([c[:2] for c in calls[1:]], [("exec", self.prof.sandbox)])
+        self.assertIn("claude_activity", calls[1][-1])
 
     def test_cache_survives_the_sandbox_being_stopped(self):
         self.finished_job()

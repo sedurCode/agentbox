@@ -3718,15 +3718,19 @@ def profile_status(prof: Profile, states=_FETCH) -> dict:
     job = public_job(info_) | {"progress": status_progress(prof, info_, states)}
     if job["id"]:
         job["vm"] = sandbox_state(prof, states)      # now, not as of the last probe (job_info caches)
-    return {"name": prof.name, "valid": True, "enabled": True, "sandbox": prof.sandbox,
-            "job": job,
-            "agent": prof.d["agent"], "mode": prof.d["mode"],
-            "sandbox_exists": sandbox_exists(prof) if states is None else prof.sandbox in states,
-            "host_tools": prof.tool_names,
-            "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
-            "local_model": prof.local_model,
-            "bridge": {"running": pid is not None, "pid": pid},
-            "skills": skills_status(prof)}
+    out = {"name": prof.name, "valid": True, "enabled": True, "sandbox": prof.sandbox,
+           "job": job,
+           "agent": prof.d["agent"], "mode": prof.d["mode"],
+           "sandbox_exists": sandbox_exists(prof) if states is None else prof.sandbox in states,
+           "host_tools": prof.tool_names,
+           "host_tools_port": int(prof.d.get("host_tools_port") or 0) or None,
+           "local_model": prof.local_model,
+           "bridge": {"running": pid is not None, "pid": pid},
+           "skills": skills_status(prof)}
+    if sandbox_state(prof, states) == "running":     # interactive sessions: never from a stopped VM
+        r = vm_exec(prof, vm_script(VM_SESSIONS_SCRIPT, prof))
+        out |= parse_vm_sessions(r.stdout or "") if r.returncode == 0 else NO_SESSIONS
+    return out
 
 
 def skills_status(prof: Profile) -> list[dict]:
@@ -3776,6 +3780,36 @@ def cmd_status(cfg: Config, as_json: bool = False) -> int:
 # tokens. A running sandbox costs one `sbx exec` (the resource probe below) plus whatever `status`
 # already needs for its job; stopped sandboxes are listed, never booted. Everything the VM prints is
 # parsed as numbers here and drawn by us, so nothing from the VM reaches the terminal as text.
+#
+# The same exec also reports interactive agent sessions (VM_SESSIONS_SCRIPT): each claude/opencode
+# process (by argv[0]'s base name) with its age and whether it is the current job ($AB_JOB's pid or a
+# descendant), how long ago the newest Claude transcript and opencode session store were written, and
+# the transcript's last permissionMode. Only process metadata, file times and that one word are read,
+# never conversation content; the lines carry only numbers and fixed words.
+VM_SESSIONS_SCRIPT = r"""
+now=$(date +%s); up=$(cut -d' ' -f1 /proc/uptime); hz=$(getconf CLK_TCK 2>/dev/null) || hz=100
+jp=; case "$AB_JOB" in ?*) jp=$(head -c 16 "$HOME/.agentbox/jobs/$AB_JOB/pid" 2>/dev/null | tr -cd 0-9);; esac
+ag=
+for f in /proc/[0-9]*/cmdline; do
+  a=$(head -c 512 "$f" 2>/dev/null | tr '\0\n' '\n ' | head -n1); a=${a##*/}
+  case "$a" in claude|opencode) p=${f#/proc/}; ag="$ag ${p%/cmdline}:$a";; esac
+done
+[ -n "$ag" ] && cat /proc/[0-9]*/stat 2>/dev/null | awk -v ag="$ag" -v jp="$jp" -v up="$up" -v hz="$hz" '
+  { pid = $1; sub(/^.*\) /, ""); pp[pid] = $2; st[pid] = $20 }
+  END { n = split(ag, a, " "); for (i = 1; i <= n && i <= 64; i++) {
+      split(a[i], x, ":"); p = x[1]; if (!(p in st)) continue
+      j = 0; q = p; for (k = 0; k < 64 && q != "" && q > 1; k++) { if (q == jp) { j = 1; break }; q = pp[q] }
+      e = int(up - st[p] / hz); if (e < 0) e = 0
+      print "agent", x[2], p, e, j } }'
+f=$(ls -t -- "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -n1)
+if [ -n "$f" ] && t=$(stat -c %Y -- "$f" 2>/dev/null); then
+  m=$(tail -c 65536 -- "$f" 2>/dev/null | grep -o '"permissionMode":"[a-zA-Z]*"' | tail -n1 | cut -d'"' -f4)
+  echo "claude_activity $((now > t ? now - t : 0)) ${m:--}"
+fi
+o=$(ls -td -- "$HOME"/.local/share/opencode/opencode.db* "$HOME"/.local/share/opencode/storage/session/*/* \
+  "$HOME"/.local/share/opencode/storage/message/* 2>/dev/null | head -n1)
+if [ -n "$o" ] && t=$(stat -c %Y -- "$o" 2>/dev/null); then echo "opencode_activity $((now > t ? now - t : 0))"; fi
+"""
 VM_STATS_SCRIPT = r"""
 echo "stat1 $(head -n1 /proc/stat)"; sleep 0.5; echo "stat2 $(head -n1 /proc/stat)"
 echo "uptime $(cut -d' ' -f1 /proc/uptime)"
@@ -3783,7 +3817,49 @@ echo "load $(cut -d' ' -f1-3 /proc/loadavg)"
 echo "cpus $(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)"
 grep -E '^(MemTotal|MemAvailable):' /proc/meminfo | tr -s ' ' | sed 's/^/mem /'
 echo "disk $(df -Pk / | tail -n1)"
-"""
+""" + VM_SESSIONS_SCRIPT
+SESSION_AGENTS = ("claude", "opencode")
+SESSION_MODES = ("auto", "acceptEdits", "bypassPermissions", "plan", "default", "dontAsk", "manual")
+SESSIONS_MAX, SESSION_SECS_MAX, SESSION_PID_MAX = 32, 10**9, 1 << 22
+
+
+def vm_script(script: str, prof: "Profile") -> str:
+    """`script` with AB_JOB set to the profile's job, if that job may still be running (a finished job's
+    pid file could name a reused pid)."""
+    rec = job_record(prof)
+    jid = rec.get("id")
+    if isinstance(jid, str) and JOB_ID_RE.match(jid) and rec.get("state") not in ("finished", "lost"):
+        return f"AB_JOB={jid}\n{script}"
+    return f"AB_JOB=\n{script}"
+
+
+def _secs(v: str, top: int = SESSION_SECS_MAX) -> int | None:
+    """A plain ASCII decimal in [0, top], else None (no sign, no '_', no other digits)."""
+    return int(v) if re.fullmatch(r"[0-9]{1,10}", v) and int(v) <= top else None
+
+
+def parse_vm_sessions(out: str) -> dict:
+    """The session lines of VM_SESSIONS_SCRIPT: {"sessions": [{"agent", "age_s"}] (interactive processes
+    only, at most SESSIONS_MAX), "activity_age_s": int | None, "permission_mode": str | None}. Any line
+    that isn't exactly the expected shape is ignored."""
+    sessions, ages, mode, seen = [], [], None, set()
+    for line in out.split("\n"):
+        f = line.split(" ")
+        if f[0] == "agent" and len(f) == 5 and f[1] in SESSION_AGENTS and f[4] in ("0", "1"):
+            pid, age = _secs(f[2], SESSION_PID_MAX), _secs(f[3])
+            if pid and age is not None and pid not in seen and f[4] == "0" and len(sessions) < SESSIONS_MAX:
+                seen.add(pid)
+                sessions.append({"agent": f[1], "age_s": age})
+        elif f[0] == "claude_activity" and len(f) == 3 and _secs(f[1]) is not None:
+            ages.append(_secs(f[1]))
+            mode = f[2] if f[2] in SESSION_MODES else None
+        elif f[0] == "opencode_activity" and len(f) == 2 and _secs(f[1]) is not None:
+            ages.append(_secs(f[1]))
+    sessions.sort(key=lambda s: -s["age_s"])
+    return {"sessions": sessions, "activity_age_s": min(ages) if ages else None, "permission_mode": mode}
+
+
+NO_SESSIONS = {"sessions": [], "activity_age_s": None, "permission_mode": None}
 
 
 def _cpu_times(fields: list[str]) -> tuple[int, int] | None:
@@ -3802,8 +3878,9 @@ def parse_vm_stats(out: str) -> dict | None:
     """The numbers from VM_STATS_SCRIPT, or None if the output is not what we expect."""
     rows: dict[str, list[list[str]]] = {}
     for line in out.splitlines():
-        key, *rest = line.split()
-        rows.setdefault(key, []).append(rest)
+        if line.split():
+            key, *rest = line.split()
+            rows.setdefault(key, []).append(rest)
     try:
         t1, t2 = _cpu_times(rows["stat1"][0][1:]), _cpu_times(rows["stat2"][0][1:])
         mem = {r[0].rstrip(":"): int(r[1]) * 1024 for r in rows["mem"]}
@@ -3831,12 +3908,14 @@ def dashboard_entry(cfg: Config, name: str, states) -> dict:
         vm = sandbox_state(prof, states)
         row = {"name": name, "enabled": True, "sandbox": prof.sandbox, "agent": prof.d["agent"],
                "mode": prof.d["mode"], "vm": vm, "job": None, "resources": None,
-               "review": review_summary(cfg, prof, states)}      # clone mode: what `review` would list
+               "review": review_summary(cfg, prof, states)} | NO_SESSIONS   # clone mode: what `review` would list
         if vm == "unknown":
             return row
         if vm == "running":
-            r = vm_exec(prof, VM_STATS_SCRIPT)
-            row["resources"] = parse_vm_stats(r.stdout or "") if r.returncode == 0 else None
+            r = vm_exec(prof, vm_script(VM_STATS_SCRIPT, prof))
+            if r.returncode == 0:
+                row["resources"] = parse_vm_stats(r.stdout or "")
+                row |= parse_vm_sessions(r.stdout or "")
         j = job_info(prof, states=states)       # a stopped VM: host-side state only, as `status` does
         row["job"] = public_job(j) | {"progress": status_progress(prof, j, states)}
         return row
