@@ -9,6 +9,7 @@
 --   agentbox_run        pick a profile + prompt file -> run --detach, then progress --watch
 --   agentbox_dashboard  session "agentbox" running `agentbox dashboard --interactive`
 --   agentbox_fetch      fetch in a visible tab (agentbox prints what it did)
+--   agentbox_stop       stop a running sandbox in a visible tab (a running job: type the name; never --force)
 --   agentbox_down       down in a visible tab (sbx asks for confirmation there; never --force)
 
 local M = {}
@@ -41,20 +42,31 @@ local function profiles()
       local job = p.job or {}
       local detail = job.state and job.state ~= "none" and job.state or ""
       if job.progress and job.progress.stalled then detail = "stalled" end
+      local vm = type(job.vm) == "string" and job.vm or nil   -- known only once the profile has had a job
       table.insert(items, {
         id = p.name, title = p.name, icon = "package", detail = detail,
-        subtitle = "vm " .. tostring(job.vm or p.vm or "?"),
+        subtitle = "vm " .. tostring(vm or p.vm or "?"),
         running = job.state == "running",
+        -- up: the sandbox exists and isn't known to be stopped
+        up = p.sandbox_exists == true and (vm == nil or vm == "running"),
       })
     end
   end
   return items
 end
 
-local function pick_profile(title)
+local function pick_profile(title, filter)
   local items = profiles()
   if not items then return nil end
-  if #items == 0 then warn("no enabled profiles"); return nil end
+  if filter then
+    local kept = {}
+    for _, it in ipairs(items) do
+      if filter(it) then table.insert(kept, it) end
+    end
+    items = kept
+  end
+  if #items == 0 then warn(filter and "no profile to pick" or "no enabled profiles"); return nil end
+  if type(title) == "function" then title = title(items) end
   local name = rex.ui.pick{ title = title, placeholder = "Filter profiles", items = items }
   if not valid_name(name) then return nil end
   for _, it in ipairs(items) do
@@ -155,25 +167,56 @@ function M.setup(user)
     end,
   }
 
+  -- `agentbox <verb> <p>` in a visible tab: in session ab:<p> if there is one, else here.
+  local function in_tab(verb, p)
+    local layout = term(ab(verb, p), verb, true)
+    local id = find_session("ab:" .. p)
+    if id then
+      rex.call("session.new_window", { session_id = id, window_label = verb, layout = layout })
+      show(id)
+    else
+      rex.session.new_window{ window_label = verb .. " " .. p, layout = layout }
+    end
+  end
+
   local function visible(name, title, verb)
     rex.action{
       name = name, title = title, category = "agentbox",
       run = function(ctx)
         local p = pick_profile(title:gsub("…$", ""))
         if not p then return end
-        local layout = term(ab(verb, p), verb, true)
-        local id = find_session("ab:" .. p)
-        if id then
-          rex.call("session.new_window", { session_id = id, window_label = verb, layout = layout })
-          show(id)
-        else
-          rex.session.new_window{ window_label = verb .. " " .. p, layout = layout }
-        end
+        in_tab(verb, p)
       end,
     }
   end
   visible("agentbox_fetch", "agentbox: Fetch for Review…", "fetch")
   visible("agentbox_down", "agentbox: Remove Sandbox…", "down")
+
+  rex.action{
+    name = "agentbox_stop", title = "agentbox: Stop…", category = "agentbox",
+    keywords = "sandbox sbx stop halt",
+    run = function(ctx)
+      local p, item = pick_profile(function(items)
+        for _, it in ipairs(items) do
+          if it.running then return "Stop sandbox (a running job there will be lost)" end
+        end
+        return "Stop sandbox"
+      end, function(it) return it.up end)
+      if not p then return end
+      if item.running then
+        local typed = rex.ui.input{
+          title = "A job is running in " .. p .. ": stopping kills it and it will be reported as lost. "
+            .. "Type " .. p .. " to stop it",
+          value = "", confirm = "Stop",
+        }
+        if typed ~= p then
+          if typed then warn("stop cancelled: the name did not match") end
+          return
+        end
+      end
+      in_tab("stop", p)
+    end,
+  }
 end
 
 return M
