@@ -64,7 +64,13 @@ for you, cleared when none do or when it quits. It is never `blocked`, `done` or
 notifies about an open review. The dashboard keeps one record per profile that follows its latest job, also after sbx has stopped
 the sandbox (read from the state agentbox keeps on the host; a stopped sandbox is never booted): `done` or
 `error` stays until the profile's next job starts, and a job that died with its sandbox shows `error`
-("sandbox stopped"). The record is cleared when the profile has no job, is disabled or is removed. `AGENTBOX_NO_OSC=1` turns the reports off. A report holds only host-side state
+("sandbox stopped"). The record is cleared when the profile has no job, is disabled or is removed.
+While interactive agent sessions (`agentbox up`, "Open Profile") run in a sandbox and no headless job does,
+its dashboard record is `working` with "interactive" when a session wrote in the last 90 seconds, else `idle`
+with "interactive, idle 12m"; never `done`, `error` or `blocked`, so Rex doesn't notify about them. When the
+sessions end the record follows the latest job again (as above), or is cleared if there is none. To see them
+the dashboard reads only process metadata, file times and Claude's permission mode in the running VM, never
+conversation content. `AGENTBOX_NO_OSC=1` turns the reports off. A report holds only host-side state
 (job state, exit code, profile name, agentbox's own wording), never text from the sandbox.
 
 ## Notifications

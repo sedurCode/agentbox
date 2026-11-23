@@ -601,12 +601,29 @@ costs one extra `sbx exec` (CPU is sampled over half a second inside the VM) on 
 The VM's output is parsed as numbers and drawn by agentbox, never printed raw. Colour is used only on a
 terminal and not if `NO_COLOR` is set.
 
+**Interactive sessions.** The same exec also looks for agent sessions you opened yourself (`agentbox up`, Rex's
+"Open Profile"): every `claude` or `opencode` process (by its executable's name) that isn't the current
+headless job or one of its children, how long ago the newest Claude transcript (`~/.claude/projects/*/*.jsonl`)
+or opencode session store (`~/.local/share/opencode/`) was written, and the transcript's last
+`permissionMode` (one `grep` over its final 64 KB). Only process metadata, file times and that one mode word
+are read, never conversation content, and never from a stopped sandbox. A card then gets a line like
+`interactive: 3 sessions, active 9s ago, mode auto`. `--json` adds to each row `sessions`
+(`[{"agent": "claude", "age_s": 10735}]`, interactive processes only, at most 32), `activity_age_s` (seconds
+since the newest write, or `null`) and `permission_mode` (`auto`, `acceptEdits`, `bypassPermissions`, `plan`,
+`default`, `dontAsk`, `manual`, or `null`); a VM that isn't running has `[]`, `null`, `null`.
+
 `--interactive` (`-i`) is a full-screen terminal view (Python's `curses`, nothing to install) and needs a
 terminal; it can't be combined with `--watch` or `--json`. A list of every profile, not only the running
-ones, sorted working first, then those needing attention (stalled, failed, lost), then finished, then the
-rest. Each row has a state mark, the agent, and the job's elapsed time or how long ago it finished. Beside it
+ones, sorted: working jobs, then working interactive sessions, then those needing attention (stalled,
+failed, lost), then idle interactive sessions, then finished, then the rest. A running headless job decides
+a row's state; otherwise, if interactive sessions run there, the row is *interactive* (a blue ◉, `@` in
+ASCII) when one wrote in the last 90 seconds and *interactive, idle* (a blue ◦, `i`) when not, whatever an
+older job says. Each row has a state mark, the agent, and the job's elapsed time, how long ago an
+interactive session last wrote (`9s ago`, `idle 12m`), or how long ago the job finished. Beside it
 (or below it in a narrow pane) the selected profile's details: the VM with CPU, memory and disk bars, the
-job (id, state, start and finish, exit code, elapsed, idle, turns, tool calls, the most-used tools, commits,
+interactive sessions (each agent and how long it has run, the last activity and the permission mode;
+`bypassPermissions` in yellow with "(bypass: no permission checks)"), then the job (while sessions run and
+no job does, only a dim "last job: done 10d ago" line; otherwise its id, state, start and finish, exit code, elapsed, idle, turns, tool calls, the most-used tools, commits,
 tokens, cost with `~` when estimated), small charts of tokens and tool calls per refresh since the dashboard
 started (kept in memory only), and the agent's plan, which is the agent's own claim, not verified. Data is
 collected in the background every `--interval` seconds, so keys and resizing stay responsive while `sbx` is
@@ -643,7 +660,9 @@ it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 - **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` / `--interactive` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
   idle. Each record is named after its profile; the dashboard keeps one per profile, and a finished job's
-  done or error stays after the sandbox stops, until that profile's next job. Only host-side state goes in
+  done or error stays after the sandbox stops, until that profile's next job. While interactive sessions run
+  in a sandbox with no running job, its dashboard record is `working` ("interactive") or `idle`
+  ("interactive, idle 12m"), never done, error or blocked; when they end it follows the latest job again. Only host-side state goes in
   (job state, exit code, profile name, agentbox's own wording), never text from the sandbox. Reports are sent only to a
   terminal with `REX_SESSION` set, never with `--json`; `AGENTBOX_NO_OSC=1` turns them off.
 - **Review**: while `agentbox review` runs inside Rex it sets the tab's title to `review: <profile>/<branch>`
@@ -740,7 +759,10 @@ the message is on stderr and stdout is empty, so check the exit code before pars
 `job.state` is `none`, `running`, `finished` or `lost` (see *Headless jobs*); `exit_code` is set only when
 finished. `job.vm` is the sandbox state **now** (`running`, `stopped`, `missing`, `unknown`), from one
 `sbx ls --json` per `status` run, even when the job's own state is cached. `status` never boots a stopped sandbox: it asks `sbx ls --json`, and a job whose sandbox isn't
-running is `lost` without any exec. A running sandbox with an unfinished job costs one `sbx exec`:
+running is `lost` without any exec. A running sandbox with an unfinished job costs one `sbx exec`, and every
+running sandbox one more for its interactive sessions: then, and only then, a profile also has `sessions`,
+`activity_age_s` and `permission_mode`, as in `dashboard --json` (see *Dashboard*; process metadata, file
+times and the permission mode only, never conversation content):
 
 ```json
 {"profiles": [
@@ -749,7 +771,8 @@ running is `lost` without any exec. A running sandbox with an unfinished job cos
    "bridge": {"running": true, "pid": 4242},
    "job": {"id": "20260101T120000Z-ab12cd", "state": "finished", "exit_code": 0,
            "session_id": "0b1c...", "started_at": "2026-01-01T12:00:01Z", "finished_at": "2026-01-01T12:07:45Z",
-           "vm": "running", "branch": "fix-uart", "end_head": "3f9c...", "progress": {"...": "..."}}},
+           "vm": "running", "branch": "fix-uart", "end_head": "3f9c...", "progress": {"...": "..."}},
+   "sessions": [{"agent": "claude", "age_s": 10735}], "activity_age_s": 9, "permission_mode": "auto"},
   {"name": "scratch", "valid": true, "enabled": false, "sandbox": "ab-scratch", "agent": "shell", "mode": "clone",
    "job": {"id": null, "state": "none", "exit_code": null, "session_id": null, "started_at": null,
            "finished_at": null, "vm": null, "branch": null, "end_head": null, "progress": null}},
