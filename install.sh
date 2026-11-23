@@ -27,6 +27,8 @@ mkdir -p "$DEST/bin" "$DEST/share" "$BIN" "$CFG/kits" "$CFG/gdb"
 cp "$SRC/share/hosttool" "$DEST/share/hosttool"
 cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
 cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
+mkdir -p "$DEST/share/skill"
+cp -R "$SRC/share/skill/." "$DEST/share/skill/"
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
@@ -51,4 +53,5 @@ fi
 chmod 700 "$CFG"
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "add $BIN to PATH";; esac
+echo "agents on this machine (Claude Code, Codex, OpenCode, Pi): \`agentbox skill setup\` installs the agentbox skill"
 echo "done. next: sbx login, then edit $CFG/agentbox.toml, then: agentbox doctor"
