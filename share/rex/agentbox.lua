@@ -7,7 +7,7 @@
 -- Actions (command palette, category "agentbox"):
 --   agentbox_open       pick a profile -> session "ab:<profile>" (Agent, Progress, Shell tabs)
 --   agentbox_run        pick a profile + prompt file -> run --detach, then progress --watch
---   agentbox_dashboard  session "agentbox" running `agentbox dashboard --watch`
+--   agentbox_dashboard  session "agentbox" running `agentbox dashboard --interactive`
 --   agentbox_fetch      fetch in a visible tab (agentbox prints what it did)
 --   agentbox_down       down in a visible tab (sbx asks for confirmation there; never --force)
 
@@ -150,7 +150,7 @@ function M.setup(user)
     keywords = "sandbox overview status",
     run = function(ctx)
       ensure_session("agentbox", {
-        { window_label = "Dashboard", layout = term(ab("dashboard", "--watch"), "dashboard", true) },
+        { window_label = "Dashboard", layout = term(ab("dashboard", "--interactive"), "dashboard", true) },
       })
     end,
   }
