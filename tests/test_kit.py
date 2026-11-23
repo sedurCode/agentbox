@@ -59,7 +59,7 @@ class ShippedKitTests(unittest.TestCase):
         from helpers import ROOT
         spec = (ROOT / "kits" / "claude-team" / "spec.yaml").read_text()
         env = spec.split("environment:\n  variables:\n")[1].split("\n\n")[0].splitlines()
-        self.assertEqual(env[0].strip(), 'ANTHROPIC_MODEL: "opusplan"')
+        self.assertEqual(env[0].strip(), 'ANTHROPIC_MODEL: "opus"')
         self.assertTrue(env[1].strip().startswith('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"'))
 
 

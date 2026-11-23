@@ -61,7 +61,7 @@ extra_workspaces = [
 ]
 kits = ["embedded-arm"]              # toolchain inside the sandbox
 # skills = ["pocock"]                # [skillsets.pocock] above, mounted read-only
-# kits = ["embedded-arm", "claude-team"]   # + opusplan main loop and reader/worker/architect subagents (Claude profiles only)
+# kits = ["embedded-arm", "claude-team"]   # + opus main loop and on-request reader/worker/architect subagents (Claude profiles only)
 # kits = ["embedded-arm", "python-node"]   # + Python 3 / venv / pip, Node, git
 allow = [
   "github.com", "codeload.github.com", "objects.githubusercontent.com",  # fetch deps (no creds)

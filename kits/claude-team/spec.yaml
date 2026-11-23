@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
 # See LICENSING.md.
 # Mixin: Claude Code model routing.
-# Main loop on opusplan (Opus in plan mode, Sonnet when executing) plus three
-# user-level subagents: reader (Haiku), worker (Sonnet), architect (Opus).
+# Main loop on Opus plus three user-level subagents: reader (Haiku), worker (Sonnet),
+# architect (Opus). Subagents are opt-in: Claude only delegates when the user asks it to.
 # Add to Claude profiles only: kits = [..., "claude-team"]
 schemaVersion: "2"
 kind: mixin
 name: claude-team
 displayName: Claude model routing
-description: opusplan main loop + haiku reader / sonnet worker / opus architect subagents
+description: opus main loop + on-request haiku reader / sonnet worker / opus architect subagents
 
 environment:
   variables:
-    ANTHROPIC_MODEL: "opusplan"
+    ANTHROPIC_MODEL: "opus"
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"   # no telemetry/error reporting (blocked anyway)
 
 setup:
@@ -27,7 +27,7 @@ setup:
         cat > "$d/reader.md" <<'EOF'
         ---
         name: reader
-        description: Fast, cheap read-only lookup. Use PROACTIVELY to find files, locate symbols, read code or docs and summarise them. Returns findings with file:line references, never edits.
+        description: Fast, cheap read-only lookup - find files, locate symbols, read code or docs and summarise them. Returns findings with file:line references, never edits. Use ONLY when the user asks for subagents.
         model: haiku
         tools: Read, Grep, Glob
         ---
@@ -37,7 +37,7 @@ setup:
         cat > "$d/worker.md" <<'EOF'
         ---
         name: worker
-        description: Implements a well-specified change - edits code, runs tests, fixes failures. Use for any task with a clear plan or spec; give it the files and acceptance criteria.
+        description: Implements a well-specified change - edits code, runs tests, fixes failures. Give it the files and acceptance criteria. Use ONLY when the user asks for subagents.
         model: sonnet
         tools: Read, Edit, Write, Bash, Grep, Glob
         ---
@@ -47,7 +47,7 @@ setup:
         cat > "$d/architect.md" <<'EOF'
         ---
         name: architect
-        description: Design and review for hard problems - cross-module changes, security-sensitive code, tricky bugs, trade-offs. Use before large changes or when a worker gets stuck. Read-only.
+        description: Design and review for hard problems - cross-module changes, security-sensitive code, tricky bugs, trade-offs. Read-only. Use ONLY when the user asks for subagents.
         model: opus
         tools: Read, Grep, Glob
         ---
@@ -56,9 +56,12 @@ setup:
 
 agentInstructions:
   content: |
-    ## Delegation
-    Save tokens by delegating:
-    - `reader` (Haiku) for finding and reading code or docs; don't read large files yourself.
+    ## Subagents: only when asked
+    Do the work yourself in this session. Do NOT start subagents (the Agent/Task tool, including
+    the built-in Explore, Plan and general-purpose agents) unless the user explicitly asks you to
+    use subagents for the task at hand. Permission for one task does not carry over to the next.
+    When the user does ask, these are available:
+    - `reader` (Haiku) for finding and reading code or docs.
     - `worker` (Sonnet) for implementing a clear, scoped change and running its tests.
-    - `architect` (Opus) for design decisions, reviews and stuck bugs, before large changes.
+    - `architect` (Opus) for design decisions, reviews and stuck bugs.
     You coordinate, give each subagent precise inputs, and check its results.
