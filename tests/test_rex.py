@@ -292,11 +292,11 @@ class WaitTests(CommandCase):
 
 
 class DashboardTests(CommandCase):
-    def row(self, name, vm="running", j=None, v=None):
-        return {"name": name, "enabled": True, "agent": "claude", "mode": "clone", "vm": vm, "resources": None,
+    def row(self, name, vm="running", j=None, v=None, enabled=True):
+        return {"name": name, "enabled": enabled, "agent": "claude", "mode": "clone", "vm": vm, "resources": None,
                 "job": None if j is None else j | {"progress": v}}
 
-    def dash(self, frames, tty=True, interrupt=True):
+    def dash(self, frames, tty=True):
         it = iter(frames)
 
         def collect(cfg):
@@ -309,19 +309,58 @@ class DashboardTests(CommandCase):
             return self.run_cmd(ab.cmd_dashboard, self.cfg,
                                 argparse.Namespace(watch=True, json=False, interval=2.0), tty=tty)
 
-    def test_one_record_per_profile_and_clear(self):
+    def test_one_record_per_profile(self):
         _, out = self.dash([
             [self.row("p", j=job("running"), v=view()), self.row("q", j=job("running"), v=view(stalled=True, age=60))],
-            [self.row("p", j=job("finished", 0), v=view()), self.row("q", vm="stopped")],
-            [self.row("p", j=job("finished", 0), v=view()), self.row("q", vm="stopped")],
+            [self.row("p", j=job("finished", 0), v=view()), self.row("q", j=job("running"), v=view(stalled=True, age=60))],
         ])
         self.assertEqual(records(out), [
             {"state": "working", "app": "agentbox", "id": "p"},
             {"state": "blocked", "kind": "other", "app": "agentbox", "id": "q", "msg": "no event for 1 min"},
             {"state": "done", "app": "agentbox", "id": "p"},
-            {"state": "clear", "id": "q"},
             {"state": "clear", "id": "p"},              # Ctrl-C: nothing is watched any more
+            {"state": "clear", "id": "q"},
         ])
+
+    def test_finished_jobs_stay_after_the_vm_stops_until_the_next_job(self):
+        lost = job("lost") | {"vm": "running"}          # process gone while the VM was up
+        _, out = self.dash([
+            [self.row("p", j=job("finished", 0)), self.row("q", j=job("finished", 2)), self.row("r", j=lost)],
+            [self.row("p", "stopped", job("finished", 0)), self.row("q", "stopped", job("finished", 2)),
+             self.row("r", "stopped", lost)],
+            [self.row("p", "stopped", job("finished", 0)), self.row("q", "missing", job("finished", 2)),
+             self.row("r", "stopped", lost)],
+            [self.row("p", j=job("running"), v=view()), self.row("q", "missing", job("finished", 2)),
+             self.row("r", "stopped", lost)],
+        ])
+        self.assertEqual(records(out)[:5], [
+            {"state": "done", "app": "agentbox", "id": "p"},
+            {"state": "error", "app": "agentbox", "id": "q", "msg": "exit 2"},
+            {"state": "error", "app": "agentbox", "id": "r", "msg": "job lost"},
+            {"state": "working", "app": "agentbox", "id": "p"},    # the next job replaces it
+            {"state": "clear", "id": "p"},                         # Ctrl-C
+        ])
+
+    def test_working_whose_vm_stopped_becomes_error(self):
+        died = job("lost") | {"vm": "stopped"}          # job_info's answer once the VM has stopped
+        _, out = self.dash([
+            [self.row("p", j=job("running"), v=view()), self.row("q", j=job("running"), v=view(stalled=True, age=60))],
+            [self.row("p", "stopped", died), self.row("q", "missing", job("lost") | {"vm": "missing"})],
+            [self.row("p", "stopped", died), self.row("q", "missing", job("lost") | {"vm": "missing"})],
+        ])
+        self.assertEqual([r for r in records(out) if r["state"] == "error"], [
+            {"state": "error", "app": "agentbox", "id": "p", "msg": "sandbox stopped"},
+            {"state": "error", "app": "agentbox", "id": "q", "msg": "sandbox missing"},
+        ])
+
+    def test_no_job_disabled_or_removed_clears(self):
+        _, out = self.dash([
+            [self.row("p", j=job("finished", 0)), self.row("q", j=job("finished", 0)),
+             self.row("r", j=job("finished", 0))],
+            [self.row("p", "stopped", job("none")), self.row("q", "disabled", enabled=False)],   # r: gone
+        ])
+        self.assertEqual([(r["state"], r["id"]) for r in records(out)],
+                         [("done", "p"), ("done", "q"), ("done", "r"), ("clear", "p"), ("clear", "q"), ("clear", "r")])
 
     def test_running_without_a_job_is_idle_and_unknown_keeps_state(self):
         _, out = self.dash([
@@ -329,13 +368,56 @@ class DashboardTests(CommandCase):
             [self.row("p", vm="unknown")],
             None,                                       # `sbx ls` failed: no change
             [self.row("p", j=job("none"))],
-            [],                                         # profile gone from the config
+            [self.row("p", "stopped", job("none"))],    # stopped, no job
         ])
         self.assertEqual(records(out), [{"state": "idle", "app": "agentbox", "id": "p"}, {"state": "clear", "id": "p"}])
+
+    def test_unknown_keeps_a_finished_record(self):
+        _, out = self.dash([[self.row("p", "stopped", job("finished", 0))], [self.row("p", "unknown")], None,
+                            [self.row("p", "stopped", job("finished", 0))]])
+        self.assertEqual([r["state"] for r in records(out)], ["done", "clear"])   # the clear is Ctrl-C
 
     def test_not_a_tty(self):
         _, out = self.dash([[self.row("p", j=job("running"), v=view())]], tty=False)
         self.assertEqual(records(out), [])
+
+
+class DashboardStoppedVmTests(CommandCase):
+    """collect_dashboard + dashboard_rex with the real job_info: a stopped VM is answered from the host."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        for name in ("vm_exec", "probe_job", "sbx_retry", "refresh_progress"):
+            p = mock.patch.object(ab, name, lambda *a, _n=name, **k: self.calls.append(_n))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def collect(self, vm):
+        with mock.patch.object(ab, "sandbox_states", lambda cfg: {self.prof.sandbox: vm}):
+            data = ab.collect_dashboard(self.cfg)
+        out = Tty()
+        with mock.patch.object(sys, "stdout", out):
+            ab.dashboard_rex(ab.RexStatus(True), data)
+        return data, records(out.getvalue())
+
+    def test_finished_job_on_a_stopped_vm(self):
+        ab.save_job_record(self.prof, dict(ab.NO_JOB) | {"id": JOB, "state": "finished", "exit_code": 0, "vm": "running"})
+        data, recs = self.collect("stopped")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(data["profiles"][0]["job"]["state"], "finished")
+        self.assertEqual(recs, [{"state": "done", "app": "agentbox", "id": "p"}])
+
+    def test_running_job_on_a_stopped_vm_is_never_probed(self):
+        ab.save_job_record(self.prof, dict(ab.NO_JOB) | {"id": JOB, "state": "running", "vm": "running"})
+        for vm in ("stopped", "missing"):
+            _, recs = self.collect(vm)
+            self.assertEqual(self.calls, [])
+            self.assertEqual(recs, [{"state": "error", "app": "agentbox", "id": "p", "msg": "sandbox stopped"}])
+
+    def test_no_job_on_a_stopped_vm(self):
+        _, recs = self.collect("stopped")
+        self.assertEqual((self.calls, recs), ([], []))
 
 
 if __name__ == "__main__":

@@ -3234,11 +3234,12 @@ def dashboard_entry(cfg: Config, name: str, states) -> dict:
         vm = sandbox_state(prof, states)
         row = {"name": name, "enabled": True, "sandbox": prof.sandbox, "agent": prof.d["agent"],
                "mode": prof.d["mode"], "vm": vm, "job": None, "resources": None}
-        if vm != "running":
+        if vm == "unknown":
             return row
-        r = vm_exec(prof, VM_STATS_SCRIPT)
-        row["resources"] = parse_vm_stats(r.stdout or "") if r.returncode == 0 else None
-        j = job_info(prof, states=states)
+        if vm == "running":
+            r = vm_exec(prof, VM_STATS_SCRIPT)
+            row["resources"] = parse_vm_stats(r.stdout or "") if r.returncode == 0 else None
+        j = job_info(prof, states=states)       # a stopped VM: host-side state only, as `status` does
         row["job"] = public_job(j) | {"progress": status_progress(prof, j, states)}
         return row
     except SystemExit:
@@ -3386,20 +3387,31 @@ def cmd_dashboard(cfg: Config, args) -> int:
 
 
 def dashboard_rex(rex: RexStatus, data: dict):
-    """One record per running profile (id = profile name); `clear` once it stops running. A profile whose
-    state can't be read keeps its last record, so a flaky `sbx ls` doesn't clear and re-notify."""
+    """One record per profile (id = profile name) that follows its latest job, whatever the VM's state:
+    done/error stay until the next job starts. A record is cleared only when the profile has no job, is
+    disabled or is gone from the config. A profile whose state can't be read keeps its last record, so a
+    flaky `sbx ls` doesn't clear and re-notify."""
     if not data["sandboxes_known"]:
         return
-    running = set()
+    keep = set()
     for row in data["profiles"]:
-        if row.get("vm") == "unknown":
-            running.add(row["name"])
-        elif row.get("vm") == "running":
-            running.add(row["name"])
-            rex.report(rex_fields(row["job"] or NO_JOB, (row["job"] or {}).get("progress")), row["name"])
+        vm, j = row.get("vm"), row.get("job") or NO_JOB
+        if vm == "unknown":
+            keep.add(row["name"])
+        elif vm == "running" or (row.get("enabled") and j["state"] != "none"):
+            keep.add(row["name"])
+            rex.report(dashboard_fields(j), row["name"])
     for rid in rex.ids():
-        if rid not in running:
+        if rid not in keep:
             rex.clear(rid)
+
+
+def dashboard_fields(j: dict) -> dict:
+    """`rex_fields` for a dashboard row's job. A job that died with its sandbox (found lost while the VM
+    was not running) is an error that says so."""
+    if j["state"] == "lost" and j.get("vm") in ("stopped", "missing"):
+        return {"state": "error", "msg": f"sandbox {j['vm']}"}
+    return rex_fields(j, j.get("progress"))
 
 
 def describe_tool(t: dict) -> dict:
