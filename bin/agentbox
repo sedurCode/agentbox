@@ -16,6 +16,7 @@ Docker Sandboxes (`sbx`).
     agentbox provision <name>    guided setup of a new profile (--yes, --dry-run, --up)
     agentbox status              sandboxes and bridges (--json)
     agentbox dashboard           running sandboxes at a glance: uptime, idle, tokens, cpu (--watch, --json)
+    agentbox dashboard -i        interactive: every profile, its job and plan; watch, logs, fetch
     agentbox doctor [<profile>]  sanity / security checks (--json)
     agentbox bridge <profile>    run the host-tool bridge in the foreground
     agentbox run <profile> (--prompt-file F | --prompt T) [--detach]   headless agent job
@@ -42,6 +43,7 @@ if sys.version_info < (3, 11):          # before anything that needs 3.11 (tomll
 import argparse
 import base64
 import calendar
+import collections
 import contextlib
 import datetime
 import fnmatch
@@ -49,6 +51,7 @@ import hashlib
 import hmac
 import html
 import http.server
+import io
 import json
 import os
 import re
@@ -62,6 +65,7 @@ import subprocess
 import textwrap
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -3479,12 +3483,16 @@ class Style:
         return f"\x1b[{self.CODES[kind]}m{text}\x1b[0m" if self.on else text
 
 
+def bar_colour(pct: float) -> str:
+    return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
+
+
 def bar(pct, st: Style, width: int = 20) -> str:
     if pct is None:
         return st("dim", "░" * width) + "    ?"
     pct = max(0.0, min(100.0, float(pct)))
     n = round(pct * width / 100)
-    colour = "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
+    colour = bar_colour(pct)
     return st(colour, "█" * n) + st("dim", "░" * (width - n)) + f" {pct:3.0f}%"
 
 
@@ -3558,8 +3566,15 @@ def dashboard_lines(data: dict, st: Style, width: int = 78) -> list[str]:
 def cmd_dashboard(cfg: Config, args) -> int:
     if args.json and args.watch:
         die("--json cannot be combined with --watch", EXIT_USAGE)
+    interactive = getattr(args, "interactive", False)
+    if interactive and (args.json or args.watch):
+        die("--interactive cannot be combined with --json or --watch", EXIT_USAGE)
     if args.interval < 2:
         die("--interval must be at least 2 seconds", EXIT_USAGE)
+    if interactive:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            die("--interactive needs a terminal; use --watch or --json otherwise", EXIT_USAGE)
+        return dashboard_ui(lambda: collect_dashboard(cfg), args.interval, RexStatus(rex_wanted()))
     tty = sys.stdout.isatty()
     st = Style(tty and "NO_COLOR" not in os.environ)
     width = max(60, min(100, shutil.get_terminal_size((78, 24)).columns - 2))
@@ -3608,6 +3623,718 @@ def dashboard_fields(j: dict) -> dict:
     if j["state"] == "lost" and j.get("vm") in ("stopped", "missing"):
         return {"state": "error", "msg": f"sandbox {j['vm']}"}
     return rex_fields(j, j.get("progress"))
+
+
+# ---------------------------------------------------- interactive dashboard
+# `dashboard --interactive`: a full-screen curses UI over collect_dashboard(). Only dashboard_ui() and
+# DashScreen touch curses; the rest is plain functions over plain data (the rows, a UI-state dict, lines
+# of (text, style) segments), so tests need no terminal. Every piece of text reaches the screen through
+# dash_line(), which runs it through safe_text and replaces what is left of the control, format and
+# combining characters, so a line is exactly as many cells wide as asked and curses never sees a control.
+DASH_MIN_W, DASH_MIN_H, DASH_WIDE = 60, 15, 100       # smallest usable pane; side-by-side from this width
+DASH_STATES = {     # display state: (glyph, ASCII glyph, style, label, sort group)
+    "working": ("●", "*", "green", "working", 0),
+    "stalled": ("◐", "~", "yellow", "stalled", 1),
+    "error": ("✗", "x", "red", "failed", 1),
+    "lost": ("◌", "!", "red", "lost", 1),
+    "done": ("✓", "+", "cyan", "done", 2),
+    "nojob": ("○", "o", "", "no job", 3),
+    "stopped": ("□", "-", "dim", "stopped", 3),
+    "disabled": ("⊘", "/", "dim", "disabled", 3),
+    "unknown": ("?", "?", "yellow", "unknown", 3),
+}
+DASH_VM_STYLE = {"running": "green", "stopped": "dim", "missing": "dim", "unknown": "yellow", "disabled": "dim"}
+DASH_STEP = {"done": ("✓", "+", "green"), "active": ("▶", ">", "bold"), "pending": ("·", "-", "dim")}
+DASH_SPARK, DASH_SPARK_ASCII = "▁▂▃▄▅▆▇█", "_.-:=+*#"
+DASH_HELP = [("↑ ↓  j k", "select a profile (or click it)"), ("Home End", "first / last profile"),
+             ("wheel", "scroll the list or the details"), ("Enter  p", "watch the job: agentbox progress --watch"),
+             ("l", "the job's log in a pager ($PAGER)"), ("f", "fetch the job's commits (asks first)"),
+             ("r", "refresh now"), ("?", "this help"), ("q  Ctrl-C", "quit")]
+DASH_HISTORY, DASH_HISTORY_JOBS = 120, 64            # samples per job, jobs remembered
+
+
+def dash_state(row: dict) -> str:
+    """A dashboard row (dashboard_entry's shape) -> a DASH_STATES key."""
+    vm = row.get("vm")
+    if vm == "disabled" or row.get("enabled") is False:
+        return "disabled"
+    if row.get("error"):
+        return "unknown"
+    job = row.get("job") or {}
+    state = job.get("state")
+    if state == "running":
+        return "stalled" if (job.get("progress") or {}).get("stalled") else "working"
+    if state == "finished":
+        return "done" if job.get("exit_code") == 0 else "error"
+    if state == "lost":
+        return "lost"
+    if vm == "running":
+        return "nojob"
+    if vm in ("stopped", "missing"):
+        return "stopped"
+    return "unknown"
+
+
+def dash_sort(rows: list) -> list:
+    """Working first, then the ones needing attention (stalled, failed, lost), then finished, then the rest;
+    by name within each group."""
+    return sorted(rows, key=lambda r: (DASH_STATES[dash_state(r)][4], str(r.get("name"))))
+
+
+def dash_clean(s) -> str:
+    """safe_text, then a space for tab and newline and '?' for any control, format, private-use,
+    unassigned, combining or separator character left: what remains is one or two cells each."""
+    out = []
+    for ch in safe_text("" if s is None else s):
+        cat = unicodedata.category(ch)
+        out.append(" " if ch in "\t\n" else "?" if cat[0] == "C" or cat in ("Mn", "Me", "Zl", "Zp") else ch)
+    return "".join(out)
+
+
+def _cell(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def dash_cells(s: str) -> int:
+    """Width in terminal cells of text that went through dash_clean."""
+    return sum(_cell(ch) for ch in s)
+
+
+def _clip(s: str, w: int) -> tuple[str, int]:
+    out, used = [], 0
+    for ch in s:
+        c = _cell(ch)
+        if used + c > w:
+            break
+        out.append(ch)
+        used += c
+    return "".join(out), used
+
+
+def dash_line(segs, width: int, ascii_: bool = False) -> list:
+    """Segments -> segments whose text is clean and exactly `width` cells wide: clipped with an
+    ellipsis, or padded with spaces."""
+    if width <= 0:
+        return []
+    segs = [(dash_clean(t), st) for t, st in segs if t]
+    if sum(dash_cells(t) for t, _ in segs) > width:
+        out, room = [], width - 1
+        for t, st in segs:
+            part, used = _clip(t, room)
+            if part:
+                out.append((part, st))
+            room -= used
+            if part != t:
+                break
+        segs = out + [(" " * room + ("~" if ascii_ else "…"), out[-1][1] if out else "")]
+    used = sum(dash_cells(t) for t, _ in segs)
+    return segs + [(" " * (width - used), "")] if used < width else segs
+
+
+def sparkline(values, width: int, ascii_: bool = False) -> str:
+    """The last `width` values as block characters, scaled to the largest, right-aligned in exactly
+    `width` cells. None is a gap; 0 is the lowest block; anything above 0 is at least the second."""
+    if width <= 0:
+        return ""
+    chars = DASH_SPARK_ASCII if ascii_ else DASH_SPARK
+    vals = list(values)[-width:]
+    top = max((v for v in vals if v is not None), default=0)
+    out = []
+    for v in vals:
+        if v is None:
+            out.append(" ")
+        elif v <= 0 or top <= 0:
+            out.append(chars[0])
+        else:
+            out.append(chars[max(1, min(len(chars) - 1, round(v * (len(chars) - 1) / top)))])
+    return " " * (width - len(out)) + "".join(out)
+
+
+def _int_or_none(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+class DashHistory:
+    """In memory only: per job id, a ring buffer of the job's running totals (tokens, tool calls), one
+    sample per collection. Keeps the DASH_HISTORY_JOBS most recently seen jobs."""
+    KEYS = ("tokens", "tools")
+
+    def __init__(self, size: int = DASH_HISTORY, jobs: int = DASH_HISTORY_JOBS):
+        self.size, self.max_jobs, self.jobs = size, jobs, {}
+
+    def add(self, data: dict):
+        for row in (data or {}).get("profiles") or []:
+            job = row.get("job") or {}
+            jid, view = job.get("id"), job.get("progress")
+            if not isinstance(jid, str) or not isinstance(view, dict):
+                continue
+            rings = self.jobs.pop(jid, None) or {k: collections.deque(maxlen=self.size + 1) for k in self.KEYS}
+            self.jobs[jid] = rings                      # most recently seen last
+            rings["tokens"].append(_int_or_none((view.get("tokens") or {}).get("total")))
+            rings["tools"].append(_int_or_none(view.get("tool_calls")))
+        while len(self.jobs) > self.max_jobs:
+            del self.jobs[next(iter(self.jobs))]
+
+    def totals(self, jid, key: str) -> list:
+        return list(self.jobs.get(jid, {}).get(key, ()))
+
+    def deltas(self, jid, key: str) -> list:
+        """How much the total grew between consecutive samples (None where a sample was missing)."""
+        v = self.totals(jid, key)
+        return [None if a is None or b is None else max(0, b - a) for a, b in zip(v, v[1:])]
+
+
+def dash_layout(width: int, height: int, nrows: int) -> dict | None:
+    """Where the profile list and the details go, as (x, y, w, h); None if the pane is too small.
+    Row 0 is the header and the last row the footer."""
+    if width < DASH_MIN_W or height < DASH_MIN_H:
+        return None
+    body = height - 2
+    if width >= DASH_WIDE:
+        lw = max(30, min(46, width // 3))
+        return {"stacked": False, "list": (0, 1, lw, body), "detail": (lw + 1, 1, width - lw - 1, body)}
+    lh = max(3, min(max(nrows, 1), body // 3))
+    return {"stacked": True, "list": (0, 1, width, lh), "detail": (0, lh + 2, width, body - lh - 1)}
+
+
+def dash_new_ui(size=(80, 24)) -> dict:
+    """The UI state dash_key and dash_render share. `names` is the sorted profile names, `sel` an index
+    into it, `top` / `dtop` the scroll of the list / details, `mode` list | help | confirm."""
+    return {"names": [], "sel": 0, "top": 0, "dtop": 0, "size": tuple(size), "mode": "list", "target": None,
+            "msg": "", "busy": False, "error": ""}
+
+
+def dash_set_rows(ui: dict, names: list) -> dict:
+    """New data arrived: keep the same profile selected if it is still there."""
+    old = ui["names"][ui["sel"]] if ui["names"] else None
+    sel = names.index(old) if old in names else min(ui["sel"], max(0, len(names) - 1))
+    return _dash_follow({**ui, "names": list(names), "sel": sel}, sel)
+
+
+def _dash_follow(ui: dict, sel: int) -> dict:
+    """Select `sel` and scroll the list so it is visible."""
+    n = len(ui["names"])
+    sel = max(0, min(sel, n - 1)) if n else 0
+    lay = dash_layout(*ui["size"], n)
+    top = ui["top"]
+    if lay:
+        lh = lay["list"][3]
+        top = min(top, sel) if sel < top else max(top, sel - lh + 1)
+        top = max(0, min(top, max(0, n - lh)))
+    return {**ui, "sel": sel, "top": top, "dtop": 0 if sel != ui["sel"] else ui["dtop"]}
+
+
+def _inside(rect, x, y) -> bool:
+    rx, ry, rw, rh = rect
+    return rx <= x < rx + rw and ry <= y < ry + rh
+
+
+def dash_key(ui: dict, key) -> tuple[dict, tuple | None]:
+    """(UI state, key) -> (new UI state, action or None). A key is a character, a name ("up", "down",
+    "home", "end", "pgup", "pgdn", "enter", "esc", "ctrl-c", "resize"), ("click", x, y) or
+    ("wheel", +1/-1, x, y). Actions: ("quit",), ("refresh",), ("redraw",), ("progress", name),
+    ("logs", name), ("confirm_fetch", name) and, only straight after a confirm_fetch and a "y",
+    ("fetch", name). The loop runs them; dash_argv says how."""
+    ui = {**ui, "msg": ""}
+    n = len(ui["names"])
+    name = ui["names"][ui["sel"]] if n else None
+    if key == "resize":
+        return _dash_follow(ui, ui["sel"]), ("redraw",)
+    if ui["mode"] == "confirm":
+        target, ui = ui["target"], {**ui, "mode": "list", "target": None}
+        if key in ("y", "Y") and target:
+            return ui, ("fetch", target)
+        return {**ui, "msg": "fetch cancelled"}, None
+    if ui["mode"] == "help":
+        return {**ui, "mode": "list"}, ("quit",) if key in ("q", "ctrl-c") else None
+    if key in ("q", "Q", "ctrl-c"):
+        return ui, ("quit",)
+    lay = dash_layout(*ui["size"], n)
+    page = lay["list"][3] if lay else 1
+    moves = {"up": -1, "k": -1, "down": 1, "j": 1, "pgup": -page, "pgdn": page}
+    if key in moves:
+        return _dash_follow(ui, ui["sel"] + moves[key]), None
+    if key in ("home", "g"):
+        return _dash_follow(ui, 0), None
+    if key in ("end", "G"):
+        return _dash_follow(ui, n - 1), None
+    if key == "r":
+        return ui, ("refresh",)
+    if key == "?":
+        return {**ui, "mode": "help"}, None
+    if isinstance(key, tuple) and lay:
+        kind, *rest = key
+        if kind == "click":
+            x, y = rest
+            lx, ly, lw, lh = lay["list"]
+            if _inside(lay["list"], x, y) and ui["top"] + y - ly < n:
+                return _dash_follow(ui, ui["top"] + y - ly), None
+        elif kind == "wheel":
+            step, x, y = rest
+            if _inside(lay["detail"], x, y):
+                return {**ui, "dtop": max(0, ui["dtop"] + 3 * step)}, None
+            return {**ui, "top": max(0, min(ui["top"] + 3 * step, max(0, n - lay["list"][3])))}, None
+        return ui, None
+    if name is None:
+        return ui, None
+    if key in ("enter", "p"):
+        return ui, ("progress", name)
+    if key == "l":
+        return ui, ("logs", name)
+    if key == "f":
+        return {**ui, "mode": "confirm", "target": name}, ("confirm_fetch", name)
+    return ui, None
+
+
+def dash_argv(action) -> list[str] | None:
+    """The agentbox arguments for an action that runs a command, or None. These three are the only
+    commands the dashboard ever runs, and never with another flag."""
+    kind, name = (tuple(action) + (None, None))[:2]
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        return None
+    return {"progress": ["progress", name, "--watch"], "logs": ["logs", name], "fetch": ["fetch", name]}.get(kind)
+
+
+def _dash_clock(iso, now: float) -> str:
+    t = iso_epoch(iso) if isinstance(iso, str) else None
+    if t is None:
+        return "-"
+    fmt = "%H:%M:%S" if time.localtime(t)[:3] == time.localtime(now)[:3] else "%b %d %H:%M"
+    return time.strftime(fmt, time.localtime(t))
+
+
+def _dash_dur(v, precise: bool = False) -> str:
+    return fmt_dur(v, precise) if _int_or_none(v) is not None else "-"
+
+
+def _dash_count(v) -> str:
+    return fmt_count(v) if _int_or_none(v) is not None and v >= 0 else "-"
+
+
+def dash_when(row: dict, now: float) -> str:
+    """The list's time column: a running job's elapsed time, or how long ago an ended job finished."""
+    st, job = dash_state(row), row.get("job") or {}
+    if st in ("working", "stalled"):
+        return _dash_dur((job.get("progress") or {}).get("elapsed_s"))
+    if st in ("done", "error", "lost"):
+        t = iso_epoch(job.get("finished_at")) if isinstance(job.get("finished_at"), str) else None
+        return f"{fmt_dur(max(0, now - t))} ago" if t is not None else "-"
+    return ""
+
+
+def dash_bar(pct, width: int, ascii_: bool) -> list:
+    if pct is None:
+        return [(("-" if ascii_ else "░") * width, "dim"), ("    ?", "")]
+    pct = max(0.0, min(100.0, float(pct)))
+    n = round(pct * width / 100)
+    full, empty = ("#", "-") if ascii_ else ("█", "░")
+    return [(full * n, bar_colour(pct)), (empty * (width - n), "dim"), (f" {pct:3.0f}%", "")]
+
+
+def dash_list(rows: list, ui: dict, w: int, h: int, now: float, ascii_: bool) -> list:
+    top = max(0, min(ui["top"], max(0, len(rows) - h)))
+    nw = max(8, min(41, w - 25))
+    out = []
+    for i, row in enumerate(rows[top:top + h], top):
+        g, ga, style, _, _ = DASH_STATES[dash_state(row)]
+        sel = " sel" if i == ui["sel"] else ""
+        name, used = _clip(dash_clean(row.get("name")), nw)
+        text = f"{name}{' ' * (nw - used)} {dash_clean(row.get('agent') or '-'):<8.8} {dash_when(row, now):>11} "
+        out.append(dash_line([(" ", sel), (ga if ascii_ else g, (style + sel).strip()), (" ", sel), (text, sel.strip())],
+                             w, ascii_))
+    return out
+
+
+def dash_detail(row: dict, history: DashHistory, w: int, now: float, ascii_: bool) -> list:
+    """Unclipped segment lists describing one profile; dash_render cuts them to the panel."""
+    st = dash_state(row)
+    g, ga, style, label, _ = DASH_STATES[st]
+    L = [[(ga if ascii_ else g, style), (" ", ""), (row.get("name"), "bold"), (f"  {label}", style),
+          (f"   {row.get('agent') or '-'} {'/' if ascii_ else '·'} {row.get('mode') or '-'}", "dim")]]
+    if row.get("error"):
+        L.append([("this profile could not be read (try `agentbox doctor` for it)", "red")])
+    vm, res = row.get("vm") or "unknown", row.get("resources")
+    head = [("VM   ", "bold"), (vm, DASH_VM_STYLE.get(vm, ""))]
+    if vm == "running" and isinstance(res, dict):
+        load = res.get("load")
+        head.append((f"   up {_dash_dur(res.get('uptime_s'))}", ""))
+        if isinstance(load, list) and len(load) == 3 and all(isinstance(x, (int, float)) for x in load):
+            head.append((f"   load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}", "dim"))
+        if _int_or_none(res.get("cpus")):
+            head.append((f"   {res['cpus']} cpu", "dim"))
+    L += [[], head]
+    if vm == "running":
+        if not isinstance(res, dict):
+            L.append([("     running, but the VM could not be read", "yellow")])
+        else:
+            bw = max(10, min(30, w - 34))
+
+            def pct(used, total):
+                return 100 * used / total if _int_or_none(used) is not None and _int_or_none(total) else None
+            for lbl, p, extra in (
+                    ("cpu", res.get("cpu_pct") if isinstance(res.get("cpu_pct"), (int, float)) else None, ""),
+                    ("memory", pct(res.get("mem_used"), res.get("mem_total")), (res.get("mem_used"), res.get("mem_total"))),
+                    ("disk", pct(res.get("disk_used"), res.get("disk_total")), (res.get("disk_used"), res.get("disk_total")))):
+                tail = f"  {fmt_bytes(extra[0])}/{fmt_bytes(extra[1])}" if extra and p is not None else ""
+                L.append([(f"     {lbl:<7}", "")] + dash_bar(p, bw, ascii_) + [(tail, "dim")])
+    job = row.get("job") or {}
+    L.append([])
+    if job.get("state") in (None, "none") or not job.get("id"):
+        L.append([("job  ", "bold"), ("none", "dim")])
+        return L
+    view = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    jstate = job.get("state")
+    jstyle = {"running": "green", "finished": "cyan" if job.get("exit_code") == 0 else "red", "lost": "red"}
+    L.append([("job  ", "bold"), (job.get("id"), ""), ("  ", ""), (jstate, jstyle.get(jstate, ""))]
+             + ([("  STALLED", "red bold")] if view.get("stalled") else []))
+    code = job.get("exit_code")
+    L.append([(f"     started {_dash_clock(job.get('started_at'), now)}   finished {_dash_clock(job.get('finished_at'), now)}"
+               f"   exit {code if _int_or_none(code) is not None else '-'}", "")])
+    L.append([(f"     elapsed {_dash_dur(view.get('elapsed_s'), True)}   idle {_dash_dur(view.get('last_event_age_s'), True)}"
+               f"   turns {_dash_count(view.get('turns'))}   tool calls {_dash_count(view.get('tool_calls'))}", "")])
+    tools = [t for t in view.get("tools_top") or [] if isinstance(t, dict)]
+    if tools:
+        L.append([("     tools   ", ""), (", ".join(f"{t.get('name')} {_dash_count(t.get('count'))}" for t in tools), "dim")])
+    commits, expect = _int_or_none(view.get("commits")), _int_or_none(view.get("expect_commits"))
+    tok = view.get("tokens") if isinstance(view.get("tokens"), dict) else {}
+    cache = [_int_or_none(tok.get(k)) for k in ("cache_read", "cache_creation")]
+    cost = view.get("cost_usd")
+    cost = (f"{'~' if view.get('cost_is_estimate') else ''}${cost:.2f}"
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "-")
+    L.append([(f"     commits {'-' if commits is None else commits}{f'/{expect}' if commits is not None and expect else ''}"
+               f"   tokens {_dash_count(tok.get('total'))}", ""),
+              (f" (in {_dash_count(tok.get('input'))} out {_dash_count(tok.get('output'))}"
+               f" cache {_dash_count(sum(cache) if None not in cache else None)})", "dim"),
+              ("   cost ", ""), (cost, "")])
+    if view.get("stale"):
+        L.append([("     (cached values: the sandbox could not be read)", "dim")])
+    sw = max(8, min(60, w - 30))
+    for lbl, key in (("tokens", "tokens"), ("tool calls", "tools")):
+        d = history.deltas(job.get("id"), key)
+        line = [(f"     {lbl:<11}", "")]
+        line += [(sparkline(d, sw, ascii_), "cyan"), ("  per refresh", "dim")] if d else [("(after the next refresh)", "dim")]
+        L.append(line)
+    plan = view.get("plan") if isinstance(view.get("plan"), dict) else None
+    steps = [s for s in (plan or {}).get("steps") or [] if isinstance(s, dict)]
+    if steps:
+        L += [[], [("plan ", "bold"), (f"{_dash_count(plan.get('done'))}/{_dash_count(plan.get('total'))}", ""),
+                   ("   agent's plan, not verified", "dim")]]
+        for s in steps:
+            sg, sa, sst = DASH_STEP.get(s.get("status"), DASH_STEP["pending"])
+            L.append([("     ", ""), (sa if ascii_ else sg, sst), (" ", ""), (s.get("text"), sst if sst != "green" else "")])
+    if view.get("note"):
+        L.append([("note ", "bold"), (view.get("note"), ""), ("   agent's note", "dim")])
+    return L
+
+
+def _dash_box(title: str, body: list, w: int, ascii_: bool) -> list:
+    """A framed box (list of segment lists) at most w cells wide, for the help and confirm overlays."""
+    inner = min(w - 4, max([dash_cells(dash_clean(title)) + 2] + [sum(dash_cells(dash_clean(t)) for t, _ in ln) for ln in body]))
+    h, v, tl, tr, bl, br = ("-", "|", "+", "+", "+", "+") if ascii_ else ("─", "│", "╭", "╮", "╰", "╯")
+    title = dash_clean(title)
+    out = [[(f"{tl}{h} {title} " + h * (inner - 1 - dash_cells(title)) + tr, "bold")]]
+    out += [[(v + " ", "bold")] + dash_line(ln, inner, ascii_) + [(" " + v, "bold")] for ln in body]
+    out.append([(bl + h * (inner + 2) + br, "bold")])
+    return out
+
+
+def dash_render(data, ui: dict, history: DashHistory, size, now: float | None = None, ascii_: bool = False) -> list:
+    """The whole screen: `size[1]` lines of (text, style) segments, each exactly `size[0]` cells wide."""
+    w, h = size
+    if w <= 0 or h <= 0:
+        return []
+    now = time.time() if now is None else now
+    rows = dash_sort((data or {}).get("profiles") or [])
+    lay = dash_layout(w, h, len(rows))
+    if lay is None:
+        msg = f"make the pane bigger: at least {DASH_MIN_W}x{DASH_MIN_H} (now {w}x{h})"
+        lines = [dash_line([], w) for _ in range(h)]
+        lines[h // 2] = dash_line([(" " * max(0, (w - len(msg)) // 2), ""), (msg, "yellow")], w, ascii_)
+        return lines
+    # header
+    head = [(" agentbox", "bold")]
+    if data:
+        head += [(f"   {sum(r.get('vm') == 'running' for r in rows)} running", ""),
+                 (f"   {time.strftime('%H:%M:%S', time.localtime(data.get('generated_at') or now))}", "dim")]
+    head += [("   refreshing…" if not ascii_ else "   refreshing...", "cyan")] if ui.get("busy") else []
+    if data and not data.get("sandboxes_known", True):
+        head.append(("   could not list sandboxes (`sbx ls --json` failed)", "red bold"))
+    if ui.get("error"):
+        head.append((f"   {ui['error']}", "red bold"))
+    # list and details
+    lx, ly, lw, lh = lay["list"]
+    dx, dy, dw, dh = lay["detail"]
+    if rows:
+        left = dash_list(rows, ui, lw, lh, now, ascii_)
+        sel = rows[max(0, min(ui["sel"], len(rows) - 1))]
+        detail = dash_detail(sel, history, dw - 1, now, ascii_)
+    else:
+        left = [dash_line([(" collecting…" if data is None else " no profiles in agentbox.toml", "dim")], lw, ascii_)]
+        detail = []
+    left += [dash_line([], lw)] * (lh - len(left))
+    dtop = max(0, min(ui.get("dtop", 0), max(0, len(detail) - dh)))
+    right = [dash_line([(" ", "")] + seg, dw, ascii_) for seg in detail[dtop:dtop + dh]]
+    right += [dash_line([], dw)] * (dh - len(right))
+    if lay["stacked"]:
+        rule = "-" if ascii_ else "─"
+        n = len(rows)
+        top = max(0, min(ui["top"], n - lh))
+        span = f" {top + 1}-{top + lh} of {n} " if n > lh else ""
+        body = left + [dash_line([(rule * 2 + span + rule * max(0, w - 2 - len(span)), "dim")], w, ascii_)] + right
+    else:
+        bar_ = "|" if ascii_ else "│"
+        body = [left[i] + [(bar_, "dim")] + right[i] for i in range(h - 2)]
+    # overlays
+    box = None
+    if ui.get("mode") == "help":
+        help_ = [("Up Dn  j k", d) if ascii_ and i == 0 else (k, d) for i, (k, d) in enumerate(DASH_HELP)]
+        kw = max(dash_cells(k) for k, _ in help_)
+        box = _dash_box("keys", [[(f"{k:<{kw}}  ", "bold"), (d, "")] for k, d in help_]
+                        + [[], [("any key closes this", "dim")]], w, ascii_)
+    elif ui.get("mode") == "confirm" and ui.get("target"):
+        box = _dash_box("fetch", [[("This runs:", "")], [("  " + shlex.join(["agentbox", "fetch", ui["target"]]), "bold")],
+                                  [], [("y", "bold"), (" to run it, any other key cancels", "")]], w, ascii_)
+    if box:
+        top = max(0, (len(body) - len(box)) // 2)
+        bw = sum(dash_cells(t) for t, _ in box[0])
+        for i, ln in enumerate(box[:len(body)]):
+            body[top + i] = dash_line([(" " * max(0, (w - bw) // 2), "")] + ln, w, ascii_)
+    # footer
+    if ui.get("msg"):
+        foot = [(" " + ui["msg"], "yellow")]
+    elif ui.get("mode") == "confirm":
+        foot = [(" y", "bold"), (" fetch   ", ""), ("any other key", "bold"), (" cancel", "")]
+    else:
+        keys = (("j/k" if ascii_ else "↑↓", "select"), ("Enter", "progress"), ("l", "logs"), ("f", "fetch"),
+                ("r", "refresh"), ("?", "help"), ("q", "quit"))
+        foot = [s for k, d in keys for s in ((f" {k}", "bold"), (f" {d}  ", "dim"))]
+    return [dash_line(head, w, ascii_)] + body + [dash_line(foot, w, ascii_)]
+
+
+class DashCollector:
+    """Runs collect() in a worker thread so the UI stays responsive while sbx is slow; never two at once."""
+
+    def __init__(self, collect):
+        self.collect, self.lock, self.running, self.result = collect, threading.Lock(), False, None
+
+    def start(self) -> bool:
+        with self.lock:
+            if self.running:
+                return False
+            self.running = True
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def _run(self):
+        try:
+            res = ("ok", self.collect())
+        except (Exception, SystemExit) as e:        # die() in a worker must not end the UI
+            res = ("error", e)
+        with self.lock:
+            self.result, self.running = res, False
+
+    def take(self):
+        """The last finished collection's ("ok", data) or ("error", exception), once; else None."""
+        with self.lock:
+            res, self.result = self.result, None
+            return res
+
+
+def agentbox_argv(args: list[str]) -> list[str]:
+    """This same agentbox, run as a child process."""
+    return [sys.executable, str(Path(__file__).resolve()), *args]
+
+
+def dash_pager() -> list[str]:
+    try:
+        argv = shlex.split(os.environ.get("PAGER") or "")
+    except ValueError:
+        argv = []
+    return argv or ["less", "-R"]
+
+
+class DashScreen:
+    """The curses side of `dashboard --interactive`: draw dash_render's lines, turn curses input into
+    dash_key's keys, run the actions."""
+
+    def __init__(self, scr, curses, collect, interval: float, rex: RexStatus, ascii_: bool):
+        self.scr, self.c, self.coll, self.interval, self.rex, self.ascii = scr, curses, DashCollector(collect), interval, rex, ascii_
+        self.history, self.data, self.attrs = DashHistory(), None, {}
+
+    def setup(self):
+        c = self.c
+        with contextlib.suppress(c.error):
+            c.curs_set(0)
+        self.scr.keypad(True)
+        self.scr.timeout(200)
+        buttons = c.BUTTON1_PRESSED | c.BUTTON1_CLICKED | c.BUTTON4_PRESSED | getattr(c, "BUTTON5_PRESSED", 0)
+        with contextlib.suppress(c.error):
+            c.mousemask(buttons)
+            c.mouseinterval(0)
+        colour = c.has_colors() and "NO_COLOR" not in os.environ
+        a = {"": 0, "bold": c.A_BOLD, "dim": c.A_DIM, "sel": c.A_REVERSE}
+        plain = {"red": c.A_BOLD, "yellow": c.A_BOLD, "green": 0, "cyan": 0}
+        if colour:
+            try:
+                c.use_default_colors()
+                bg = -1                          # the terminal's own background: fits light and dark themes
+            except c.error:
+                bg = c.COLOR_BLACK
+            for i, (k, fg) in enumerate((("red", c.COLOR_RED), ("green", c.COLOR_GREEN),
+                                         ("yellow", c.COLOR_YELLOW), ("cyan", c.COLOR_CYAN)), 1):
+                try:
+                    c.init_pair(i, fg, bg)
+                    a[k] = c.color_pair(i)
+                except c.error:
+                    a[k] = plain[k]
+        else:
+            a.update(plain)
+        self.attrs = a
+
+    def attr(self, style: str) -> int:
+        v = 0
+        for k in style.split():
+            v |= self.attrs.get(k, 0)
+        return v
+
+    def draw(self, lines: list):
+        self.scr.erase()
+        for y, segs in enumerate(lines):
+            x = 0
+            for text, style in segs:
+                with contextlib.suppress(self.c.error):     # the bottom-right cell "fails" after writing
+                    self.scr.addstr(y, x, text, self.attr(style))
+                x += dash_cells(text)
+        self.scr.refresh()
+
+    def read_key(self):
+        c = self.c
+        try:
+            ch = self.scr.get_wch()
+        except c.error:
+            return None                         # timeout: no key
+        if isinstance(ch, str):
+            return {"\n": "enter", "\r": "enter", "\x03": "ctrl-c", "\x1b": "esc"}.get(ch, ch)
+        if ch == c.KEY_MOUSE:
+            try:
+                _, x, y, _, bstate = c.getmouse()
+            except c.error:
+                return None
+            if bstate & c.BUTTON4_PRESSED:
+                return ("wheel", -1, x, y)
+            if bstate & getattr(c, "BUTTON5_PRESSED", 0):
+                return ("wheel", 1, x, y)
+            if bstate & (c.BUTTON1_PRESSED | c.BUTTON1_CLICKED):
+                return ("click", x, y)
+            return None
+        return {c.KEY_UP: "up", c.KEY_DOWN: "down", c.KEY_HOME: "home", c.KEY_END: "end", c.KEY_PPAGE: "pgup",
+                c.KEY_NPAGE: "pgdn", c.KEY_ENTER: "enter", c.KEY_RESIZE: "resize"}.get(ch)
+
+    def run(self) -> int:
+        self.setup()
+        ui, next_at = dash_new_ui(), 0.0
+        while True:
+            res = self.coll.take()
+            if res and res[0] == "ok":
+                self.data = res[1]
+                self.history.add(self.data)
+                dashboard_rex(self.rex, self.data)
+                ui = dash_set_rows({**ui, "error": ""}, [r.get("name") for r in dash_sort(self.data.get("profiles") or [])])
+            elif res:
+                ui = {**ui, "error": f"refresh failed: {res[1]}"}
+            if res:
+                next_at = time.monotonic() + self.interval
+            if not self.coll.running and time.monotonic() >= next_at:
+                self.coll.start()
+            h, w = self.scr.getmaxyx()
+            ui = {**ui, "busy": self.coll.running, "size": (w, h)}
+            self.draw(dash_render(self.data, ui, self.history, (w, h), ascii_=self.ascii))
+            key = self.read_key()
+            if key is None:
+                continue
+            if key == "resize":
+                with contextlib.suppress(AttributeError, self.c.error):
+                    self.c.update_lines_cols()
+                h, w = self.scr.getmaxyx()
+                ui = {**ui, "size": (w, h)}
+            ui, action = dash_key(ui, key)
+            if not action:
+                continue
+            if action[0] == "quit":
+                return EXIT_OK
+            if action[0] == "refresh":
+                next_at = 0.0                   # starts now, unless one is already running
+            elif action[0] in ("progress", "logs", "fetch"):
+                ui = {**ui, "msg": self.suspend(action)}
+
+    def suspend(self, action) -> str:
+        """Leave curses, run the action's command in this terminal, come back. Returns a footer message."""
+        argv = dash_argv(action)
+        if argv is None:
+            return ""
+        c, msg = self.c, ""
+        c.def_prog_mode()
+        c.endwin()
+        # Ctrl-C belongs to the child while it runs. A Python handler (not SIG_IGN, which a child
+        # would inherit) keeps it from interrupting us; exec resets it to the default in the child.
+        old = signal.signal(signal.SIGINT, lambda *_: None)
+        env = {**os.environ, "AGENTBOX_NO_OSC": "1"}     # the dashboard keeps reporting this profile itself
+        rc = 0
+        try:
+            if action[0] == "logs":
+                rc, msg = self._logs(argv, env)
+            else:
+                print(f"\n$ {shlex.join(['agentbox', *argv])}", flush=True)
+                rc = subprocess.run(agentbox_argv(argv), env=env).returncode
+        finally:
+            signal.signal(signal.SIGINT, old)
+        if action[0] != "logs" and rc != -signal.SIGINT:
+            try:
+                input(f"\n[agentbox {argv[0]} exited {rc}; press Enter to return to the dashboard] ")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        c.reset_prog_mode()
+        self.scr.clear()
+        with contextlib.suppress(c.error):
+            c.curs_set(0)
+        return msg or (f"agentbox {argv[0]} exited {rc}" if rc not in (0, -signal.SIGINT) else "")
+
+    def _logs(self, argv: list[str], env: dict) -> tuple[int, str]:
+        """`agentbox logs` (it already sanitises every line) piped into the pager; argv lists, no shell."""
+        pager = dash_pager()
+        logs = subprocess.Popen(agentbox_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        try:
+            view = subprocess.Popen(pager, stdin=logs.stdout)
+        except OSError:
+            logs.kill()
+            logs.wait()
+            return 1, f"could not start the pager {safe_text(pager[0])!r} (set $PAGER)"
+        finally:
+            logs.stdout.close()
+        view.wait()
+        if logs.poll() is None:
+            logs.terminate()                    # the pager was closed before the end
+        logs.wait()
+        return view.returncode, ""
+
+
+def dashboard_ui(collect, interval: float, rex: RexStatus) -> int:
+    """`dashboard --interactive`. Rex records are written straight to stdout by dashboard_rex (they draw
+    nothing) and cleared on the way out, as `--watch` does."""
+    import curses
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+    ascii_ = "utf" not in (locale.getpreferredencoding(False) or "").lower().replace("-", "")
+    os.environ.setdefault("ESCDELAY", "25")
+    real_err, sys.stderr = sys.stderr, io.StringIO()   # info()/die() from the worker would scribble on the screen
+    try:
+        return curses.wrapper(lambda scr: DashScreen(scr, curses, collect, interval, rex, ascii_).run())
+    except KeyboardInterrupt:
+        return EXIT_OK
+    finally:
+        sys.stderr = real_err
+        for rid in rex.ids():                   # nothing is watched any more
+            rex.clear(rid)
 
 
 def describe_tool(t: dict) -> dict:
@@ -4591,7 +5318,10 @@ def main():
     p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("dashboard", help="live overview of the running sandboxes: uptime, idle, tokens, cpu, memory")
     p.add_argument("--watch", action="store_true", help="redraw until interrupted")
-    p.add_argument("--interval", type=float, default=5.0, metavar="S", help="seconds between --watch updates (default 5)")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="full-screen view of every profile: select one, watch its job, read its log, fetch (? for keys)")
+    p.add_argument("--interval", type=float, default=5.0, metavar="S",
+                   help="seconds between --watch / --interactive updates (default 5)")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("doctor"); p.add_argument("profile", nargs="?"); p.add_argument("--json", action="store_true")
     p.add_argument("--start", action="store_true", help="also check inside a stopped sandbox (boots it)")
