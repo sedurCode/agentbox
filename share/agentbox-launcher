@@ -11,7 +11,15 @@ while [ -h "$self" ]; do                # follow the ~/.local/bin symlink
   case $target in /*) self=$target ;; *) self=$dir/$target ;; esac
 done
 here=$(cd "$(dirname "$self")" && pwd)
-for py in python3.14 python3.13 python3.12 python3.11 python3; do
+# Started by a GUI app (Rex, an IDE) PATH may be just /usr/bin:/bin:/usr/sbin:/sbin, where python3 is
+# macOS's 3.9 and sbx is missing. Append where Homebrew, Linuxbrew and python.org install, after
+# whatever the caller has, so the caller's own choices still win.
+for dir in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin \
+           /Library/Frameworks/Python.framework/Versions/Current/bin; do
+  case ":$PATH:" in *":$dir:"*) ;; *) [ -d "$dir" ] && PATH=$PATH:$dir ;; esac
+done
+export PATH
+for py in python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
   if command -v "$py" >/dev/null 2>&1 &&
      "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
     exec "$py" "$here/agentbox.py" "$@"
