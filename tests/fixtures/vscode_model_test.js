@@ -38,11 +38,26 @@ assert.throws(() => M.parseDashboard("[]"));
 assert.throws(() => M.parseDashboard("nope"));
 assert.throws(() => M.parseDashboard(JSON.stringify({ profiles: [{ name: "a" }] })), /older/);   // an agentbox without `state`
 
-// transitions: none on first load, only into done/error/stalled/lost
-const before = M.stateMap({ profiles: [row("a", "working"), row("b", "working"), row("c", "nojob")] });
-const after = { profiles: [row("a", "done"), row("b", "working"), row("c", "interactive_working"), row("n", "error")] };
+// transitions: none on first load; a job that ended, once; a profile that became stalled
+const fin = (id, code) => ({ job: { id, state: "finished", exit_code: code } });
+const before = M.stateMap({ profiles: [row("a", "working"), row("b", "working"), row("c", "nojob", { job: null }),
+  row("s", "working")] });
+const after = { profiles: [row("a", "done", fin("j1", 0)), row("b", "working"), row("c", "interactive_working", { job: null }),
+  row("n", "error", fin("j1", 1)), row("s", "stalled")] };
 assert.deepStrictEqual(M.transitions(null, after), []);
-assert.deepStrictEqual(M.transitions(before, after), [{ name: "a", state: "done" }]);
+assert.deepStrictEqual(M.transitions(before, after), [{ name: "a", state: "done" }, { name: "s", state: "stalled" }]);
+// an interactive session closing drops back to an old job's outcome: no repeat
+const old = fin("j0", 0);
+const inter = M.stateMap({ profiles: [row("a", "interactive_idle", old), row("b", "interactive_idle", { job: { id: "j0", state: "lost" } })] });
+assert.deepStrictEqual(M.transitions(inter, { profiles: [row("a", "done", old), row("b", "lost", { job: { id: "j0", state: "lost" } })] }), []);
+// a job that finished during an interactive session is reported, with its own outcome
+const busy = M.stateMap({ profiles: [row("a", "interactive_working")] });
+assert.deepStrictEqual(M.transitions(busy, { profiles: [row("a", "interactive_idle", fin("j1", 1))] }), [{ name: "a", state: "error" }]);
+// a new job that started and ended between two polls
+assert.deepStrictEqual(M.transitions(M.stateMap({ profiles: [row("a", "done", old)] }), { profiles: [row("a", "error", fin("j2", 3))] }),
+  [{ name: "a", state: "error" }]);
+// and the next poll is quiet
+assert.deepStrictEqual(M.transitions(M.stateMap(after), after), []);
 
 // status bar
 const s = M.summary({ sandboxes_known: true, profiles: [row("a", "working"), row("b", "stalled"), rv] });

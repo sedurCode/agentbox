@@ -28,13 +28,14 @@ function agentboxPath() {
   return fs.existsSync(local) ? local : "agentbox";
 }
 
-/** Run agentbox and collect stdout. A .cmd needs cmd.exe on Windows; the arguments are fixed words and a
- * NAME_RE-checked profile name, so nothing in them is special to it. */
+/** Run agentbox and collect stdout. A .cmd needs cmd.exe on Windows, and with `shell` node joins the command
+ * line with spaces and quotes nothing, so the path is quoted here (C:\Users\John Smith\...); the arguments are
+ * fixed words and a NAME_RE-checked profile name, so nothing in them is special to cmd.exe. */
 function runAgentbox(args, timeoutMs) {
   const exe = agentboxPath();
   const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(exe);
   return new Promise((resolve, reject) => {
-    cp.execFile(exe, args, { timeout: timeoutMs, maxBuffer: 64 << 20, shell, windowsHide: true,
+    cp.execFile(shell ? `"${exe}"` : exe, args, { timeout: timeoutMs, maxBuffer: 64 << 20, shell, windowsHide: true,
       env: { ...process.env, AGENTBOX_NO_OSC: "1", NO_COLOR: "1" } },
     (err, stdout, stderr) => err ? reject(Object.assign(err, { stderr: String(stderr || "") })) : resolve(String(stdout)));
   });
@@ -131,20 +132,23 @@ class Poller {
 
   schedule() {
     clearTimeout(this.timer);
+    if (this.disposed) return;
     const s = this.interval();
     if (s > 0) this.timer = setTimeout(() => this.refresh(), s * 1000);
   }
 
   async refresh() {
-    if (this.busy) return;
+    if (this.busy || this.disposed) return;
     this.busy = true;
     clearTimeout(this.timer);
     try {
       const out = await runAgentbox(["dashboard", "--json"], 120000);
       const data = M.parseDashboard(out);
+      if (this.disposed) return;           // deactivated while agentbox ran: the emitter and status bar are gone
       this.provider.set(data, null);
       this.onData(data, null);
     } catch (e) {
+      if (this.disposed) return;
       const msg = e.code === "ENOENT" ? `agentbox not found (${agentboxPath()}); set agentbox.path`
         : (e.stderr && e.stderr.trim()) || e.message;
       this.provider.set(this.provider.data, msg);
@@ -161,7 +165,7 @@ class Poller {
     if (v && !was) this.refresh(); else this.schedule();
   }
 
-  dispose() { clearTimeout(this.timer); }
+  dispose() { this.disposed = true; clearTimeout(this.timer); }
 }
 
 // ---------------------------------------------------------------- actions

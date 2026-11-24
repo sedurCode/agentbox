@@ -194,20 +194,39 @@ function summary(data) {
   return { text: "agentbox" + (parts.length ? " " + parts.join(" ") : ""), attention: attn > 0 || !data.sandboxes_known };
 }
 
-/** Profiles that moved into a notify-worthy state since `prev` (a Map name -> state). Not on the first load. */
+/** How a row's job ended: done | error | lost, or null while it runs or with no job. Read from the job itself,
+ * not the display state, which shows an interactive session ahead of the job's outcome. */
+function jobOutcome(row) {
+  const job = (row && row.job) || {};
+  if (job.state === "finished") return job.exit_code === 0 ? "done" : "error";
+  return job.state === "lost" ? "lost" : null;
+}
+
+function jobId(row) {
+  return row && row.job && typeof row.job.id === "string" ? row.job.id : null;
+}
+
+/** Notifications since `prev` (from stateMap), not on the first load: a job that ended (done, error or lost),
+ * once, when it was seen running or is a job not seen before; and a profile that became stalled. A display
+ * state falling back to an old job's outcome (an interactive session closing) is not news. */
 function transitions(prev, data) {
   const out = [];
   if (!prev || !data) return out;
   for (const r of data.profiles || []) {
-    const st = stateOf(r);
     const before = prev.get(r.name);
-    if (before !== undefined && before !== st && NOTIFY.has(st) && NAME_RE.test(r.name)) out.push({ name: r.name, state: st });
+    if (before === undefined || !NAME_RE.test(r.name)) continue;
+    const st = stateOf(r);
+    const outcome = jobOutcome(r);
+    if (outcome && NOTIFY.has(outcome) && (before.running || before.job !== jobId(r))) out.push({ name: r.name, state: outcome });
+    else if (st === "stalled" && before.state !== "stalled") out.push({ name: r.name, state: st });
   }
   return out;
 }
 
+/** name -> { state, job id, whether that job was running }: what transitions() compares against. */
 function stateMap(data) {
-  return new Map(((data && data.profiles) || []).map(r => [r.name, stateOf(r)]));
+  return new Map(((data && data.profiles) || []).map(r =>
+    [r.name, { state: stateOf(r), job: jobId(r), running: Boolean(r.job && r.job.state === "running") }]));
 }
 
 /** The dashboard document, or throws: a JSON object with a profiles array of rows with safe names. */

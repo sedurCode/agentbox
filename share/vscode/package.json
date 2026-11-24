@@ -12,6 +12,11 @@
   "extensionKind": ["ui"],
   "capabilities": { "untrustedWorkspaces": { "supported": true }, "virtualWorkspaces": true },
   "contributes": {
+    "taskDefinitions": [{
+      "type": "agentbox",
+      "required": ["args"],
+      "properties": { "args": { "type": "array", "items": { "type": "string" }, "description": "The agentbox arguments" } }
+    }],
     "viewsContainers": {
       "activitybar": [{ "id": "agentbox", "title": "agentbox", "icon": "media/agentbox.svg" }]
     },

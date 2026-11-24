@@ -60,11 +60,13 @@ class PackTests(unittest.TestCase):
 class CommandTests(AgentboxTestCase):
     """`agentbox vscode`: `code` is stubbed; nothing touches the real VS Code."""
 
-    def fake_code(self, listed=""):
+    def fake_code(self, listed="", list_rc=0):
         calls = []
         def run(cmd, **kw):
             calls.append(cmd[1:])
-            return mock.Mock(returncode=0, stdout=listed if "--list-extensions" in cmd else "")
+            if "--list-extensions" in cmd:
+                return mock.Mock(returncode=list_rc, stdout=listed, stderr="boom" if list_rc else "")
+            return mock.Mock(returncode=0, stdout="")
         for p in (mock.patch.object(ab, "find_vscode", lambda cfg: "/x/code"),
                   mock.patch.object(ab.shutil, "which", lambda c: "/x/code"),
                   mock.patch.object(ab.subprocess, "run", run)):
@@ -85,6 +87,14 @@ class CommandTests(AgentboxTestCase):
         inst = [c for c in calls if c[0] == "--install-extension"]
         self.assertEqual(len(inst), 1)
         self.assertTrue(inst[0][1].endswith(".vsix") and inst[0][2] == "--force")
+        self.assertFalse(any(c[0] == "--list-extensions" for c in calls))     # install doesn't need the list
+
+    def test_a_failed_listing_is_an_error_not_missing(self):
+        self.fake_code(list_rc=1)
+        for action in ("status", "uninstall"):
+            code, _, err = self.run_main("vscode", action)
+            self.assertNotEqual(code, 0)
+            self.assertIn("boom", err)
 
     def test_uninstall_only_when_installed(self):
         calls = self.fake_code()

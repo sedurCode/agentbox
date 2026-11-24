@@ -83,3 +83,44 @@ class RexSetupTests(AgentboxTestCase):
 
     def test_json_only_for_status(self):
         self.assertEqual(self.run_main("rex", "setup", "--json")[0], 2)
+
+    def test_orphan_begin_marker_never_takes_the_users_lines(self):
+        # a begin marker whose end and require lines were deleted by hand, then setup appends a fresh block
+        self.init.parent.mkdir(parents=True)
+        mine = ab.REX_BEGIN + "\n-- my config\nrex.font = 'x'\n"
+        self.init.write_text(mine)
+        self.assertEqual(self.state(), "missing")
+        self.run_main("rex", "setup")
+        self.assertEqual(self.state(), "current")
+        self.run_main("rex", "remove")
+        self.assertEqual(self.init.read_text(), mine + "\n")
+
+    def test_crlf_line_endings_are_kept(self):
+        self.init.parent.mkdir(parents=True)
+        self.init.write_bytes(b"-- mine\r\nrex.font = 'x'\r\n")
+        self.run_main("rex", "setup")
+        raw = self.init.read_bytes()
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))       # no bare LF anywhere
+        self.assertEqual(self.state(), "current")
+        self.run_main("rex", "remove")
+        self.assertEqual(self.init.read_bytes(), b"-- mine\r\nrex.font = 'x'\r\n\r\n")
+
+    def test_symlinked_init_lua_is_written_through(self):
+        if ab.IS_WIN:
+            self.skipTest("symlinks need privileges on Windows")
+        dots = self.home / "dotfiles"
+        dots.mkdir()
+        (dots / "init.lua").write_text("-- mine\n")
+        self.init.parent.mkdir(parents=True)
+        self.init.symlink_to(dots / "init.lua")
+        self.run_main("rex", "setup")
+        self.assertTrue(self.init.is_symlink())
+        self.assertIn(ab.REX_BEGIN, (dots / "init.lua").read_text())
+
+    def test_unreadable_init_lua_is_a_message_not_a_traceback(self):
+        self.init.parent.mkdir(parents=True)
+        self.init.write_bytes(b"-- caf\xe9\n")                    # Latin-1
+        code, _, err = self.run_main("rex", "status")
+        self.assertNotEqual(code, 0)
+        self.assertIn("isn't UTF-8", err)
+        self.assertNotIn("Traceback", err)

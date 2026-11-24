@@ -2391,7 +2391,10 @@ def pack_vsix(out_dir: Path, src: Path = None) -> Path:
 
 
 def vscode_installed_version(code: str, ext_id: str) -> str | None:
+    """The installed version, None if not installed; dies if VS Code can't list its extensions."""
     r = subprocess.run([code, "--list-extensions", "--show-versions"], capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        die(f"'{code} --list-extensions' failed (exit {r.returncode}): {(r.stderr or r.stdout or '').strip()[:300]}")
     for line in (r.stdout or "").splitlines():
         ident, _, ver = line.strip().partition("@")
         if ident.lower() == ext_id.lower():
@@ -2409,7 +2412,7 @@ def cmd_vscode(args) -> int:
             die("VS Code CLI 'code' not found. On macOS run 'Shell Command: Install code command in PATH' in VS Code")
     pkg = vscode_ext_package()
     ext_id = f"{pkg['publisher']}.{pkg['name']}"
-    have = vscode_installed_version(code, ext_id)
+    have = vscode_installed_version(code, ext_id) if args.action != "install" else None
     if args.action == "status":
         state = "missing" if have is None else "current" if have == pkg["version"] else "outdated"
         if args.json:
@@ -2443,7 +2446,7 @@ REX_REQUIRE_RE = re.compile(r"""^\s*require\s*\(?\s*["']agentbox["']""", re.M)
 
 
 def rex_init_lua() -> Path:
-    return Path.home() / ".config" / "rex" / "init.lua"
+    return Path.home() / ".config" / "rex" / "init.lua"     # not HOME: read at call time, as rex_block() does
 
 
 def rex_block() -> str:
@@ -2457,15 +2460,20 @@ def rex_block() -> str:
     return f'{REX_BEGIN}\npackage.path = {path} .. package.path\nrequire("agentbox").setup{{}}\n{REX_END}\n'
 
 
-def write_text_atomic(path: Path, text: str):
-    """Replace path's contents in one rename, keeping its permission bits (0644 for a new file)."""
+def write_text_atomic(path: Path, text: str, mode: int | None = None):
+    """Replace path's contents in one rename. Text is written as given (no newline translation). Mode: the
+    given one, else the file's own (0644 for a new file). A symlink is written through: its target is
+    replaced and the link kept (an init.lua kept in a dotfiles repo stays linked)."""
+    path = Path(os.path.realpath(path))
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o644
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except FileNotFoundError:
-        mode = 0o644
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with open(tmp, "x", encoding="utf-8", newline="") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -2478,15 +2486,20 @@ def lua_str(s: str) -> str:
 
 
 def rex_block_span(text: str) -> tuple[int, int] | None:
-    """(start, end) of our block in init.lua's text, end past its newline; None if absent."""
-    i = text.find(REX_BEGIN)
-    if i < 0 or (i > 0 and text[i - 1] != "\n"):
-        return None
-    j = text.find(REX_END, i)
-    if j < 0:
-        return None
-    j += len(REX_END)
-    return i, j + 1 if text[j:j + 1] == "\n" else j
+    """(start, end) of our block in init.lua's text, end past its line ending; None if absent. Both markers
+    must be whole lines, and the block is the end marker's nearest begin marker: a begin left behind by a
+    hand edit (its end line deleted) never pairs with a later block's end, which would take the user's lines
+    in between with it."""
+    begin = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if bare == REX_BEGIN:
+            begin = pos
+        elif bare == REX_END and begin is not None:
+            return begin, pos + len(line)
+        pos += len(line)
+    return None
 
 
 def rex_setup_state(text: str | None) -> str:
@@ -2495,7 +2508,8 @@ def rex_setup_state(text: str | None) -> str:
         return "missing"
     span = rex_block_span(text)
     if span:
-        return "current" if text[span[0]:span[1]].rstrip("\n") == rex_block().rstrip("\n") else "outdated"
+        ours = text[span[0]:span[1]].replace("\r\n", "\n").rstrip("\n")
+        return "current" if ours == rex_block().rstrip("\n") else "outdated"
     return "manual" if REX_REQUIRE_RE.search(text) else "missing"
 
 
@@ -2503,11 +2517,23 @@ def cmd_rex(args) -> int:
     """`agentbox rex setup|status|remove`: the agentbox actions in Rex's init.lua."""
     f = rex_init_lua()
     try:
-        text = f.read_text(encoding="utf-8")
+        with open(f, encoding="utf-8", newline="") as fh:     # newline="": CRLF kept, written back as found
+            text = fh.read()
     except FileNotFoundError:
         text = None
+    except UnicodeDecodeError:
+        die(f"cannot read {f}: it isn't UTF-8. Save it as UTF-8, or add the lines by hand (see `agentbox rex status`)")
     except OSError as e:
         die(f"cannot read {f}: {e.strerror}")
+    nl = "\r\n" if text and "\r\n" in text else "\n"
+
+    def write(new: str):
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(f, new)
+        except OSError as e:
+            die(f"cannot write {f}: {e.strerror or e}")
+
     state = rex_setup_state(text)
     actions = SHARE_DIR / "rex" / "agentbox.lua"
     if args.action == "status":
@@ -2521,7 +2547,7 @@ def cmd_rex(args) -> int:
     if args.action == "remove":
         if state in ("current", "outdated"):
             i, j = rex_block_span(text)
-            write_text_atomic(f, text[:i] + text[j:])
+            write(text[:i] + text[j:])
             print(f"removed the agentbox block from {f}; restart Rex (or reload its config) to drop the actions")
         elif state == "manual":
             print(f"left alone: {f} loads agentbox with lines agentbox didn't write; delete them by hand")
@@ -2537,14 +2563,14 @@ def cmd_rex(args) -> int:
         print(f"left alone: {f} already loads agentbox with lines agentbox didn't write. To let agentbox manage it,"
               " delete those lines and run `agentbox rex setup` again")
         return EXIT_OK
+    block = rex_block().replace("\n", nl)                  # in the file's own line endings
     if state == "outdated":
         i, j = rex_block_span(text)
-        new = text[:i] + rex_block() + text[j:]
+        new = text[:i] + block + text[j:]
     else:
         base = text or ""
-        new = base + ("\n" if base and not base.endswith("\n") else "") + ("\n" if base.strip() else "") + rex_block()
-    f.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(f, new)
+        new = base + (nl if base and not base.endswith("\n") else "") + (nl if base.strip() else "") + block
+    write(new)
     print(f"{'updated' if state == 'outdated' else 'added'} the agentbox block in {f}; restart Rex (or reload its config)"
           " and the command palette has the actions under \"agentbox\"")
     return EXIT_OK
@@ -8099,14 +8125,7 @@ def skill_rows() -> list[dict]:
 
 def write_skill_stub(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".SKILL.md.{os.getpid()}.tmp")
-    try:
-        with open(tmp, "x") as f:
-            f.write(SKILL_STUB)
-        os.chmod(tmp, 0o644)        # agents read it; nothing in it is private
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    write_text_atomic(path, SKILL_STUB, mode=0o644)     # agents read it; nothing in it is private
 
 
 def cmd_skill(args) -> int:
