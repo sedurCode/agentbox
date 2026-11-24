@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import subprocess
+from pathlib import Path
 
 from helpers import AgentboxTestCase, ab
 
@@ -59,7 +60,10 @@ class TemplateTests(AgentboxTestCase):
         self.assertEqual(create[4], str(self.kit))
         self.assertEqual(create[5], "claude")
         self.assertNotIn(str(self.ws), create)                    # never the real workspace
-        self.assertFalse(any("agentbox" in str(a) and "kit" in str(a) for a in create[4:]))   # no generated kit
+        # no generated kit: only the user's kit, the agent and the empty build workspace. Not a substring
+        # check: the workspace is /tmp/agentbox-tpl-<random>, and the random part can contain "kit"
+        self.assertEqual(len(create), 7)
+        self.assertTrue(Path(create[6]).name.startswith("agentbox-tpl-"))
         kinds = [c[:2] for c in self.rec.calls]
         self.assertLess(kinds.index(("stop", "ab-p-tpl")), kinds.index(("template", "save")))
         self.assertEqual(self.rec.calls[-1][:2], ("rm", "--force"))   # the build box goes

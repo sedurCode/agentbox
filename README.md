@@ -79,10 +79,55 @@ unzip agentbox.zip && cd agentbox && ./install.sh
 `install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
 small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything. It also installs the guide for
 agents on the host (`share/skill/`) but leaves their skill folders alone: run `agentbox skill setup` for that.
+It copies the VS Code extension (`share/vscode/`) and, if it finds Rex, the Rex actions (`share/rex/`), but
+installs neither into the editor or Rex: see *Rex and VS Code* below.
 
 The launcher looks for Python at run time (`python3.14`, `3.13`, `3.12`, `3.11`, then `python3`;
 the first that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the
 install. With none it prints "agentbox needs Python 3.11+ (brew install python)" and exits 1.
+
+### Rex and VS Code
+
+Both are optional and run on the host; each gives you the dashboard (every profile, its job, interactive
+sessions and review branches) and its actions. Neither changes anything until you opt in, and re-running
+`install.sh` (or `install.ps1`) after an upgrade refreshes the files both use (run `agentbox vscode install`
+again too; Rex loads the new files when it restarts).
+
+**VS Code**: one command, then reload VS Code's windows (Developer: Reload Window):
+
+```bash
+agentbox vscode install      # installs or updates the extension; run it again after upgrading agentbox
+agentbox vscode status       # current, outdated (agentbox has a newer one) or missing; --json
+agentbox vscode uninstall    # removes it
+```
+
+There is no build step and node isn't needed: `install` zips `~/.local/share/agentbox/share/vscode` into a
+`.vsix` and runs `code --install-extension <it> --force`. The VS Code CLI is found as for `agentbox code`:
+`[settings] vscode`, else `code` on `PATH`, else the one in the app bundle (no config is needed). See
+*Using agentbox from VS Code*.
+
+**Rex**: the installer copies the actions to `~/.local/share/agentbox/share/rex/` when it finds Rex
+(`$AGENTBOX_REX`, `rex` on `PATH`, Rex.app or `~/.config/rex/`); then, once:
+
+```bash
+agentbox rex setup           # adds the agentbox block to ~/.config/rex/init.lua (creating it if needed)
+agentbox rex status          # current, outdated, missing or manual; --json
+agentbox rex remove          # deletes that block, nothing else
+```
+
+and restart Rex (or reload its config). `setup` appends one block between `-- agentbox: added by ...` and
+`-- end agentbox` comments, and touches nothing else in the file; run it again after moving agentbox and it
+rewrites the block in place. If `init.lua` already loads agentbox with lines you wrote yourself (the old
+install instructions), `status` says `manual` and `setup` and `remove` leave them alone: delete them and run
+`setup` to hand them over. Neither the installer nor any other command edits Rex's config. The block is:
+
+```lua
+package.path = os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;" .. package.path
+require("agentbox").setup{}
+```
+
+Installed Rex after agentbox? Run the installer again. See *Using agentbox from Rex* and
+[`share/rex/README.md`](share/rex/README.md).
 
 ### One-time sbx settings
 
@@ -642,7 +687,9 @@ are read, never conversation content, and never from a stopped sandbox. A card t
 `interactive: 3 sessions, active 9s ago, mode auto`. `--json` adds to each row `sessions`
 (`[{"agent": "claude", "age_s": 10735}]`, interactive processes only, at most 32), `activity_age_s` (seconds
 since the newest write, or `null`) and `permission_mode` (`auto`, `acceptEdits`, `bypassPermissions`, `plan`,
-`default`, `dontAsk`, `manual`, or `null`); a VM that isn't running has `[]`, `null`, `null`.
+`default`, `dontAsk`, `manual`, or `null`); a VM that isn't running has `[]`, `null`, `null`. Each row also has
+`state`, the interactive view's state for it: `working`, `interactive_working`, `stalled`, `error`, `lost`,
+`interactive_idle`, `done`, `nojob`, `stopped`, `disabled` or `unknown`.
 
 `--interactive` (`-i`) is a full-screen terminal view (Python's `curses`, nothing to install) and needs a
 terminal; it can't be combined with `--watch` or `--json`. A list of every profile, not only the running
@@ -678,17 +725,37 @@ isn't UTF-8. Below 60x15 it asks for a bigger pane.
 The dashboard runs only `progress --watch`, `logs`, `fetch`, `up`, `stop` and `review`, each with only the profile name;
 it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 
+### Using agentbox from VS Code
+
+This is VS Code on your Mac watching the sandboxes; for a VS Code window that works inside one, see *VS Code
+inside the sandbox* below. `agentbox vscode install` (see *Rex and VS Code* in §1) adds the dashboard to VS Code as an extension; details
+in [`share/vscode/README.md`](share/vscode/README.md):
+
+- **Profiles view** (the agentbox icon in the activity bar): every profile in the interactive dashboard's
+  order, with its state, timing and agent, and a ◆ when branches wait for review. Expand one for the VM's
+  CPU, memory and disk, interactive sessions and their permission mode, the job's stats and plan, and the
+  review counts.
+- **Actions** on a profile's context menu or the command palette: watch progress, show the job log, fetch
+  (asks first), review, open an agent session (`up`), stop (asks first; the profile name must be typed if a
+  job runs there), and "Open Workspace in VS Code" (`agentbox code`). Like the dashboard, never `--force`,
+  `--start`, `down`, `fresh`, `run` or `resume`.
+- **Status bar** summary and **notifications** when a job finishes, fails, stalls or is lost.
+
+It reads `agentbox dashboard --json` every 5 s while the view is visible and every 30 s while it is hidden
+(`agentbox.refreshInterval`, `agentbox.backgroundInterval`); `agentbox.path` points at another agentbox.
+The rows' `state` field it needs is new: with an older agentbox the view asks you to run the installer again.
+
 ### Using agentbox from Rex
 
 [Rex](https://www.superlogical.com/rex/docs) users get palette actions and job status from
 `share/rex/` (installed to `~/.local/share/agentbox/share/rex/` when the installer finds Rex; setup in
-[`share/rex/README.md`](share/rex/README.md)):
+*Rex and VS Code* in §1 and [`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
   a job from a prompt file, open the interactive dashboard, fetch for review, review (`agentbox review` in a
   "Review" window of the profile's session; the picker shows "2 ready · 1 not fetched"), stop a sandbox,
-  remove a sandbox. Two lines in
-  `~/.config/rex/init.lua` add them; `install.sh` prints them and never edits Rex's config.
+  remove a sandbox. `agentbox rex setup` adds
+  them to `~/.config/rex/init.lua` (see *Rex and VS Code* in §1).
 - **Status in tabs and View Activity**: inside Rex, `progress --watch`, `dashboard --watch` / `--interactive` and `wait`
   report the job's state with OSC 7501: working (with plan progress), blocked when stalled, done, error,
   idle. Each record is named after its profile; the dashboard keeps one per profile, and a finished job's
@@ -769,7 +836,7 @@ skill from any you mount *into* sandboxes with `[skillsets]`.
 
 ### Scripting agentbox
 
-`status`, `dashboard`, `doctor`, `tools`, `progress`, `fetch`, `history` and `review` take `--json`: stdout is then exactly one JSON document, the human
+`status`, `dashboard`, `doctor`, `tools`, `progress`, `fetch`, `history` and `review` take `--json`, as do `skill status`, `rex status` and `vscode status`: stdout is then exactly one JSON document, the human
 text is unchanged without the flag, and diagnostics still go to stderr. No secret values appear
 in any of them (`doctor` reports token-like variables by name, class and length only).
 

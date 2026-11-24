@@ -1,0 +1,68 @@
+{
+  "name": "agentbox",
+  "displayName": "agentbox",
+  "description": "The agentbox dashboard in VS Code: every profile's sandbox, job, interactive sessions and review branches",
+  "version": "0.1.0",
+  "publisher": "sedaudio",
+  "license": "SEE LICENSE IN LICENSING.md",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["ui"],
+  "capabilities": { "untrustedWorkspaces": { "supported": true }, "virtualWorkspaces": true },
+  "contributes": {
+    "taskDefinitions": [{
+      "type": "agentbox",
+      "required": ["args"],
+      "properties": { "args": { "type": "array", "items": { "type": "string" }, "description": "The agentbox arguments" } }
+    }],
+    "viewsContainers": {
+      "activitybar": [{ "id": "agentbox", "title": "agentbox", "icon": "media/agentbox.svg" }]
+    },
+    "views": {
+      "agentbox": [{ "id": "agentbox.profiles", "name": "Profiles" }]
+    },
+    "viewsWelcome": [{ "view": "agentbox.profiles", "contents": "Reading `agentbox dashboard --json`...\n[Settings](command:workbench.action.openSettings?%22agentbox%22)" }],
+    "commands": [
+      { "command": "agentbox.refresh", "title": "Refresh", "category": "agentbox", "icon": "$(refresh)" },
+      { "command": "agentbox.dashboardTerminal", "title": "Open the Interactive Dashboard in a Terminal", "category": "agentbox", "icon": "$(terminal)" },
+      { "command": "agentbox.progress", "title": "Watch Progress", "category": "agentbox", "icon": "$(eye)" },
+      { "command": "agentbox.logs", "title": "Show Job Log", "category": "agentbox", "icon": "$(output)" },
+      { "command": "agentbox.fetch", "title": "Fetch for Review", "category": "agentbox", "icon": "$(cloud-download)" },
+      { "command": "agentbox.up", "title": "Open Agent Session (up)", "category": "agentbox", "icon": "$(play)" },
+      { "command": "agentbox.stop", "title": "Stop Sandbox", "category": "agentbox", "icon": "$(debug-stop)" },
+      { "command": "agentbox.review", "title": "Review Branches", "category": "agentbox", "icon": "$(git-pull-request)" },
+      { "command": "agentbox.code", "title": "Open Workspace in VS Code (Remote SSH)", "category": "agentbox", "icon": "$(remote-explorer)" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "agentbox.refresh", "when": "view == agentbox.profiles", "group": "navigation@1" },
+        { "command": "agentbox.dashboardTerminal", "when": "view == agentbox.profiles", "group": "navigation@2" }
+      ],
+      "view/item/context": [
+        { "command": "agentbox.progress", "when": "view == agentbox.profiles && viewItem =~ / job-running /", "group": "inline@1" },
+        { "command": "agentbox.review", "when": "view == agentbox.profiles && viewItem =~ / review-pending /", "group": "inline@2" },
+        { "command": "agentbox.up", "when": "view == agentbox.profiles && viewItem =~ / enabled / && viewItem =~ / profile /", "group": "inline@3" },
+
+        { "command": "agentbox.progress", "when": "view == agentbox.profiles && viewItem =~ / has-job /", "group": "1_job@1" },
+        { "command": "agentbox.logs", "when": "view == agentbox.profiles && viewItem =~ / has-job /", "group": "1_job@2" },
+        { "command": "agentbox.fetch", "when": "view == agentbox.profiles && viewItem =~ / clone / && viewItem =~ / running /", "group": "1_job@3" },
+        { "command": "agentbox.review", "when": "view == agentbox.profiles && viewItem =~ / clone /", "group": "1_job@4" },
+        { "command": "agentbox.up", "when": "view == agentbox.profiles && viewItem =~ / enabled /", "group": "2_open@1" },
+        { "command": "agentbox.code", "when": "view == agentbox.profiles && viewItem =~ / enabled /", "group": "2_open@2" },
+        { "command": "agentbox.stop", "when": "view == agentbox.profiles && viewItem =~ / running /", "group": "9_stop@1" }
+      ]
+    },
+    "configuration": {
+      "title": "agentbox",
+      "properties": {
+        "agentbox.path": { "type": "string", "default": "", "scope": "machine", "markdownDescription": "The `agentbox` CLI. Empty: `~/.local/bin/agentbox` if it exists, else `agentbox` on `PATH`." },
+        "agentbox.refreshInterval": { "type": "number", "default": 5, "minimum": 2, "description": "Seconds between refreshes while the Profiles view is visible." },
+        "agentbox.backgroundInterval": { "type": "number", "default": 30, "minimum": 0, "description": "Seconds between refreshes while the view is hidden (status bar and notifications). 0: only while visible." },
+        "agentbox.statusBar": { "type": "boolean", "default": true, "description": "Show a summary in the status bar." },
+        "agentbox.notifications": { "type": "boolean", "default": true, "description": "Notify when a profile's job finishes, fails, stalls or is lost." }
+      }
+    }
+  }
+}

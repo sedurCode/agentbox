@@ -109,6 +109,8 @@ class CommandTests(AgentboxTestCase):
         vms = {r["name"]: r["vm"] for r in data["profiles"]}
         self.assertEqual(vms, {"a": "running", "b": "stopped", "c": "disabled"})
         self.assertEqual(data["profiles"][0]["resources"]["cpus"], 4)
+        states = {r["name"]: r["state"] for r in data["profiles"]}       # dash_state, for the VS Code extension
+        self.assertEqual(states, {"a": "nojob", "b": "stopped", "c": "disabled"})
 
     def test_json_is_one_document(self):
         self.stub({})
