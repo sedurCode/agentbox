@@ -29,6 +29,9 @@ cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
 cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
 mkdir -p "$DEST/share/skill"
 cp -R "$SRC/share/skill/." "$DEST/share/skill/"
+# the VS Code extension (`agentbox vscode install` packs it from here); replaced whole, so removed files go
+rm -rf "$DEST/share/vscode"
+cp -R "$SRC/share/vscode" "$DEST/share/vscode"
 # Rex actions, only if Rex is here (found as agentbox's rex_program() finds it, or a ~/.config/rex);
 # ~/.config/rex/ is never touched (see share/rex/README.md)
 REX_APP_CLI="/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
@@ -71,13 +74,10 @@ chmod 700 "$CFG"
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "add $BIN to PATH";; esac
 if [ -n "$HAVE_REX" ]; then
-  echo "Rex: to add the agentbox actions, put these two lines in ~/.config/rex/init.lua:"
-  if [ "$DEST" = "$HOME/.local/share/agentbox" ]; then rexpath='os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;"'
-  else rexpath="\"$DEST/share/rex/?.lua;\""; fi
-  echo "  package.path = $rexpath .. package.path"
-  echo "  require(\"agentbox\").setup{}"
+  echo "Rex: \`agentbox rex setup\` adds the agentbox actions to ~/.config/rex/init.lua (a marked block; \`agentbox rex remove\` deletes it)"
 else
   echo "Rex not found: skipped the Rex actions (install Rex, then run install.sh again to add them)"
 fi
+echo "VS Code: \`agentbox vscode install\` adds the dashboard as an extension (again after upgrading agentbox)"
 echo "agents on this machine (Claude Code, Codex, OpenCode, Pi): \`agentbox skill setup\` installs the agentbox skill"
 echo "done. next: sbx login, then edit $CFG/agentbox.toml, then: agentbox doctor"

@@ -48,6 +48,9 @@ foreach ($f in 'hosttool', 'jobwrap', 'jobprogress') { Copy-Item "$Src\share\$f"
 # the agent guide (`agentbox skill show`), as install.sh does
 New-Item -ItemType Directory -Force "$Dest\share\skill" | Out-Null
 Copy-Item "$Src\share\skill\*" "$Dest\share\skill\" -Recurse -Force
+# the VS Code extension (`agentbox vscode install` packs it from here); replaced whole, so removed files go
+Remove-Item "$Dest\share\vscode" -Recurse -Force -ErrorAction SilentlyContinue
+Copy-Item "$Src\share\vscode" "$Dest\share\vscode" -Recurse -Force
 # Rex actions, only if Rex is here ($env:AGENTBOX_REX, rex on PATH, or a ~\.config\rex); ~\.config\rex is never touched
 $HaveRex = ($env:AGENTBOX_REX -and (Test-Path $env:AGENTBOX_REX -PathType Leaf)) -or
            [bool](Get-Command rex -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $Home_ '.config\rex'))
@@ -85,11 +88,10 @@ else {
 
 if (($env:Path -split ';') -notcontains $Bin) { Write-Host "add $Bin to PATH" }
 if ($HaveRex) {
-    Write-Host 'Rex: to add the agentbox actions, put these two lines in ~\.config\rex\init.lua:'
-    Write-Host ('  package.path = "' + ("$Dest\share\rex\?.lua;" -replace '\\', '/') + '" .. package.path')
-    Write-Host '  require("agentbox").setup{}'
+    Write-Host 'Rex: `agentbox rex setup` adds the agentbox actions to ~\.config\rex\init.lua (a marked block; `agentbox rex remove` deletes it)'
 } else {
     Write-Host 'Rex not found: skipped the Rex actions (install Rex, then run install.ps1 again to add them)'
 }
+Write-Host 'VS Code: `agentbox vscode install` adds the dashboard as an extension (again after upgrading agentbox)'
 Write-Host 'agents on this machine (Claude Code, Codex, OpenCode, Pi): `agentbox skill setup` installs the agentbox skill'
 Write-Host "done. next: sbx login, then edit $Cfg\agentbox.toml, then: agentbox doctor"

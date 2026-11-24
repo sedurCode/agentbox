@@ -28,6 +28,8 @@ Docker Sandboxes (`sbx`).
     agentbox review [<profile>] [--json]   clone mode: review branches like a pull request; merge (owner only)
     agentbox history [<profile>] [--json]  the jobs each profile ran: branch, cost, title, the agent's summary
     agentbox skill show|setup|status|remove   the skill for agents on this machine (status --json)
+    agentbox rex setup|status|remove          the agentbox actions in Rex's init.lua (status --json)
+    agentbox vscode install|status|uninstall  the dashboard as a VS Code extension (status --json)
 
 Exit codes: 0 ok, 1 checks/command failed, 2 usage or config error, 3 sandbox not found;
 `wait` also 4 = timeout, 5 = job lost (otherwise it exits with the job's own exit code).
@@ -2324,6 +2326,230 @@ def cmd_code(prof: Profile, args) -> int:
     return 0
 
 
+# ------------------------------------------------- the VS Code extension (share/vscode)
+# Plain JavaScript, no build step: `vscode install` zips share/vscode into a .vsix (a zip with a manifest
+# and [Content_Types].xml; no node or vsce) and hands it to `code --install-extension`.
+VSCODE_EXT_DIR = SHARE_DIR / "vscode"
+VSCODE_EXT_FILES = ("package.json", "extension.js", "model.js", "README.md", "media/agentbox.svg")
+VSIX_CONTENT_TYPES = """<?xml version="1.0" encoding="utf-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>
+<Default Extension=".md" ContentType="text/markdown"/><Default Extension=".svg" ContentType="image/svg+xml"/>
+<Default Extension=".vsixmanifest" ContentType="text/xml"/>
+</Types>
+"""
+
+
+def vscode_ext_package(src: Path = None) -> dict:
+    src = src or VSCODE_EXT_DIR
+    try:
+        return json.loads((src / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        die(f"cannot read the VS Code extension at {src}: {e} - reinstall agentbox")
+
+
+def vsix_manifest(pkg: dict) -> str:
+    from xml.sax.saxutils import escape, quoteattr
+    a = {k: quoteattr(str(pkg[k])) for k in ("name", "version", "publisher")}
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Language="en-US" Id={a["name"]} Version={a["version"]} Publisher={a["publisher"]}/>
+    <DisplayName>{escape(pkg["displayName"])}</DisplayName>
+    <Description xml:space="preserve">{escape(pkg["description"])}</Description>
+    <Categories>Other</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value={quoteattr(pkg["engines"]["vscode"])}/>
+      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="ui"/>
+    </Properties>
+  </Metadata>
+  <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
+  <Dependencies/>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
+  </Assets>
+</PackageManifest>
+"""
+
+
+def pack_vsix(out_dir: Path, src: Path = None) -> Path:
+    """share/vscode as <name>-<version>.vsix in out_dir."""
+    import zipfile
+    src = src or VSCODE_EXT_DIR
+    pkg = vscode_ext_package(src)
+    out = Path(out_dir) / f"{pkg['name']}-{pkg['version']}.vsix"
+    try:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", VSIX_CONTENT_TYPES)
+            z.writestr("extension.vsixmanifest", vsix_manifest(pkg))
+            for f in VSCODE_EXT_FILES:
+                z.write(src / f, f"extension/{f}")
+    except OSError as e:
+        die(f"cannot pack the VS Code extension from {src}: {e} - reinstall agentbox")
+    return out
+
+
+def vscode_installed_version(code: str, ext_id: str) -> str | None:
+    r = subprocess.run([code, "--list-extensions", "--show-versions"], capture_output=True, text=True, check=False)
+    for line in (r.stdout or "").splitlines():
+        ident, _, ver = line.strip().partition("@")
+        if ident.lower() == ext_id.lower():
+            return ver
+    return None
+
+
+def cmd_vscode(args) -> int:
+    """`agentbox vscode install|status|uninstall`: the dashboard extension in the host's VS Code."""
+    if CONFIG_FILE.exists():                 # [settings] vscode, if set
+        code = find_vscode(Config())
+    else:                                    # no config yet: `code` on PATH, else the app bundles
+        code = shutil.which(DEFAULT_SETTINGS["vscode"]) or next((p for p in VSCODE_APP_CLIS if Path(p).is_file()), None)
+        if not code:
+            die("VS Code CLI 'code' not found. On macOS run 'Shell Command: Install code command in PATH' in VS Code")
+    pkg = vscode_ext_package()
+    ext_id = f"{pkg['publisher']}.{pkg['name']}"
+    have = vscode_installed_version(code, ext_id)
+    if args.action == "status":
+        state = "missing" if have is None else "current" if have == pkg["version"] else "outdated"
+        if args.json:
+            emit_json({"id": ext_id, "state": state, "installed": have, "available": pkg["version"], "code": code})
+        else:
+            print(f"{ext_id}: {state} (installed {have or '-'}, this agentbox has {pkg['version']})")
+        return EXIT_OK
+    if args.action == "uninstall":
+        if have is None:
+            print(f"{ext_id}: not installed")
+            return EXIT_OK
+        r = subprocess.run([code, "--uninstall-extension", ext_id], check=False)
+        return EXIT_OK if r.returncode == 0 else EXIT_FAIL
+    with tempfile.TemporaryDirectory(prefix="agentbox-vsix-") as d:
+        vsix = pack_vsix(Path(d))
+        # --force: reinstall over the same version too, so `install` after an agentbox upgrade always takes
+        r = subprocess.run([code, "--install-extension", str(vsix), "--force"], check=False)
+    if r.returncode != 0:
+        return EXIT_FAIL
+    print(f"{ext_id} {pkg['version']} installed: reload VS Code's windows (Developer: Reload Window) to start it")
+    return EXIT_OK
+
+
+# ------------------------------------------------- the Rex actions (share/rex) in ~/.config/rex/init.lua
+# `rex setup` appends one marked block to init.lua and `rex remove` deletes exactly that block; nothing else in
+# the file is touched. Lines that load agentbox without the markers (added by hand, as the installer used to
+# suggest) are "manual" and left alone.
+REX_BEGIN = "-- agentbox: added by `agentbox rex setup`; `agentbox rex remove` deletes this block"
+REX_END = "-- end agentbox"
+REX_REQUIRE_RE = re.compile(r"""^\s*require\s*\(?\s*["']agentbox["']""", re.M)
+
+
+def rex_init_lua() -> Path:
+    return Path.home() / ".config" / "rex" / "init.lua"
+
+
+def rex_block() -> str:
+    """The block for this agentbox's share/rex. A Lua string: forward slashes (Rex takes them on Windows too)."""
+    d = (SHARE_DIR / "rex").as_posix()
+    home = Path.home().as_posix()
+    if not IS_WIN and d.startswith(home + "/"):          # as install.sh printed it: survives a renamed home
+        path = 'os.getenv("HOME") .. ' + lua_str(d[len(home):] + "/?.lua;")
+    else:
+        path = lua_str(d + "/?.lua;")
+    return f'{REX_BEGIN}\npackage.path = {path} .. package.path\nrequire("agentbox").setup{{}}\n{REX_END}\n'
+
+
+def write_text_atomic(path: Path, text: str):
+    """Replace path's contents in one rename, keeping its permission bits (0644 for a new file)."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "x", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def lua_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def rex_block_span(text: str) -> tuple[int, int] | None:
+    """(start, end) of our block in init.lua's text, end past its newline; None if absent."""
+    i = text.find(REX_BEGIN)
+    if i < 0 or (i > 0 and text[i - 1] != "\n"):
+        return None
+    j = text.find(REX_END, i)
+    if j < 0:
+        return None
+    j += len(REX_END)
+    return i, j + 1 if text[j:j + 1] == "\n" else j
+
+
+def rex_setup_state(text: str | None) -> str:
+    """missing | current | outdated (our block, for another path) | manual (loaded without our markers)."""
+    if text is None:
+        return "missing"
+    span = rex_block_span(text)
+    if span:
+        return "current" if text[span[0]:span[1]].rstrip("\n") == rex_block().rstrip("\n") else "outdated"
+    return "manual" if REX_REQUIRE_RE.search(text) else "missing"
+
+
+def cmd_rex(args) -> int:
+    """`agentbox rex setup|status|remove`: the agentbox actions in Rex's init.lua."""
+    f = rex_init_lua()
+    try:
+        text = f.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    except OSError as e:
+        die(f"cannot read {f}: {e.strerror}")
+    state = rex_setup_state(text)
+    actions = SHARE_DIR / "rex" / "agentbox.lua"
+    if args.action == "status":
+        if args.json:
+            emit_json({"init_lua": str(f), "state": state, "actions": str(actions), "actions_present": actions.is_file()})
+        else:
+            print(f"{state:<9} {f}")
+            if not actions.is_file():
+                print(f"the Rex actions aren't installed at {actions}: run the installer again")
+        return EXIT_OK
+    if args.action == "remove":
+        if state in ("current", "outdated"):
+            i, j = rex_block_span(text)
+            write_text_atomic(f, text[:i] + text[j:])
+            print(f"removed the agentbox block from {f}; restart Rex (or reload its config) to drop the actions")
+        elif state == "manual":
+            print(f"left alone: {f} loads agentbox with lines agentbox didn't write; delete them by hand")
+        else:
+            print(f"not set up: {f}")
+        return EXIT_OK
+    if not actions.is_file():
+        die(f"the Rex actions aren't installed at {actions}: run the installer again (it copies them when it finds Rex)")
+    if state == "current":
+        print(f"current: {f}")
+        return EXIT_OK
+    if state == "manual":
+        print(f"left alone: {f} already loads agentbox with lines agentbox didn't write. To let agentbox manage it,"
+              " delete those lines and run `agentbox rex setup` again")
+        return EXIT_OK
+    if state == "outdated":
+        i, j = rex_block_span(text)
+        new = text[:i] + rex_block() + text[j:]
+    else:
+        base = text or ""
+        new = base + ("\n" if base and not base.endswith("\n") else "") + ("\n" if base.strip() else "") + rex_block()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(f, new)
+    print(f"{'updated' if state == 'outdated' else 'added'} the agentbox block in {f}; restart Rex (or reload its config)"
+          " and the command palette has the actions under \"agentbox\"")
+    return EXIT_OK
+
+
 
 # ------------------------------------------------- sessions and unsaved work across `fresh`
 # Recreating a sandbox is a new VM: sbx (0.54) keeps no volume across `sbx rm`, so the agent's session
@@ -4424,6 +4650,8 @@ def collect_dashboard(cfg: Config) -> dict:
     names = cfg.profile_names()
     with ThreadPoolExecutor(max_workers=max(1, min(8, len(names)))) as pool:
         rows = list(pool.map(lambda n: dashboard_entry(cfg, n, states), names))
+    for r in rows:              # the interactive dashboard's state, so other front ends (VS Code) needn't re-derive it
+        r["state"] = dash_state(r)
     return {"generated_at": int(time.time()), "sandboxes_known": states is not None, "profiles": rows}
 
 
@@ -7998,12 +8226,28 @@ def main():
     p.add_argument("--yes", action="store_true", help="take every default, never prompt")
     p.add_argument("--dry-run", action="store_true", help="print the TOML block, change nothing")
     p.add_argument("--up", action="store_true", help="start the sandbox afterwards")
+    p = sub.add_parser("rex", help="the agentbox actions in Rex's command palette (~/.config/rex/init.lua)")
+    p.add_argument("action", choices=("setup", "status", "remove"),
+                   help="setup: add our block to init.lua; status; remove: delete our block")
+    p.add_argument("--json", action="store_true", help="status: one JSON document")
+    p = sub.add_parser("vscode", help="the agentbox dashboard extension for the host's VS Code")
+    p.add_argument("action", choices=("install", "status", "uninstall"),
+                   help="install (or update) it, show whether it is current, or remove it")
+    p.add_argument("--json", action="store_true", help="status: one JSON document")
     p = sub.add_parser("skill", help="the agentbox skill for agents on this machine (Claude Code, Codex, OpenCode, Pi)")
     p.add_argument("action", choices=("show", "setup", "status", "remove"),
                    help="show: print the guide; setup: install SKILL.md stubs; status; remove: delete our stubs")
     p.add_argument("--json", action="store_true", help="status: one JSON document")
     a = ap.parse_args()
 
+    if a.cmd == "rex":       # host-side only: touches no sandbox
+        if a.json and a.action != "status":
+            die("--json is only for `rex status`", EXIT_USAGE)
+        sys.exit(cmd_rex(a))
+    if a.cmd == "vscode":    # host-side only: touches no sandbox
+        if a.json and a.action != "status":
+            die("--json is only for `vscode status`", EXIT_USAGE)
+        sys.exit(cmd_vscode(a))
     if a.cmd == "skill":     # host-side only: needs no config and touches no sandbox
         if a.json and a.action != "status":
             die("--json is only for `skill status`", EXIT_USAGE)

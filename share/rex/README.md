@@ -2,16 +2,22 @@
 
 [Rex](https://www.superlogical.com/rex/docs) runs on the host only. `install.sh` (or `install.ps1`) copies these files to
 `~/.local/share/agentbox/share/rex/` if it finds Rex (`$AGENTBOX_REX`, `rex` on `PATH`,
-Rex.app or `~/.config/rex/`), and never touches `~/.config/rex/`. Installed Rex after agentbox? Run the installer again.
+Rex.app or `~/.config/rex/`), and never touches `~/.config/rex/` (only `agentbox rex setup`, when you run it, does). Installed Rex after agentbox? Run the installer again.
 
 ## Actions
 
-Add to `~/.config/rex/init.lua`:
+Run `agentbox rex setup` once, then restart Rex (or reload its config). It appends this block to
+`~/.config/rex/init.lua`, creating the file if needed, between `-- agentbox: added by ...` and `-- end agentbox`
+comments, and touches nothing else there:
 
 ```lua
 package.path = os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;" .. package.path
 require("agentbox").setup{}
 ```
+
+`agentbox rex status` (`--json`) says `current`, `outdated` (the block names another path: `setup` rewrites
+it), `missing` or `manual` (init.lua loads agentbox with lines you wrote; `setup` and `remove` leave those
+alone). `agentbox rex remove` deletes the block. You can also write the lines yourself instead.
 
 `setup{ agentbox = "/abs/path/to/agentbox" }` points at another agentbox binary (the default is
 `~/.local/bin/agentbox`). The command palette then has, under "agentbox":
