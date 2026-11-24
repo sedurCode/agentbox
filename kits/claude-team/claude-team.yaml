@@ -1,0 +1,77 @@
+# syntax=docker/sandbox-kit:3
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
+# Mixin: Claude Code model routing.
+# Main loop on Opus plus three user-level subagents: reader (Haiku), worker (Sonnet),
+# architect (Opus). Subagents are opt-in: Claude only delegates when the user asks it to.
+# Add to Claude profiles only: kits = [..., "claude-team"]
+# Declaration-only (no recipe): the environment is exported through args and the
+# subagent files are written by the runtime, so no image build is needed.
+schemaVersion: "3"
+kind: mixin
+version: "2.0.0"
+displayName: Claude model routing
+description: opus main loop + on-request haiku reader / sonnet worker / opus architect subagents
+sourceUrl: https://github.com/sedurCode/agentbox
+requires: ["claude"]
+
+# MIGRATION NOTE: v2 environment.variables. A declaration-only mixin has no image
+# config to carry ENV, so each variable is a create-phase arg exported under its name.
+args:
+  ANTHROPIC_MODEL:
+    default: "opus"
+    env: ANTHROPIC_MODEL
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:
+    default: "1"          # no telemetry/error reporting (blocked anyway)
+    env: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+
+capabilities:
+  # MIGRATION NOTE: v2 wrote these from an install hook (user 1000) because a v2 mixin
+  # could not ship files; v3 lifecycle files are written by the runtime, owned by the agent.
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      files:
+        - path: /home/agent/.claude/agents/reader.md
+          description: Claude subagent - reader (Haiku)
+          content: |
+            ---
+            name: reader
+            description: Fast, cheap read-only lookup - find files, locate symbols, read code or docs and summarise them. Returns findings with file:line references, never edits. Use ONLY when the user asks for subagents.
+            model: haiku
+            tools: Read, Grep, Glob
+            ---
+            You locate and summarise. Answer the question asked, cite file:line, quote only the lines that matter. Keep the reply short; don't propose designs or edit anything.
+        - path: /home/agent/.claude/agents/worker.md
+          description: Claude subagent - worker (Sonnet)
+          content: |
+            ---
+            name: worker
+            description: Implements a well-specified change - edits code, runs tests, fixes failures. Give it the files and acceptance criteria. Use ONLY when the user asks for subagents.
+            model: sonnet
+            tools: Read, Edit, Write, Bash, Grep, Glob
+            ---
+            Implement exactly the change described, matching the surrounding code style. Run the relevant tests and report: files changed, test result, anything you could not do. Don't widen scope.
+        - path: /home/agent/.claude/agents/architect.md
+          description: Claude subagent - architect (Opus)
+          content: |
+            ---
+            name: architect
+            description: Design and review for hard problems - cross-module changes, security-sensitive code, tricky bugs, trade-offs. Read-only. Use ONLY when the user asks for subagents.
+            model: opus
+            tools: Read, Grep, Glob
+            ---
+            Produce a concrete plan: the files to touch, the approach and why, risks, and how to verify. Name trade-offs and make a recommendation. Don't edit files.
+
+  - type: com.docker.sandbox/agent-context@2
+    config:
+      content: |
+        ## Subagents: only when asked
+        Do the work yourself in this session. Do NOT start subagents (the Agent/Task tool, including
+        the built-in Explore, Plan and general-purpose agents) unless the user explicitly asks you to
+        use subagents for the task at hand. Permission for one task does not carry over to the next.
+        When the user does ask, these are available:
+        - `reader` (Haiku) for finding and reading code or docs.
+        - `worker` (Sonnet) for implementing a clear, scoped change and running its tests.
+        - `architect` (Opus) for design decisions, reviews and stuck bugs.
+        You coordinate, give each subagent precise inputs, and check its results.

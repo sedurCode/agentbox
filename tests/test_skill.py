@@ -13,7 +13,8 @@ class SkillTests(AgentboxTestCase):
         self.home = self.tmp / "home"
         self.home.mkdir()
         env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
-        p = mock.patch.dict(os.environ, env | {"HOME": str(self.home)}, clear=True)
+        # Path.home() reads USERPROFILE on Windows, HOME elsewhere: set both, or the real home is written
+        p = mock.patch.dict(os.environ, env | {"HOME": str(self.home), "USERPROFILE": str(self.home)}, clear=True)
         p.start()
         self.addCleanup(p.stop)
         self.claude = self.home / ".claude/skills/agentbox/SKILL.md"

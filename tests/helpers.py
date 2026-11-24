@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-REAL_KILL, REAL_KILLPG = os.kill, os.killpg
+REAL_KILL, REAL_KILLPG = os.kill, getattr(os, "killpg", None)   # no killpg on Windows
 REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen   # for the few tests that run `sh` on purpose
 
 
@@ -22,6 +22,29 @@ REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen   # for the few tests th
 # and use tools macOS lacks (setsid, /proc, GNU userland), so tests that run them for real need a Linux host.
 needs_linux_vm = unittest.skipUnless(sys.platform.startswith("linux"),
                                      "runs VM-side sh scripts that use Linux-only tools (setsid, /proc, GNU userland)")
+
+
+def _can_symlink() -> bool:
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            os.symlink(d, os.path.join(d, "l"), target_is_directory=True)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+
+# Windows creates symlinks only with Developer Mode or an elevated shell; the tests that need one are skipped
+# there (turn on Developer Mode to run them: they are the symlink-escape security tests).
+needs_symlinks = unittest.skipUnless(_can_symlink(), "needs symlink support (Windows: enable Developer Mode)")
+
+
+posix_only = unittest.skipIf(sys.platform == "win32", "POSIX-only behaviour (modes, signals, shell argv)")
+needs_hostile_filenames = unittest.skipIf(sys.platform == "win32",
+                                          "creates file names with control characters or quotes, invalid on NTFS")
+runs_vm_link_script = unittest.skipIf(sys.platform == "win32",
+    "runs the VM-side link script (ln -s, readlink): MSYS sh on Windows does not behave like the Linux VM")
+needs_mkfifo = unittest.skipUnless(hasattr(os, "mkfifo"), "needs os.mkfifo (not on Windows)")
 
 
 @contextlib.contextmanager
@@ -52,7 +75,7 @@ class AgentboxTestCase(unittest.TestCase):
     """Temp config dir + state dir; sbx and subprocess calls fail loudly unless a test stubs them."""
 
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)   # Windows: a lingering fake agent may hold a file
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
         self.cfg_dir = self.tmp / "cfg"
@@ -69,6 +92,12 @@ class AgentboxTestCase(unittest.TestCase):
             p = mock.patch.object(ab, target, _forbidden(what))
             p.start()
             self.addCleanup(p.stop)
+        if ab.IS_WIN:
+            # owner_only() runs icacls on Windows, which the subprocess guard below forbids; test_platform.py
+            # exercises the real thing against a temp dir.
+            p = mock.patch.object(ab, "owner_only", lambda path, is_dir=False: None)
+            p.start()
+            self.addCleanup(p.stop)
         for name in ("run", "Popen", "check_output"):
             p = mock.patch.object(subprocess, name, _forbidden(f"subprocess.{name}"))
             p.start()
@@ -78,7 +107,7 @@ class AgentboxTestCase(unittest.TestCase):
         # a test registered with allow_kill() can be signalled; anything else fails loudly.
         self.killable = set()
         for mod, name in ((os, "kill"), (os, "killpg")):
-            p = mock.patch.object(mod, name, self._guarded(name))
+            p = mock.patch.object(mod, name, self._guarded(name), create=True)   # no killpg on Windows
             p.start()
             self.addCleanup(p.stop)
 
@@ -103,7 +132,10 @@ class AgentboxTestCase(unittest.TestCase):
 
     def write_config(self, body: str) -> "ab.Config":
         header = f'[settings]\nsbx = "sbx-must-not-run"\nstate_dir = "{self.state_dir}"\n'
-        (self.cfg_dir / "agentbox.toml").write_text(header + textwrap.dedent(body))
+        text = header + textwrap.dedent(body)
+        if os.sep == "\\":          # Windows paths hold backslashes, escapes inside a TOML "string"
+            text = text.replace("\\", "/")
+        (self.cfg_dir / "agentbox.toml").write_text(text)
         return ab.Config()
 
     def run_main(self, *argv):
@@ -142,7 +174,7 @@ class FakeSbx:
             if not self.boot:
                 raise AssertionError(f"exec into a {self.vm} sandbox would boot it: {args!r}")
             self.vm = "running"
-        if args[:2] == ("kit", "validate"):
+        if args[:2] == ("kit", "inspect"):
             return done()
         if args[0] == "exec":
             for marker, (rc, out) in self.exec_out.items():
@@ -187,7 +219,7 @@ class LocalVM:
         bindir.mkdir()
         (bindir / "claude").write_text(FAKE_CLAUDE)
         (bindir / "claude").chmod(0o755)
-        self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bindir}:{os.environ['PATH']}"}
+        self.env = {**os.environ, "HOME": str(self.home), "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
         for name, fn in (("sbx", self), ("sandbox_exists", lambda prof, retry=False: self.exists)):
             p = mock.patch.object(ab, name, fn)
             p.start()
@@ -225,7 +257,8 @@ class LocalVM:
             return done()
         if args[0] == "exec" and args[-3:-1] == ("sh", "-c"):
             with mock.patch.object(subprocess, "Popen", REAL_POPEN):
-                r = REAL_RUN(["sh", "-c", args[-1]], env=self.env, input=stdin, capture_output=True, text=True,
-                             errors="replace")
-            return done(r.returncode, r.stdout, r.stderr)
+                # like the real sbx(): bytes in (no \n -> \r\n on Windows), UTF-8 out
+                r = REAL_RUN(["sh", "-c", args[-1]], env=self.env,
+                             input=None if stdin is None else stdin.encode("utf-8"), capture_output=True)
+            return done(r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace"))
         raise AssertionError(f"unexpected sbx call: {args!r}")

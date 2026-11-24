@@ -1,0 +1,4 @@
+# Everything is LF (these files run on macOS/Linux and inside the Linux microVM), except Windows scripts.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

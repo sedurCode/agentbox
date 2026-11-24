@@ -20,6 +20,7 @@ class ConfirmDialogTests(AgentboxTestCase):
         env = {"DISPLAY": ":0"} if display else {}
         run = mock.Mock(return_value=SimpleNamespace(returncode=rc, stdout=out), side_effect=side_effect)
         with mock.patch.object(ab.sys, "platform", platform), \
+             mock.patch.object(ab, "IS_WIN", platform == "win32"), \
              mock.patch.object(ab.shutil, "which", lambda n: f"/usr/bin/{n}" if n in tools else None), \
              mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(ab.subprocess, "run", run):

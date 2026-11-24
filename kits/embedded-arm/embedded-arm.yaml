@@ -1,0 +1,56 @@
+# syntax=docker/sandbox-kit:3
+# Copyright (c) 2026 SEDAudio Ltd.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
+# See LICENSING.md.
+# Mixin: Arm bare-metal toolchain INSIDE the sandbox.
+# Prefer compiling in here - a compiler running on the host against
+# agent-written build files is host code execution in disguise.
+# Declaration-only (no recipe): apt needs the composed base's dpkg database, so the
+# install stays a create-time hook rather than an image layer.
+schemaVersion: "3"
+kind: mixin
+version: "2.0.0"
+displayName: Arm embedded toolchain
+description: arm-none-eabi GCC/newlib, CMake, Ninja, gdb-multiarch, cppcheck, clang-format
+sourceUrl: https://github.com/sedurCode/agentbox
+
+capabilities:
+  # The apt mirrors (arm64 uses ports.ubuntu.com), for the install hook below only: the kit
+  # asks for no run-time access to them. sbx's default global policy allows them anyway;
+  # under a stricter one they close before the agent starts.
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      install:
+        allow:
+          - "ports.ubuntu.com"
+          - "archive.ubuntu.com"
+          - "security.ubuntu.com"
+          - "deb.debian.org"
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        # Hook environments are deny-by-default: apt goes through the sandbox proxy.
+        # Skipped when the packages are already there: a sandbox made from a prebuilt
+        # template (`agentbox template <profile>`) has them.
+        - command: |
+            pkgs="
+              gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+              binutils-arm-none-eabi cmake ninja-build make gdb-multiarch cppcheck
+              clang-format python3"
+            if dpkg -s $pkgs >/dev/null 2>&1; then echo "already installed"; exit 0; fi
+            apt-get update &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs &&
+            rm -rf /var/lib/apt/lists/*
+          user: "0"
+          env: [HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, NO_PROXY, no_proxy]
+          description: Install Arm GNU toolchain and build tools
+
+  - type: com.docker.sandbox/agent-context@2
+    config:
+      content: |
+        ## Embedded toolchain
+        arm-none-eabi-gcc, cmake, ninja, make, gdb-multiarch, cppcheck and clang-format are
+        installed in this sandbox. Build and run static analysis here. Hardware (flashing,
+        debug probe) is only reachable through `hosttool` - see `hosttool list`.
+        Don't install system packages yourself (apt); if you need one, ask the user to add it to the kit.

@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 import test_jobs
-from helpers import AgentboxTestCase, FakeSbx, ab
+from helpers import AgentboxTestCase, FakeSbx, ab, needs_hostile_filenames
 
 ESC, BEL, CSI8 = "\x1b", "\x07", "\x9b"
 OSC52 = f"{ESC}]52;c;ZWNobyBwd25lZAo={BEL}"            # "set the host clipboard"
@@ -116,6 +116,7 @@ class DiagnosticsTests(AgentboxTestCase):
         self.assertIsNone(LIVE.search(out.replace("\n", "")))
         self.assertIn(hostile, [c["message"].removeprefix("inside sandbox: ") for c in json.loads(out)["checks"]])
 
+    @needs_hostile_filenames
     def test_audit_file_names_and_git_config_values(self):
         prof = ab.Config().profile("on")
         (self.ws / ".git").mkdir()

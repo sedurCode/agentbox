@@ -5,12 +5,14 @@ import os
 import select
 import subprocess
 import sys
-import termios
 import threading
 import time
 import unicodedata
 import unittest
 from unittest import mock
+
+if sys.platform != "win32":
+    import termios                # only the pty tests use it; they skip on Windows
 
 from helpers import REAL_POPEN, REAL_RUN, AgentboxTestCase, ab
 from test_dashboard import SAMPLE, VIEW
@@ -552,6 +554,7 @@ class RexTabTests(unittest.TestCase):
         os.chmod(path, mode)
         return path
 
+    @unittest.skipIf(sys.platform == "win32", "Rex is macOS/Linux; the lookup relies on the POSIX exec bit")
     def test_lookup_order(self):
         env_rex, path_rex, app_rex = self.exe("env", "myrex"), self.exe("bin", "rex"), self.exe("app", "rex")
         bindir = os.path.dirname(path_rex)
@@ -566,6 +569,7 @@ class RexTabTests(unittest.TestCase):
         self.exe("bin2", "rex", mode=0o644)                         # on PATH but not executable
         self.assertIsNone(ab.rex_program({"PATH": os.path.join(self.tmp.name, "bin2")}))
 
+    @unittest.skipIf(sys.platform == "win32", "Rex is macOS/Linux; the lookup relies on the POSIX exec bit")
     def test_tab_needs_session_and_block(self):
         bindir = os.path.dirname(self.exe("bin", "rex"))
         base = {"PATH": bindir}

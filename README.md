@@ -183,14 +183,25 @@ the important keys:
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
 | `local_model` | `opencode` only: a model served by Ollama on the host, `{ provider = "ollama", model = "...", port = 11434 }` — see *Local models with opencode* |
 
-Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing ones are kept):
+Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing ones are kept; an old
+v2 copy — any `spec.yaml`, which sbx reads before a v3 descriptor — is moved aside to
+`<kit>.v2-backup-<time>` and replaced):
 
 | kit | what it does |
 |---|---|
 | `embedded-arm` | arm-none-eabi GCC/newlib, CMake, Ninja, gdb-multiarch, cppcheck, clang-format |
-| `junie` | JetBrains Junie CLI as an agent (`agent = "junie"`) |
+| `junie` | JetBrains Junie CLI as an agent (`agent = "junie"`). The one kit with a recipe (`junie.dockerfile`): sbx builds it on first use, with Docker on the host if it is running, otherwise in its `sbx-kit-builder` sandbox |
 | `claude-team` | Claude model routing, **Claude profiles only**: `ANTHROPIC_MODEL=opus`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry/error reporting; blocked by the allow-list anyway), plus user-level subagents `reader` (Haiku, read-only lookup), `worker` (Sonnet, scoped edits and tests) and `architect` (Opus, read-only design/review), with instructions to use subagents only when you ask for them. Use as `kits = [..., "claude-team"]` |
 | `python-node` | Python 3 with venv/pip, Node and git, plus the Ubuntu/Debian package hosts needed to install them |
+
+Kits use **kit spec v3**: a directory `<kit>/` holding `<kit>.yaml` (first line
+`# syntax=docker/sandbox-kit:3`, `schemaVersion: "3"`, typed `capabilities` such as
+`network-policy@1`, `lifecycle@1` and `agent-context@2`) and, for a kit with content, `<kit>.dockerfile`.
+sbx now ships its own agents (`claude`, `codex`, …) as v3 kits and refuses to mix v2 (`spec.yaml`) kits
+into them, so agentbox refuses a v2 kit with a hint instead. To convert your own, see the
+[kit spec](https://github.com/docker/sandbox-kit-spec) and its `migrate-kit-to-v3` skill; the kits here
+are worked examples. Kit instructions reach the agent progressively: sbx lists each kit in the agent's
+`CLAUDE.md`/`AGENTS.md` and keeps the text in a per-kit file the agent reads.
 
 **Keep the config and kits out of every workspace.** A kit in the repo is agent-writable,
 so an agent could widen its own allow-list or add host tools for next time. The bridge
@@ -199,7 +210,7 @@ refuses to start if the config or kits dir sits inside a mounted workspace.
 Then:
 
 ```bash
-agentbox doctor            # validates kits, host tools, paths
+agentbox doctor            # loads kits, checks host tools, paths
 ```
 
 ### Skill sets
@@ -360,11 +371,30 @@ agentbox history h750      # the jobs it ran: when, exit, cost, branch, the brie
 agentbox stop h750         # pause sandbox + bridge
 agentbox down h750         # audit, delete sandbox, scoped secrets, local state (--force: also kills a running job, skips sbx's
                             # confirmation - required without a TTY - and deletes the sandbox even if in use, e.g. an open VS Code session)
-agentbox fresh h750        # down + up — use after editing the profile (kits apply at creation)
+agentbox fresh h750        # down + up — use after editing the profile (kits apply at creation); keeps Claude's sessions
+agentbox template h750     # prebuild the profile's kits into an sbx template: new sandboxes start in seconds
 agentbox status
 ```
 
+`down` and `fresh` delete the VM, so in **clone mode** they refuse while it holds work the host does not
+have: a branch whose commits the host repo lacks, uncommitted changes or stashes. Fetch it first
+(`agentbox fetch <profile> --start`), or pass `--force` to drop it. `fresh` also copies Claude's session
+history (`~/.claude/projects`) out of the old VM and into the new one, so `claude --resume` still finds
+your conversations; `down` deletes them with everything else. (sbx does not keep kit volumes across
+`sbx rm` yet, so agentbox copies them itself.)
+
 A new sandbox takes a little while on first create (kit installs run); re-attaching is quick.
+
+**Prebuilt templates.** For a profile with slow kits (apt toolchains such as `embedded-arm`, or your own
+C++/JUCE kit), `agentbox template <profile>` builds a throwaway sandbox from the profile's agent and kits
+only — an empty workspace, no host tools, secrets or generated kit — and saves it with
+`sbx template save` as `agentbox-<profile>:<time>`. From then on `up`/`fresh` create that profile's
+sandboxes from it (`--template … --pull never`), and the kits' install steps see their packages already
+installed and skip. In one measurement a C++/JUCE profile went from 64 s to 6 s per sandbox. The template is
+tied to a fingerprint of the agent and the kits' files: change a kit and agentbox stops using it and says so.
+It also freezes the agent version (and the packages) until you rebuild, so rebuild now and then.
+`agentbox template <profile> --remove` deletes it. A `template` set in the profile wins over a prebuilt one.
+Templates are local to the machine (sbx's image store).
 For throw-away work: `agentbox fresh <profile>` every time.
 
 Inside the sandbox agents run in their "skip permissions" mode — the VM is the boundary.
@@ -432,7 +462,9 @@ agentbox run h750 --prompt-file - --agent-args --model opus < task.md
   first asks `sbx ls --json`. If the sandbox isn't running, `status`, `wait`, the keep-alive and `audit`'s
   `git status` treat the job as `lost` (cached in `job.json`, so later calls make no `sbx` call at all) and
   `doctor` skips its in-sandbox checks ("skipped (sandbox stopped)"; `doctor --start` boots it first).
-  `logs` exits 3 instead of booting; `logs --start` boots it to read the output.
+  `logs` exits 3 instead of booting; `logs --start` boots it to read the output. `down` and `fresh` do boot
+  a stopped sandbox, just before deleting it: to check a clone for unfetched work and (`fresh`) to copy
+  Claude's sessions out.
 - **Retries.** `run`, `wait` and `logs` retry transient `sbx` errors (`context deadline exceeded`,
   connection reset/refused) with exponential backoff (1, 2, 4, 8 s; five attempts). A failed
   `create` is not repeated blindly: agentbox first checks whether the sandbox now exists.
@@ -649,7 +681,7 @@ it never offers `--force`, `--start`, `down`, `fresh`, `run` or `resume`.
 ### Using agentbox from Rex
 
 [Rex](https://www.superlogical.com/rex/docs) users get palette actions and job status from
-`share/rex/` (installed to `~/.local/share/agentbox/share/rex/`; setup in
+`share/rex/` (installed to `~/.local/share/agentbox/share/rex/` when the installer finds Rex; setup in
 [`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
@@ -1117,11 +1149,12 @@ for when auto mode gets in the way. `doctor` shows the mode and warns about `byp
 - **`hosttool: cannot reach host bridge`** → `agentbox status`; is the bridge running?
   `sbx policy log` should show `localhost:<port>` allowed. Bridge output:
   `~/.local/state/agentbox/ab-<profile>/bridge.out`.
-- **Kit errors at create** → `sbx kit validate <dir>`. The kits use the v2 kit grammar
-  (`schemaVersion: "2"`, `permissions.network.allow`, `setup.install`); sbx kits are marked
-  experimental and the schema has changed twice this year, so re-run `agentbox doctor` after
-  sbx upgrades. The generated per-sandbox kit is rendered in one function
-  (`render_local_kit`) if it needs adjusting.
+- **Kit errors at create** → `sbx kit inspect <dir>` (`sbx kit validate` does not take v3 source
+  kits). The kits use kit spec v3 (see *Kits* above); `cannot mix v3 kits with v1/v2 kits` means a
+  kit is still a v2 `spec.yaml` — re-run the installer for the bundled ones. sbx kits are marked
+  experimental and the schema has changed more than once, so re-run `agentbox doctor` after sbx
+  upgrades. The generated per-sandbox kit (`~/.local/state/agentbox/ab-<profile>/kit/agentbox/`) is
+  built in one function (`local_kit_spec`) if it needs adjusting.
 - **Changed the profile but nothing happened** → `agentbox fresh <profile>`.
 - **A skill isn't linked** → `agentbox doctor <profile>` says which and why (not mounted: needs `fresh`; name taken by a folder in the VM's `~/.claude/skills`; a rule violation in the set).
 - **`doctor` says "skill X is not linked (not-mounted)"** after you added a skill set to a profile: mounts

@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh, needs_linux_vm
+from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh, needs_linux_vm, posix_only
 from test_jobs import JobCase
 
 JOBPROGRESS = ab.SHARE_DIR / "jobprogress"
@@ -145,6 +145,7 @@ class JobProgressScriptTests(AgentboxTestCase):
         steps, note = ab.parse_plan(self.tsv().splitlines())
         self.assertEqual((len(steps), note), (1, "kept"))
 
+    @posix_only
     def test_validation(self):
         self.assertEqual(self.jp("start", "1").returncode, 2)                      # no plan yet
         self.jp("plan", "a", "b")
@@ -187,9 +188,15 @@ class JobProgressScriptTests(AgentboxTestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_install_sh_installs_every_share_file(self):
-        script = (ab.SHARE_DIR.parent / "install.sh").read_text()
+        sh_script = (ab.SHARE_DIR.parent / "install.sh").read_text()
+        ps_script = (ab.SHARE_DIR.parent / "install.ps1").read_text()
         for f in (p for p in ab.SHARE_DIR.iterdir() if p.is_file()):
-            self.assertIn(f'share/{f.name}"', script, f"install.sh does not copy share/{f.name}")
+            if f.suffix == ".cmd":          # the Windows launcher: only install.ps1 installs it
+                self.assertIn(f.name, ps_script, f"install.ps1 does not copy share/{f.name}")
+                continue
+            self.assertIn(f'share/{f.name}"', sh_script, f"install.sh does not copy share/{f.name}")
+            if f.name != "agentbox-launcher":   # the sh launcher is replaced by agentbox.cmd on Windows
+                self.assertIn(f"'{f.name}'", ps_script, f"install.ps1 does not copy share/{f.name}")
 
     def test_wrapper_puts_the_job_dir_at_the_end_of_path(self):
         (self.jd / "prompt.md").write_text("p")
@@ -213,10 +220,16 @@ class ProgressCase(JobCase):
     def run_job(self, **kw):
         job = self.start(**kw)
         self.job = job
+        # The fake agent writes its first output at startup and then sleeps. Wait for that write, or on a
+        # slow-starting host (Windows) it lands after a test's set_output() and replaces the fixture.
+        out = self.vm.jobdir(job) / "output.jsonl"
+        deadline = time.time() + 15
+        while time.time() < deadline and not (out.exists() and out.stat().st_size):
+            time.sleep(0.05)
         return job
 
     def set_output(self, job, *lines):
-        (self.vm.jobdir(job) / "output.jsonl").write_text("".join(ln + "\n" for ln in lines))
+        (self.vm.jobdir(job) / "output.jsonl").write_text("".join(ln + "\n" for ln in lines), newline="\n")
 
     def progress(self, *argv, expect=0):
         code, out, err = self.run_main("progress", "p", *argv)
@@ -339,6 +352,7 @@ class SignalTests(ProgressCase):
 
 
 class RunInstallTests(ProgressCase):
+    @posix_only
     def test_reporter_and_paragraph_are_installed_by_default(self):
         job = self.run_job()
         d = self.vm.jobdir(job)
@@ -577,8 +591,10 @@ class StatusShapeTests(ProgressCase):
         self.assertEqual((p["turns"], p["tool_calls"], p["expect_commits"], p["stalled"]), (1, 1, 2, False))
         self.assertIsInstance(p["elapsed_s"], int)
         v = self.view()                                                       # progress --json is the same object
-        self.assertAlmostEqual(p["elapsed_s"], v["elapsed_s"], delta=1)       # the clock may tick between the two calls
-        self.assertEqual({**p, "elapsed_s": 0}, {**v, "elapsed_s": 0})
+        clock = ("elapsed_s", "last_event_age_s")                            # may tick between the two calls
+        for k in clock:
+            self.assertAlmostEqual(p[k], v[k], delta=1, msg=k)
+        self.assertEqual({**p, **dict.fromkeys(clock, 0)}, {**v, **dict.fromkeys(clock, 0)})
 
     def test_no_job_is_null(self):
         rows = self.status_job()

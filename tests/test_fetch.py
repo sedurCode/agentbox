@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh
+from helpers import REAL_RUN, AgentboxTestCase, ab, real_sh, needs_hostile_filenames
 
 REAL_SLEEP, REAL_MONOTONIC = time.sleep, time.monotonic
 
@@ -265,6 +265,7 @@ class ValidationTests(FetchCase):
 
 
 class ReportTests(FetchCase):
+    @needs_hostile_filenames
     def test_output_is_safe_text(self):
         self.commit(self.box, "evil \x1b]52;c;ZXZpbA==\x07 subject")
         (self.box / "we\x1bird.txt").write_text("x\n")

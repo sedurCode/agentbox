@@ -7,11 +7,13 @@ import select
 import shutil
 import subprocess
 import sys
-import termios
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+if sys.platform != "win32":
+    import termios                # only the pty tests use it; they skip on Windows
 
 from helpers import REAL_POPEN, REAL_RUN, AgentboxTestCase, ab, real_sh
 
@@ -66,7 +68,10 @@ class GitCase(AgentboxTestCase):
     def write(self, name, text, repo=None):
         p = Path(repo or self.ws) / name
         p.parent.mkdir(parents=True, exist_ok=True)
-        (p.write_bytes if isinstance(text, bytes) else p.write_text)(text)
+        if isinstance(text, bytes):
+            p.write_bytes(text)
+        else:
+            p.write_text(text, newline="\n")      # no \r\n on Windows: the diffs are compared line by line
 
     def commit(self, subject, repo=None):
         self.clock += 60
@@ -189,7 +194,8 @@ class ItemTests(GitCase):
         self.assertIn("needs a terminal", err)
 
     def test_not_a_repo(self):
-        shutil.rmtree(self.ws / ".git")
+        # git makes objects read-only, which Windows refuses to delete: clear the flag and retry
+        shutil.rmtree(self.ws / ".git", onerror=lambda fn, path, _: (os.chmod(path, 0o700), fn(path)))
         p = ab.review_profile(self.prof, ["p"], {})
         self.assertIn("not a git repository", p["error"])
         self.assertEqual(p["items"], [])
@@ -291,6 +297,7 @@ class MergeTests(GitCase):
         self.assertEqual(self.git(self.ws, "rev-parse", "HEAD^2"), tip)
         self.assertEqual(self.merges(), [["merge", "--no-ff", "--no-edit", "--", "review/p-div"]])
 
+    @unittest.skipIf(sys.platform == "win32", "Windows can't create a file name with a newline or escape")
     def test_conflict_is_aborted_at_once(self):
         self.branch_with("review/p-div", "main", ("a.txt", "agent\n"), ("we\nird\x1b[2J.txt", "x\n"))
         self.write("a.txt", "owner\n")
@@ -329,14 +336,18 @@ class MergeTests(GitCase):
 
 
 class ParserTests(GitCase):
+    @unittest.skipIf(sys.platform == "win32", "Windows can't create a file name with a newline or escape")
     def test_hostile_names_and_binary_files(self):
         names = ["plain.txt", "new\nline.txt", "esc\x1b]2;pwned\x07.txt", "tab\there.txt", "sp ace.txt"]
         start = self.git(self.ws, "rev-parse", "HEAD")
         for n in names:
             self.write(n, "hello\n")
         bad = os.fsencode(str(self.ws)) + b"/bad-\xff\xfe.txt"
-        with open(bad, "wb") as f:
-            f.write(b"x\n")
+        try:
+            with open(bad, "wb") as f:
+                f.write(b"x\n")
+        except OSError as e:            # APFS (macOS) refuses names that are not valid UTF-8 (EILSEQ)
+            self.skipTest(f"this file system refuses non-UTF-8 file names: {e.strerror}")
         self.write("blob.bin", bytes(range(256)) * 4)
         self.git(self.ws, "mv", "a.txt", "renamed.txt")
         self.commit("hostile")
@@ -760,10 +771,11 @@ class ShellAndTabTests(unittest.TestCase):
         os.chmod(self.sh, 0o755)
 
     def test_rex_shell_argv(self):
-        self.assertEqual(ab.rex_shell_argv("/r/rex", "/ws", "p", self.sh),
-                         ["/r/rex", "run", "--shell=none", "--cwd", "/ws", "--label", "p shell", "--", self.sh, "-i"])
-        for args in (("", "/ws", "p", self.sh), ("/r/rex", "ws", "p", self.sh), ("/r/rex", "/ws", "-p", self.sh),
-                     ("/r/rex", "/ws", "p", "/nonexistent/sh"), ("/r/rex", "/ws", None, self.sh)):
+        ws = self.tmp.name              # absolute everywhere: since Python 3.13 "/ws" is not absolute on Windows
+        self.assertEqual(ab.rex_shell_argv("/r/rex", ws, "p", self.sh),
+                         ["/r/rex", "run", "--shell=none", "--cwd", ws, "--label", "p shell", "--", self.sh, "-i"])
+        for args in (("", ws, "p", self.sh), ("/r/rex", "ws", "p", self.sh), ("/r/rex", ws, "-p", self.sh),
+                     ("/r/rex", ws, "p", "/nonexistent/sh"), ("/r/rex", ws, None, self.sh)):
             self.assertIsNone(ab.rex_shell_argv(*args), args)
 
     def screen(self, rexbin):

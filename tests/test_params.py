@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 
-from helpers import AgentboxTestCase, ab
+from helpers import AgentboxTestCase, ab, needs_symlinks
 
 
 class HostToolParamTests(AgentboxTestCase):
@@ -14,8 +14,11 @@ class HostToolParamTests(AgentboxTestCase):
         (self.ws / "fw.elf").write_text("x")
         (self.ws / "notes.txt").write_text("x")
         (self.ws / "sub").mkdir()
-        os.symlink(self.outside / "secret.elf", self.ws / "link.elf")      # symlink escape
-        os.symlink(self.outside, self.ws / "linkdir")
+        try:
+            os.symlink(self.outside / "secret.elf", self.ws / "link.elf")      # symlink escape
+            os.symlink(self.outside, self.ws / "linkdir")
+        except OSError:                         # no symlink privilege: the tests that use the links are skipped
+            pass
         cfg = self.write_config(f'''
             [tools.flash]
             argv = ["{sys.executable}", "{{elf}}"]
@@ -59,6 +62,7 @@ class HostToolParamTests(AgentboxTestCase):
         self.assertRejected("flash", {"elf": str(self.outside / "secret.elf")})
         self.assertRejected("flash", {"elf": "../outside/secret.elf"})
 
+    @needs_symlinks
     def test_path_symlink_escape_rejected(self):
         self.assertRejected("flash", {"elf": "link.elf"})
         self.assertRejected("flash", {"elf": "linkdir/secret.elf"})
@@ -153,8 +157,8 @@ class PreflightTests(AgentboxTestCase):
         import io
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ab.Bridge(self.prof(["/nonexistent/tool"]))
-            ab.Bridge(self.prof(["/nonexistent/tool"]))
+            ab.Bridge(self.prof([str(self.tmp / "nonexistent" / "tool")]))
+            ab.Bridge(self.prof([str(self.tmp / "nonexistent" / "tool")]))
         self.assertEqual(err.getvalue().count("not executable/present"), 1)
 
 

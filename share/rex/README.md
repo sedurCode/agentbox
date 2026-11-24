@@ -1,7 +1,8 @@
 # agentbox in Rex
 
-[Rex](https://www.superlogical.com/rex/docs) runs on the host only. `install.sh` copies these files to
-`~/.local/share/agentbox/share/rex/` and never touches `~/.config/rex/`.
+[Rex](https://www.superlogical.com/rex/docs) runs on the host only. `install.sh` (or `install.ps1`) copies these files to
+`~/.local/share/agentbox/share/rex/` if it finds Rex (`$AGENTBOX_REX`, `rex` on `PATH`,
+Rex.app or `~/.config/rex/`), and never touches `~/.config/rex/`. Installed Rex after agentbox? Run the installer again.
 
 ## Actions
 

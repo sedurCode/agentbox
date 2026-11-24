@@ -29,11 +29,17 @@ cp "$SRC/share/jobwrap" "$DEST/share/jobwrap"
 cp "$SRC/share/jobprogress" "$DEST/share/jobprogress"
 mkdir -p "$DEST/share/skill"
 cp -R "$SRC/share/skill/." "$DEST/share/skill/"
-# Rex actions; ~/.config/rex/ is never touched (see share/rex/README.md)
-mkdir -p "$DEST/share/rex"
-cp -R "$SRC/share/rex/." "$DEST/share/rex/"
-# an earlier install shipped notify.lua; Rex's own notifications replace it
-rm -f "$DEST/share/rex/notify.lua"
+# Rex actions, only if Rex is here (found as agentbox's rex_program() finds it, or a ~/.config/rex);
+# ~/.config/rex/ is never touched (see share/rex/README.md)
+REX_APP_CLI="/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
+HAVE_REX=""
+if [ -x "${AGENTBOX_REX:-}" ] || command -v rex >/dev/null 2>&1 || [ -x "$REX_APP_CLI" ] || [ -d "$HOME/.config/rex" ]; then
+  HAVE_REX=1
+  mkdir -p "$DEST/share/rex"
+  cp -R "$SRC/share/rex/." "$DEST/share/rex/"
+  # an earlier install shipped notify.lua; Rex's own notifications replace it
+  rm -f "$DEST/share/rex/notify.lua"
+fi
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
@@ -43,8 +49,14 @@ ln -sf "$DEST/bin/agentbox" "$BIN/agentbox"
 
 for k in "$SRC"/kits/*/; do
   name="$(basename "$k")"
-  if [ -e "$CFG/kits/$name" ]; then echo "kept existing kit $CFG/kits/$name"
-  else cp -R "$k" "$CFG/kits/$name"; echo "installed kit $name"; fi
+  dst="$CFG/kits/$name"
+  # sbx ships its agents as v3 kits and refuses to mix in v2 ones (spec.yaml): set an old copy aside
+  if [ -e "$dst/spec.yaml" ]; then
+    bak="$dst.v2-backup-$(date +%Y%m%d%H%M%S)"
+    mv "$dst" "$bak"; echo "moved the v2 kit $name to $bak (sbx needs kit spec v3)"
+  fi
+  if [ -e "$dst" ]; then echo "kept existing kit $dst"
+  else cp -R "$k" "$dst"; echo "installed kit $name"; fi
 done
 for g in "$SRC"/config/gdb/*.gdb; do
   [ -e "$CFG/gdb/$(basename "$g")" ] || cp "$g" "$CFG/gdb/"
@@ -58,10 +70,14 @@ fi
 chmod 700 "$CFG"
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "add $BIN to PATH";; esac
-echo "Rex: to add the agentbox actions, put these two lines in ~/.config/rex/init.lua:"
-if [ "$DEST" = "$HOME/.local/share/agentbox" ]; then rexpath='os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;"'
-else rexpath="\"$DEST/share/rex/?.lua;\""; fi
-echo "  package.path = $rexpath .. package.path"
-echo "  require(\"agentbox\").setup{}"
+if [ -n "$HAVE_REX" ]; then
+  echo "Rex: to add the agentbox actions, put these two lines in ~/.config/rex/init.lua:"
+  if [ "$DEST" = "$HOME/.local/share/agentbox" ]; then rexpath='os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;"'
+  else rexpath="\"$DEST/share/rex/?.lua;\""; fi
+  echo "  package.path = $rexpath .. package.path"
+  echo "  require(\"agentbox\").setup{}"
+else
+  echo "Rex not found: skipped the Rex actions (install Rex, then run install.sh again to add them)"
+fi
 echo "agents on this machine (Claude Code, Codex, OpenCode, Pi): \`agentbox skill setup\` installs the agentbox skill"
 echo "done. next: sbx login, then edit $CFG/agentbox.toml, then: agentbox doctor"

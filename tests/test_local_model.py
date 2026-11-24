@@ -108,21 +108,25 @@ class KitTests(AgentboxTestCase):
 
     def render(self, name):
         kit_dir, digest = ab.render_local_kit(self.cfg.profile(name), "tok")
-        return Path(kit_dir), (Path(kit_dir) / "spec.yaml").read_text()
+        return Path(kit_dir), ab.kit_descriptor(Path(kit_dir)).read_text()
+
+    def files(self, name):
+        return ab.local_kit_spec(self.cfg.profile(name), "tok")[1]
 
     def test_allow_entry_env_and_provider_config(self):
         kit, spec = self.render("lm")
         self.assertIn('- "localhost:11434"', spec)
         self.assertIn('- "example.com"', spec)
-        self.assertIn(f'OPENCODE_CONFIG: "{ab.OPENCODE_CONFIG_VM}"', spec)
-        conf = json.loads((kit / "files" / "home" / ".agentbox" / "opencode.json").read_text())
+        self.assertIn(f'default: "{ab.OPENCODE_CONFIG_VM}"', spec)
+        self.assertIn("env: \"OPENCODE_CONFIG\"", spec)
+        conf = json.loads(self.files("lm")[ab.OPENCODE_CONFIG_VM])
         prov = conf["provider"]["ollama"]
         self.assertEqual(prov["npm"], "@ai-sdk/openai-compatible")
         self.assertEqual(prov["options"]["baseURL"], "http://host.docker.internal:11434/v1")
         self.assertEqual(prov["models"]["gemma4:12b"]["limit"], {"context": 32768, "output": 8192})
         self.assertTrue(prov["models"]["gemma4:12b"]["tool_call"])
         self.assertEqual((conf["model"], conf["small_model"]), ("ollama/gemma4:12b", "ollama/gemma4:12b"))
-        self.assertEqual(ab.OPENCODE_CONFIG_VM, "/home/agent/.agentbox/opencode.json")   # files/home/ -> /home/agent/
+        self.assertEqual(ab.OPENCODE_CONFIG_VM, "/home/agent/.agentbox/opencode.json")
 
     def test_nothing_is_written_into_the_workspace(self):
         before = sorted(self.ws.rglob("*"))
@@ -134,7 +138,7 @@ class KitTests(AgentboxTestCase):
         kit, spec = self.render("plain")
         self.assertNotIn("localhost:", spec)
         self.assertNotIn("OPENCODE_CONFIG", spec)
-        self.assertFalse((kit / "files" / "home" / ".agentbox" / "opencode.json").exists())
+        self.assertNotIn(ab.OPENCODE_CONFIG_VM, self.files("plain"))
 
     def test_changing_the_model_changes_the_digest(self):
         _, d1 = ab.render_local_kit(self.cfg.profile("lm"), "tok")

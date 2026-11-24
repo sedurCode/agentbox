@@ -66,6 +66,7 @@ import stat
 import subprocess
 import textwrap
 import threading
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -178,7 +179,8 @@ LOCAL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9][A-Za
                             r"(:[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$")
 LOCAL_MODEL_MIN_CONTEXT = 32768             # below this an agent's system prompt + tools + a few files don't fit
 OPENCODE_PROVIDER = "ollama"                # provider id in the generated opencode config
-OPENCODE_CONFIG_VM = "/home/agent/.agentbox/opencode.json"
+VM_HOME = "/home/agent"                    # the agent user (uid 1000) in every sbx template
+OPENCODE_CONFIG_VM = f"{VM_HOME}/.agentbox/opencode.json"
 
 
 # ----------------------------------------------------------------- helpers
@@ -207,6 +209,154 @@ def die(msg: str, code: int = EXIT_FAIL):
 
 def info(msg: str):
     print(f"agentbox: {safe_text(msg)}", file=sys.stderr)
+
+
+# ------------------------------------------------------ platform shim
+# Everything that differs between POSIX and Windows hosts lives here; POSIX behaviour is unchanged.
+IS_WIN = sys.platform == "win32"
+
+
+def owner_only(path: str | Path, is_dir: bool = False):
+    """Restrict a file or directory to the current user (chmod on POSIX, icacls on Windows)."""
+    if not IS_WIN:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+        return
+    user = os.environ.get("USERNAME") or os.getlogin()
+    perm = "(OI)(CI)F" if is_dir else "F"
+    r = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:{perm}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise OSError(f"icacls failed on {path}: {r.stdout.strip() or r.stderr.strip()}")
+
+
+def owned_by_me(path: Path) -> bool:
+    """False only when we can tell the path belongs to someone else. Windows ownership is a SID, so
+    there the check is best-effort: the directory is under the user's profile and locked down by
+    owner_only()."""
+    if IS_WIN:
+        return True
+    return path.stat().st_uid == os.getuid()
+
+
+def detached_popen_kwargs() -> dict:
+    """Popen kwargs that detach a child from this process and its terminal."""
+    if not IS_WIN:
+        return {"start_new_session": True}
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW}
+
+
+def process_cmdline(pid: int) -> list[str]:
+    """The command line of a running process as a list of tokens, [] if there is no such process."""
+    if not IS_WIN:
+        return subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True).stdout.split()
+    ps = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                          capture_output=True, text=True).stdout.replace('"', " ").split()
+
+
+def terminate(pid: int):
+    """Ask a process to stop: SIGTERM on POSIX; Windows has no SIGTERM, so end the process tree."""
+    if not IS_WIN:
+        os.kill(pid, signal.SIGTERM)
+        return
+    subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"], capture_output=True)
+
+
+def on_sigterm(handler):
+    """Install a SIGTERM handler where the platform has SIGTERM semantics (not Windows)."""
+    if not IS_WIN:
+        signal.signal(signal.SIGTERM, handler)
+
+
+# Environment passed to agentbox's own background children (bridge, keepalive): an allow-list, so that
+# API keys and tokens in the user's environment never reach them. Windows has no HOME and Python and sbx
+# need SystemRoot, USERPROFILE, LOCALAPPDATA and TEMP to start at all.
+CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "USER", "AGENTBOX_CONFIG_DIR")
+CHILD_ENV_KEYS_WIN = ("USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SystemRoot", "SystemDrive", "TEMP", "TMP",
+                      "APPDATA", "LOCALAPPDATA", "USERNAME", "PATHEXT", "ComSpec")
+
+
+def child_env() -> dict:
+    if not IS_WIN:
+        return {k: v for k, v in os.environ.items() if k in CHILD_ENV_KEYS}
+    keys = {k.upper() for k in CHILD_ENV_KEYS + CHILD_ENV_KEYS_WIN}          # env names are case-insensitive here
+    return {k: v for k, v in os.environ.items() if k.upper() in keys}
+
+
+def vm_path(p) -> str:
+    r"""A host path as the Linux microVM sees it. sbx mounts D:\Neural\x at /d/Neural/x: the drive
+    letter is lowercased, the rest is kept as is, backslashes become slashes. POSIX hosts: unchanged."""
+    s = str(p)
+    if not IS_WIN:
+        return s
+    m = re.match(r"^([A-Za-z]):(?:[\\/]+(.*))?$", s)
+    if not m:
+        die(f"cannot map {s} into the sandbox: only drive-letter paths are supported on Windows", EXIT_USAGE)
+    return "/" + m.group(1).lower() + ("/" + m.group(2).replace("\\", "/") if m.group(2) else "")
+
+
+def host_path(s: str) -> Path:
+    r"""The host path for a path the agent gave us (the inverse of vm_path). The VM sees D:\x as /d/x. On
+    Windows: /d/x -> D:\x, a drive-letter path and a relative path pass through, and any other absolute
+    POSIX path (/etc/passwd, //server/share) is refused with ValueError: it is not a mounted host path.
+    Callers still check the result against the workspace roots; this only does the mapping. POSIX hosts: as is."""
+    if not IS_WIN:
+        return Path(s)
+    if re.match(r"^[A-Za-z]:", s):
+        return Path(s)
+    m = re.match(r"^/([A-Za-z])(?:/(.*))?$", s)
+    if m:
+        return Path(m.group(1).upper() + ":/" + (m.group(2) or ""))
+    if s.startswith(("/", "\\")):
+        raise ValueError(f"{s} is not a path on a mounted host drive")
+    return Path(s)
+
+
+def tool_base_env() -> dict:
+    """The environment a host tool starts with: minimal, no inherited secrets. Per-tool `env` adds to it."""
+    if not IS_WIN:
+        return {"PATH": HOST_TOOL_PATH,
+                "HOME": str(HOME), "LANG": os.environ.get("LANG", "en_US.UTF-8")}
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    env = {"PATH": f"{root}\\System32;{root}", "SystemRoot": root, "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+           "ComSpec": os.environ.get("ComSpec", f"{root}\\System32\\cmd.exe"), "USERPROFILE": str(HOME)}
+    for k in ("SystemDrive", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles",
+              "ProgramFiles(x86)", "USERNAME", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
+
+
+def resolve_exe(exe: Path) -> Path:
+    """exe itself, or on Windows exe plus a PATHEXT suffix (CreateProcess adds .exe, so `cc21k` means cc21k.exe)."""
+    if IS_WIN and not exe.exists() and not exe.suffix:
+        for ext in (".exe", ".com"):
+            if exe.with_suffix(ext).exists():
+                return exe.with_suffix(ext)
+    return exe
+
+
+def run_tool(argv: list, cwd, env: dict, timeout: int) -> tuple[int, bytes, bytes]:
+    """Run a host tool; (exit code, stdout, stderr). On timeout the tool AND its children are stopped: cc21k and
+    openocd start helper processes, and subprocess.run() only kills the direct child (on Windows)."""
+    if not IS_WIN:
+        try:
+            p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout,
+                               stdin=subprocess.DEVNULL)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired as e:
+            return 124, e.stdout or b"", (e.stderr or b"") + f"\n[agentbox] timed out after {timeout}s".encode()
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out, err
+    except subprocess.TimeoutExpired:
+        terminate(p.pid)
+        out, err = p.communicate()
+        return 124, out or b"", (err or b"") + f"\n[agentbox] timed out after {timeout}s".encode()
 
 
 def xp(p: str | Path) -> Path:
@@ -447,7 +597,25 @@ class Profile:
 
     def skill_links(self) -> list[tuple[str, str]]:
         """(skill, VM path of its folder) for every skill of every set; the mount keeps the host path."""
-        return [(sk, f"{ss.path}/{ss.folders[sk]}") for ss in self.skillsets for sk in ss.skills]
+        return [(sk, f"{vm_path(ss.path)}/{ss.folders[sk]}") for ss in self.skillsets for sk in ss.skills]
+
+
+KIT_SYNTAX = "# syntax=docker/sandbox-kit:3"
+
+
+def kit_descriptor(d: Path) -> Path:
+    """A v3 kit directory's descriptor: <dir>/<dir name>.yaml (sbx names the kit after the directory)."""
+    return d / f"{d.name}.yaml"
+
+
+def is_kit_dir(d: Path) -> bool:
+    return kit_descriptor(d).is_file()
+
+
+def is_v2_kit_dir(d: Path) -> bool:
+    """A kit in the old v2 grammar: sbx refuses to mix it with the v3 built-in agents. sbx reads a
+    spec.yaml first, so a directory holding one is v2 even beside a v3 descriptor."""
+    return (d / "spec.yaml").is_file()
 
 
 def resolve_kit(ref: str) -> Path:
@@ -455,8 +623,14 @@ def resolve_kit(ref: str) -> Path:
     workspaces on purpose: a kit in the repo is agent-writable."""
     cand = KITS_DIR / ref
     p = cand if cand.is_dir() else xp(ref)
-    if not (p / "spec.yaml").exists():
-        die(f"kit '{ref}' not found (looked in {cand} and {p})", EXIT_USAGE)
+    if is_v2_kit_dir(p):
+        hint = (f"move spec.yaml out of {p} (sbx reads it before {kit_descriptor(p).name})" if is_kit_dir(p)
+                else f"rewrite it as {kit_descriptor(p).name} (kit spec v3), or reinstall agentbox to update the"
+                     " bundled kits")
+        die(f"kit '{ref}' ({p}) uses the v2 kit grammar (spec.yaml). sbx now ships its agents as v3 kits and"
+            f" will not mix the two: {hint}. See README, \"Kits\".", EXIT_USAGE)
+    if not is_kit_dir(p):
+        die(f"kit '{ref}' not found (looked for {kit_descriptor(cand)} and {kit_descriptor(p)})", EXIT_USAGE)
     return p
 
 
@@ -576,6 +750,13 @@ def check_include_path(root: Path, raw) -> tuple[str | None, str]:
     every component an existing real directory (lstat, so a symlink at ANY level is refused)."""
     if not isinstance(raw, str) or not raw.strip():
         return None, "include entries must be non-empty strings"
+    if IS_WIN:
+        # Windows treats both separators alike and has drive letters: `C:\x` is absolute and `a\..\..\b` climbs out
+        # of the set, though PurePosixPath sees neither (one odd component, no ".."). A colon is a drive letter
+        # or an NTFS alternate data stream (`dir:stream`): never part of a plain folder path.
+        if ":" in raw:
+            return None, f"include path '{raw}' must be relative to the set"
+        raw = raw.replace("\\", "/")
     rel = PurePosixPath(raw)
     if rel.is_absolute():
         return None, f"include path '{raw}' must be relative to the set"
@@ -591,7 +772,7 @@ def check_include_path(root: Path, raw) -> tuple[str | None, str]:
         except (OSError, ValueError):
             return None, f"include path '{raw}' does not exist"
         if stat.S_ISLNK(st.st_mode):
-            return None, f"include path '{raw}' goes through a symlink ({cur.relative_to(root)})"
+            return None, f"include path '{raw}' goes through a symlink ({cur.relative_to(root).as_posix()})"
         if not stat.S_ISDIR(st.st_mode):
             return None, f"include path '{raw}' is not a directory"
     if not is_within(cur.resolve(), root):
@@ -715,7 +896,7 @@ def _walk_set(top: Path, root: Path, allow_other: bool, bad_text: list, specials
     for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
         for n in dirnames + filenames:
             full = Path(dirpath) / n
-            rel = str(full.relative_to(root))
+            rel = full.relative_to(root).as_posix()      # repo-relative: always "/", like `include` entries
             st = os.lstat(full)
             if stat.S_ISLNK(st.st_mode):
                 links.append(rel)
@@ -774,12 +955,20 @@ def warn_skill_drift(prof: Profile):
 
 
 # --------------------------------------------------------------- sbx shell
+NO_SSH_AGENT_SOCK = r"C:\agentbox-no-ssh-agent"      # deliberately nonexistent
+
+
 def sbx_env(cfg: Config) -> dict:
     env = dict(os.environ)
     if not cfg.settings["forward_ssh_agent"]:
         # sbx forwards the host SSH agent when SSH_AUTH_SOCK is set; that would
         # let the agent authenticate as you anywhere your keys work.
-        env.pop("SSH_AUTH_SOCK", None)
+        if IS_WIN:
+            # Unset is NOT safe on Windows: sbx then falls back to the Windows OpenSSH agent (named
+            # pipe) and the sandbox can use its keys. Any path, even a dead one, forwards nothing.
+            env["SSH_AUTH_SOCK"] = NO_SSH_AGENT_SOCK
+        else:
+            env.pop("SSH_AUTH_SOCK", None)
     return env
 
 
@@ -815,13 +1004,22 @@ def sbx(cfg: Config, *args, check=True, capture=False, stdin=None):
     if cfg.settings["verbose"]:
         info("+ " + redact(cmd))
     try:
-        return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True, errors="replace",
-                              capture_output=capture, input=stdin)
+        if stdin is not None:
+            # Text mode would turn \n into \r\n on Windows and corrupt scripts and files sent into the
+            # Linux VM (a `#!/bin/sh\r` shebang). Send bytes and decode the answer ourselves.
+            r = subprocess.run(cmd, env=sbx_env(cfg), check=check, capture_output=capture,
+                               input=stdin.encode("utf-8"))
+            if capture:
+                r.stdout = (r.stdout or b"").decode("utf-8", "replace").replace("\r\n", "\n")
+                r.stderr = (r.stderr or b"").decode("utf-8", "replace").replace("\r\n", "\n")
+            return r
+        return subprocess.run(cmd, env=sbx_env(cfg), check=check, text=True, encoding="utf-8", errors="replace",
+                              capture_output=capture)
     except FileNotFoundError:
         die(f"'{cfg.settings['sbx']}' not found - install Docker Sandboxes (macOS: brew trust docker/tap && brew install docker/tap/sbx; Linux: docs.docker.com/sandboxes)")
     except subprocess.CalledProcessError as e:
-        die(f"`{redact(cmd)}` failed (exit {e.returncode})"
-            + (f"\n{e.stderr}" if e.stderr else ""))
+        err = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else e.stderr
+        die(f"`{redact(cmd)}` failed (exit {e.returncode})" + (f"\n{err}" if err else ""))
 
 
 TRANSIENT_MARKERS = ("context deadline exceeded", "connection reset", "connection refused")
@@ -947,9 +1145,22 @@ def opencode_config(lm: dict) -> dict:
     }
 
 
-def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
-    """Per-sandbox mixin: network allow/deny, env, host-tool client, instructions.
-    Stored in the state dir (not a workspace), so the agent can't edit it."""
+KIT_ARG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+LOCAL_KIT_NAME = "agentbox"
+
+
+def _no_kit_placeholders(prof: "Profile", values: list[str]):
+    """sbx expands `${{ ... }}` anywhere in a v3 descriptor, so a profile value holding one would be
+    read as a kit reference (and refused). Say so plainly instead of letting sbx fail at create."""
+    for v in values:
+        if "${{" in str(v):
+            die(f"profile '{prof.name}': '${{{{' is reserved by the sbx kit format; remove it from env,"
+                " allow/deny or instructions", EXIT_USAGE)
+
+
+def local_kit_spec(prof: Profile, token: str) -> tuple[dict, dict]:
+    """The per-sandbox mixin as a kit spec v3 descriptor (dict), and the files it writes in the VM
+    ({VM path: content}; they are inline in the descriptor too)."""
     cfg = prof.cfg
     allow = list(prof.d["allow"])
     if prof.d.get("vscode"):
@@ -963,16 +1174,18 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
         "- There are no git push credentials or production secrets in here, by design. Commit locally; the user reviews and pushes.",
         "- Do not edit git hooks, CI config, editor task files or anything under .sbx/ unless asked; these are reviewed separately.",
     ]
-    setup = {"install": []}
+    startup = []
     files = {}
     if prof.tool_names:
         allow.append(f"localhost:{prof.port}")
         env["HOSTTOOLS_URL"] = f"http://host.docker.internal:{prof.port}"
         env["HOSTTOOLS_TOKEN"] = token
-        files["home/.agentbox/hosttool"] = (SHARE_DIR / "hosttool").read_text()
-        setup["install"].append({
-            "command": "install -m 0755 /home/agent/.agentbox/hosttool /usr/local/bin/hosttool"
-                       " && (command -v python3 >/dev/null || (apt-get update && apt-get install -y python3))",
+        files[f"{VM_HOME}/.agentbox/hosttool"] = (SHARE_DIR / "hosttool").read_text()
+        # Runtime-written files belong to the agent and land after install hooks, so a root
+        # startup hook (every boot; idempotent) puts the client on PATH. The sbx agent templates
+        # ship python3, which it needs.
+        startup.append({
+            "command": f"install -m 0755 {VM_HOME}/.agentbox/hosttool /usr/local/bin/hosttool",
             "user": "0",
             "description": "Install agentbox hosttool client",
         })
@@ -990,7 +1203,7 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
         # keeps the host's localhost closed otherwise.
         if f"localhost:{lm['port']}" not in allow:
             allow.append(f"localhost:{lm['port']}")
-        files["home/.agentbox/opencode.json"] = json.dumps(opencode_config(lm), indent=2) + "\n"
+        files[OPENCODE_CONFIG_VM] = json.dumps(opencode_config(lm), indent=2) + "\n"
         env["OPENCODE_CONFIG"] = OPENCODE_CONFIG_VM
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
         env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"     # models.dev isn't on the allow-list; the model is in the config
@@ -1004,35 +1217,59 @@ def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
     mounts = prof.skill_mounts()
     if mounts:
         instructions += ["", "## Skill sets",
-                         "Read-only skill sets from the user's host are mounted at " + ", ".join(map(str, mounts))
+                         "Read-only skill sets from the user's host are mounted at " + ", ".join(map(vm_path, mounts))
                          + " and linked into ~/.claude/skills. They are read-only: do not try to edit them,"
                            " ask the user. Skills you write yourself go in ~/.claude/skills as normal folders."]
     if prof.d.get("instructions"):
         instructions += ["", prof.d["instructions"]]
+    allow = list(dict.fromkeys(allow))
+    for name, value in env.items():
+        if not KIT_ARG_RE.match(name):
+            die(f"profile '{prof.name}': env name '{name}' is not a valid variable name", EXIT_USAGE)
+    _no_kit_placeholders(prof, list(env.values()) + allow + list(prof.d["deny"]) + instructions
+                         + list(files.values()))
+    network = {k: v for k, v in (("allow", allow), ("deny", list(prof.d["deny"]))) if v}
+    lifecycle = {}
+    if startup:
+        lifecycle["startup"] = startup
+    if files:
+        lifecycle["files"] = [{"path": path, "content": body, "description": "agentbox"}
+                              for path, body in files.items()]
+    caps = []
+    if network:
+        caps.append({"type": "com.docker.sandbox/network-policy@1", "config": {"runtime": network}})
+    if lifecycle:
+        caps.append({"type": "com.docker.sandbox/lifecycle@1", "config": lifecycle})
+    caps.append({"type": "com.docker.sandbox/agent-context@2",
+                 "config": {"content": "\n".join(instructions) + "\n"}})
+    # Kit spec v3, declaration-only (no recipe, so sbx needs no image build). A declaration-only
+    # mixin has no image config for ENV: each variable is a create-phase arg exported under its name.
     spec = {
-        "schemaVersion": "2",
+        "schemaVersion": "3",
         "kind": "mixin",
-        "name": f"{prof.sandbox}-local"[:64],
+        "version": "1.0.0",
         "displayName": f"agentbox {prof.name}",
-        "description": "Generated by agentbox - do not edit; edit agentbox.toml instead",
-        "permissions": {"network": {k: v for k, v in (("allow", allow), ("deny", list(prof.d["deny"]))) if v}},
-        "environment": {"variables": env},
-        "agentInstructions": {"content": "\n".join(instructions) + "\n"},
+        "description": ("agentbox sandbox rules: network, git and host tools. Read before you start any task."),
     }
-    if not spec["permissions"]["network"]:
-        del spec["permissions"]
-    if setup["install"]:
-        spec["setup"] = setup
-    text = "# generated by agentbox - edit ~/.config/agentbox/agentbox.toml instead\n" + yaml_dump(spec) + "\n"
-    kit_dir = prof.state / "kit"
-    if kit_dir.exists():
-        shutil.rmtree(kit_dir)
-    (kit_dir / "files").mkdir(parents=True)
-    (kit_dir / "spec.yaml").write_text(text)
-    for rel, content in files.items():
-        p = kit_dir / "files" / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+    if env:
+        spec["args"] = {k: {"default": v, "env": k} for k, v in env.items()}
+    spec["capabilities"] = caps
+    return spec, files
+
+
+def render_local_kit(prof: Profile, token: str) -> tuple[str, str]:
+    """Per-sandbox mixin: network allow/deny, env, host-tool client, instructions.
+    Stored in the state dir (not a workspace), so the agent can't edit it."""
+    cfg = prof.cfg
+    spec, files = local_kit_spec(prof, token)
+    text = (KIT_SYNTAX + "\n# generated by agentbox - edit ~/.config/agentbox/agentbox.toml instead\n"
+            + yaml_dump(spec) + "\n")
+    kit_root = prof.state / "kit"
+    if kit_root.exists():
+        shutil.rmtree(kit_root)
+    kit_dir = kit_root / LOCAL_KIT_NAME         # the directory name is the kit's name inside the sandbox
+    kit_dir.mkdir(parents=True)
+    kit_descriptor(kit_dir).write_text(text, newline="\n")      # LF on Windows too: these run in the Linux VM
     # `skills` only counts once used, so sandboxes made before skill sets existed don't look changed
     shaped = {k: v for k, v in prof.d.items() if k != "skills" or v}
     # only the path is baked in at creation (the mount); ref/include/allow_scripts apply live, no fresh needed
@@ -1051,19 +1288,18 @@ def secure_state(cfg: Config):
         for d in [dirpath] + [os.path.join(dirpath, n) for n in dirnames]:
             try:
                 if not os.path.islink(d):
-                    os.chmod(d, 0o700)
+                    owner_only(d, is_dir=True)
             except OSError:
                 pass
         for f in filenames:
             fp = os.path.join(dirpath, f)
             try:
                 if not os.path.islink(fp):
-                    os.chmod(fp, 0o600)
+                    owner_only(fp)
             except OSError:
                 pass
-    st = root.stat()
-    if st.st_uid != os.getuid():
-        die(f"state dir {root} is owned by uid {st.st_uid}, not you - refusing to use it")
+    if not owned_by_me(root):
+        die(f"state dir {root} is owned by uid {root.stat().st_uid}, not you - refusing to use it")
 
 
 def get_token(prof: Profile) -> str:
@@ -1071,7 +1307,7 @@ def get_token(prof: Profile) -> str:
     if not tf.exists():
         prof.state.mkdir(parents=True, exist_ok=True)
         tf.write_text(pysecrets.token_urlsafe(32))
-        tf.chmod(0o600)
+        owner_only(tf)
     return tf.read_text().strip()
 
 
@@ -1365,6 +1601,10 @@ class Bridge:
             exe = Path(_expand_literal(argv[0]))
             if not exe.is_absolute():
                 die(f"tool '{n}': argv[0] must be an absolute path (got {argv[0]})", EXIT_USAGE)
+            exe = resolve_exe(exe)
+            if IS_WIN and exe.suffix.lower() in (".bat", ".cmd"):
+                # CreateProcess runs these through cmd.exe, whose quoting rules let an argument inject commands
+                die(f"tool '{n}': {exe.name} is a batch file; point argv[0] at an .exe (or a wrapper .exe)", EXIT_USAGE)
             rexe = exe.resolve()
             if (not rexe.exists() or not os.access(rexe, os.X_OK)) and n not in _WARNED_TOOLS:
                 _WARNED_TOOLS.add(n)      # once per run, not once per profile that lists it
@@ -1392,7 +1632,10 @@ class Bridge:
             raise ToolError(f"{pname}: must be a string")
         raw = str(raw)
         if typ == "path":
-            p = Path(raw)
+            try:
+                p = host_path(raw)          # the agent sees /d/x, the host has D:\x
+            except ValueError as e:
+                raise ToolError(f"{pname}: {e}")
             p = (cwd / p if not p.is_absolute() else p).resolve()
             if not self._root_for(p):
                 raise ToolError(f"{pname}: {p} is outside the mounted workspaces")
@@ -1467,7 +1710,10 @@ class Bridge:
         t = self.tools.get(tname)
         if not t:
             raise ToolError(f"unknown tool '{tname}'. Available: {', '.join(self.tools)}")
-        cwd = Path(cwd_s or "/").resolve()
+        try:
+            cwd = host_path(cwd_s or "/").resolve()
+        except ValueError as e:
+            raise ToolError(f"cwd: {e}; cd into the project first")
         ws = self._root_for(cwd)
         if not ws:
             raise ToolError(f"cwd {cwd} is not inside a mounted workspace; cd into the project first")
@@ -1536,7 +1782,10 @@ class Bridge:
         return bool(t.get("confirm", self.prof.d.get("confirm_host_tools", False)))
 
     def confirm(self, tname: str, argv: list[str], timeout: int) -> bool:
-        """Ask the human on the host: osascript on macOS, zenity or kdialog on Linux; else deny."""
+        """Ask the human on the host: osascript on macOS, zenity or kdialog on Linux, a PowerShell
+        message box on Windows; else deny."""
+        if IS_WIN:
+            return self.confirm_windows(tname, argv, timeout)
         where = "this Mac" if sys.platform == "darwin" else "this machine"
         msg = f"Sandbox {self.prof.sandbox} wants to run on {where}:\n\n" + shlex.join(argv)[:900]
         title = "agentbox host tool"
@@ -1562,7 +1811,7 @@ class Bridge:
                            "--no-label", "Deny"], ""
         else:
             self.log({"tool": tname, "confirm": "denied", "reason": "no dialog available"
-                      " (needs osascript on macOS, or zenity/kdialog and a display on Linux)"})
+                      " (needs osascript on macOS, zenity/kdialog and a display on Linux, or Windows)"})
             return False
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
@@ -1570,11 +1819,30 @@ class Bridge:
             return False
         return r.returncode == 0 and r.stdout.strip() == ok_out
 
+    # Reads the message from the environment, never from the script text: argv is agent-influenced.
+    # Deny is the default button, and closing the dialog or timing out is a deny.
+    WIN_CONFIRM_PS = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; "
+        "$r = [System.Windows.Forms.MessageBox]::Show($f, $env:AGENTBOX_CONFIRM_MSG, 'agentbox host tool', "
+        "'YesNo', 'Warning', 'Button2'); [Console]::Out.Write($r)")
+
+    def confirm_windows(self, tname: str, argv: list[str], timeout: int) -> bool:
+        msg = (f"Sandbox {self.prof.sandbox} wants to run on this PC:\n\n"
+               + subprocess.list2cmdline(argv)[:900] + "\n\nAllow?")
+        env = {**tool_base_env(), "AGENTBOX_CONFIRM_MSG": msg}
+        try:
+            code, out, _ = run_tool(["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command",
+                                     self.WIN_CONFIRM_PS], None, env, timeout)
+        except OSError:
+            self.log({"tool": tname, "confirm": "denied", "reason": "could not start PowerShell"})
+            return False
+        return code == 0 and out.decode(errors="replace").strip() == "Yes"
+
     def run(self, tname, params, extra, cwd):
         t, argv, run_cwd = self.build(tname, params, extra, cwd)
         self.check_rate(tname, t)
-        env = {"PATH": HOST_TOOL_PATH,
-               "HOME": str(HOME), "LANG": os.environ.get("LANG", "en_US.UTF-8")}
+        env = tool_base_env()
         env.update({k: _expand_literal(str(v)) for k, v in t.get("env", {}).items()})
         lock = self.locks.setdefault(t.get("lock", tname), threading.Lock())
         timeout = int(t.get("timeout", 60))
@@ -1587,11 +1855,7 @@ class Bridge:
         t0 = time.time()
         with lock:
             try:
-                p = subprocess.run(argv, cwd=run_cwd, env=env, capture_output=True,
-                                   timeout=timeout, stdin=subprocess.DEVNULL)
-                rc, out, err = p.returncode, p.stdout, p.stderr
-            except subprocess.TimeoutExpired as e:
-                rc, out, err = 124, e.stdout or b"", (e.stderr or b"") + f"\n[agentbox] timed out after {timeout}s".encode()
+                rc, out, err = run_tool(argv, run_cwd, env, timeout)
             except OSError as e:
                 rc, out, err = 127, b"", str(e).encode()
         res = {
@@ -1682,7 +1946,7 @@ class Bridge:
         for s in servers[1:]:
             threading.Thread(target=s.serve_forever, daemon=True).start()
         info(f"bridge for '{self.prof.name}' on localhost:{port} - tools: {', '.join(self.tools)}")
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        on_sigterm(lambda *_: sys.exit(0))
         try:
             servers[0].serve_forever()
         except KeyboardInterrupt:
@@ -1702,8 +1966,7 @@ def _pid_of(pf: Path, word: str, profile: str) -> int | None:
     try:
         pid = int(pf.read_text().strip())
         if pid > 1 and pid not in (os.getpid(), os.getppid()):
-            cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                                 capture_output=True, text=True).stdout.split()
+            cmd = process_cmdline(pid)
             if any("agentbox" in t for t in cmd) and word in cmd and profile in cmd:
                 return pid
     except (ValueError, OSError):
@@ -1720,8 +1983,7 @@ def start_bridge(prof: Profile):
     log = open(prof.state / "bridge.out", "a")
     p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bridge", prof.name],
                          stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                         start_new_session=True, env={k: v for k, v in os.environ.items()
-                                                      if k in ("PATH", "HOME", "LANG", "USER", "AGENTBOX_CONFIG_DIR")})
+                         **detached_popen_kwargs(), env=child_env())
     (prof.state / "bridge.pid").write_text(str(p.pid))
     time.sleep(0.5)
     if p.poll() is not None:
@@ -1732,7 +1994,7 @@ def start_bridge(prof: Profile):
 def stop_bridge(prof: Profile):
     pid = bridge_pid(prof)
     if pid:
-        os.kill(pid, signal.SIGTERM)
+        terminate(pid)
         info(f"stopped bridge (pid {pid})")
     (prof.state / "bridge.pid").unlink(missing_ok=True)
 
@@ -1828,6 +2090,9 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
             create.append("--clone")
         if prof.d.get("template"):
             create += ["--template", prof.d["template"]]
+        elif tpl := built_template(prof):
+            create += ["--template", tpl, "--pull", "never"]
+            info(f"starting from the prebuilt template {tpl}")
         for k in kits:
             create += ["--kit", k]
         create.append(prof.agent_ref())
@@ -1847,6 +2112,7 @@ def ensure_sandbox(prof: Profile, retry: bool = False):
         (prof.state / "skills.mounts").write_text(json.dumps(list(map(str, prof.skill_mounts()))))
         record_skill_heads(prof)
         set_secrets(prof)
+        restore_sessions(prof)
         for p in prof.d["publish"]:
             sbx(cfg, "ports", prof.sandbox, "--publish", p, check=False)
 
@@ -2058,6 +2324,215 @@ def cmd_code(prof: Profile, args) -> int:
     return 0
 
 
+
+# ------------------------------------------------- sessions and unsaved work across `fresh`
+# Recreating a sandbox is a new VM: sbx (0.54) keeps no volume across `sbx rm`, so the agent's session
+# history and, in clone mode, the working tree would go with it. `fresh` copies the sessions out and back;
+# `down`/`fresh` refuse to drop clone-mode work the host does not have.
+SESSION_DIRS = {"claude": f"{VM_HOME}/.claude/projects"}    # agent -> in-VM dir of resumable sessions
+SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+# The clone's path is passed as $1 (never an sbx-provided variable): a guard that cannot find the
+# working tree must say so, not report that nothing would be lost.
+UNSAVED_WORK_SCRIPT = r'''cd "$1" 2>/dev/null || { echo NOWS; exit 0; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo NOWS; exit 0; }
+echo "DIRTY $(git status --porcelain 2>/dev/null | wc -l)"
+echo "STASH $(git stash list 2>/dev/null | wc -l)"
+git for-each-ref --format="REF %(objectname) %(refname:short)" refs/heads'''
+
+
+def clone_unsaved_work(prof: Profile) -> list[str]:
+    """What removing this clone-mode sandbox would lose: branches whose head the host repo lacks,
+    uncommitted changes, stashes. Empty when there is nothing (or it is not clone mode)."""
+    if prof.d["mode"] != "clone":
+        return []
+    ws = vm_path(prof.primary)
+    r = vm_exec(prof, f"set -- {shlex.quote(ws)}\n{UNSAVED_WORK_SCRIPT}")
+    if r.returncode != 0:
+        return [f"could not look inside {prof.sandbox} (exit {r.returncode}): {(r.stderr or '').strip()[:200]}"]
+    lost = []
+    for ln in (r.stdout or "").splitlines():
+        kind, _, rest = ln.partition(" ")
+        if kind == "NOWS":
+            lost.append(f"possibly anything: no git working tree found at {ws} inside {prof.sandbox}")
+        elif kind in ("DIRTY", "STASH") and rest.strip().isdigit() and int(rest) > 0:
+            lost.append(f"{int(rest)} uncommitted change(s)" if kind == "DIRTY" else f"{int(rest)} stash entr(y/ies)")
+        elif kind == "REF":
+            sha, _, branch = rest.partition(" ")
+            if not SHA_RE.match(sha):           # VM output: never handed to git unchecked
+                continue
+            if host_git(prof, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
+                lost.append(f"branch {safe_text(branch)} ({sha[:12]}) has commits the host does not")
+    return lost
+
+
+def _strip_links(root: Path):
+    """Agent-written copies hold plain files only: drop symlinks and anything special, both ways."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        for n in dirnames + filenames:
+            q = Path(dirpath) / n
+            if q.is_symlink() or not (q.is_dir() or q.is_file()):
+                q.unlink()
+
+
+def save_sessions(prof: Profile) -> str | None:
+    """Copy the agent's sessions out of the sandbox into the state dir. None when done (or nothing to
+    do), else what went wrong."""
+    src = SESSION_DIRS.get(prof.d["agent"])
+    if not src:
+        return None
+    probe = vm_exec(prof, f"test -d {shlex.quote(src)}")
+    if probe.returncode != 0:
+        return None if probe.returncode == 1 else f"could not reach {prof.sandbox} (exit {probe.returncode})"
+    tmp, dest = prof.state / "sessions.new", prof.state / "sessions"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    r = sbx(prof.cfg, "cp", f"{prof.sandbox}:{src}", str(tmp), check=False, capture=True)
+    got = tmp / PurePosixPath(src).name
+    if r.returncode != 0 or not got.is_dir():
+        shutil.rmtree(tmp, ignore_errors=True)
+        return f"`sbx cp` failed (exit {r.returncode}): {((r.stderr or '') + (r.stdout or '')).strip()[:300]}"
+    _strip_links(tmp)
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
+    return None
+
+
+def restore_sessions(prof: Profile):
+    """Put sessions saved by `fresh` back into the new sandbox, owned by the agent."""
+    saved = prof.state / "sessions"
+    dst = SESSION_DIRS.get(prof.d["agent"])
+    src = saved / PurePosixPath(dst).name if dst else None
+    if not src or not src.is_dir():
+        return
+    _strip_links(saved)
+    parent = str(PurePosixPath(dst).parent)
+    r = sbx(prof.cfg, "exec", "--user", "0", prof.sandbox, "sh", "-c",
+            f"mkdir -p {shlex.quote(parent)} && rm -rf {shlex.quote(dst)}", check=False, capture=True)
+    if r.returncode == 0:   # root may just have created the parent (~/.claude): Claude Code must own it
+        r = sbx(prof.cfg, "exec", "--user", "0", prof.sandbox, "chown", "1000:1000", parent,
+                check=False, capture=True)
+    if r.returncode == 0:
+        r = sbx(prof.cfg, "cp", str(src), f"{prof.sandbox}:{parent}", check=False, capture=True)
+    if r.returncode == 0:
+        r = sbx(prof.cfg, "exec", "--user", "0", prof.sandbox, "chown", "-R", "1000:1000", dst,
+                check=False, capture=True)
+    if r.returncode != 0:
+        info(f"could not restore the saved sessions into {prof.sandbox}; they are kept in {saved}")
+        return
+    n = sum(1 for _ in src.rglob("*.jsonl"))
+    shutil.rmtree(saved, ignore_errors=True)
+    info(f"restored {n} saved session(s) into {prof.sandbox}")
+
+
+# ---------------------------------------------------------------- prebuilt templates
+# `agentbox template <profile>` creates a throwaway sandbox from the profile's agent and kits ONLY
+# (no generated kit - it holds the bridge token -, no secrets, an empty workspace), lets the kits'
+# install hooks run, and saves it with `sbx template save`. New sandboxes of that profile then start
+# from the snapshot (`--template TAG --pull never`), so apt installs are already done. The record is
+# keyed by a fingerprint of the agent and the kits' files: change a kit and the template is ignored.
+TEMPLATE_REPO = "agentbox-{name}"
+
+
+def template_record_path(prof: Profile) -> Path:
+    return prof.cfg.state_root / "templates" / f"{prof.name}.json"
+
+
+def template_fingerprint(prof: Profile) -> str:
+    h = hashlib.sha256(json.dumps([prof.d["agent"], prof.d["kits"]]).encode())
+    for k in prof.kit_paths():
+        for f in sorted(q for q in k.rglob("*") if q.is_file()):
+            h.update(f.relative_to(k).as_posix().encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def template_record(prof: Profile) -> dict | None:
+    try:
+        rec = json.loads(template_record_path(prof).read_text())
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(rec, dict) and isinstance(rec.get("tag"), str) and isinstance(rec.get("fingerprint"), str)
+    return rec if ok and TEMPLATE_TAG_RE.match(rec["tag"]) else None
+
+
+def built_template(prof: Profile) -> str | None:
+    """The tag to create this profile's sandbox from, or None (no template, or the kits changed)."""
+    rec = template_record(prof)
+    if not rec:
+        return None
+    if rec["fingerprint"] != template_fingerprint(prof):
+        info(f"the prebuilt template {rec['tag']} predates a change to the agent or kits; not using it."
+             f" Rebuild it with `agentbox template {prof.name}`")
+        return None
+    if template_image_present(prof.cfg, rec["tag"]) is False:
+        # `sbx template rm`, an image prune or an sbx reset: `create --pull never` would fail on every `up`
+        info(f"the prebuilt template {rec['tag']} is no longer in sbx's image store; creating without it."
+             f" Rebuild it with `agentbox template {prof.name}`")
+        template_record_path(prof).unlink(missing_ok=True)
+        return None
+    return rec["tag"]
+
+
+def template_image_present(cfg: Config, tag: str) -> bool | None:
+    """Whether sbx's local image store holds TAG (repo:tag); None when the listing cannot be read,
+    in which case the caller goes ahead as before rather than dropping a template that may be fine."""
+    r = sbx(cfg, "template", "ls", "--json", check=False, capture=True)
+    try:
+        images = json.loads(r.stdout or "") if r.returncode == 0 else None
+    except ValueError:
+        images = None
+    if not isinstance(images, list):
+        return None
+    repo, _, want = tag.partition(":")
+    return any(isinstance(i, dict) and i.get("tag") == want
+               and str(i.get("repository", "")).rsplit("/", 1)[-1] == repo for i in images)
+
+
+TEMPLATE_TAG_RE = re.compile(r"^agentbox-[a-z0-9][a-z0-9-]{0,40}:\d{14}$")
+
+
+def cmd_template(prof: Profile, args) -> int:
+    cfg = prof.cfg
+    rec = template_record(prof)
+    if args.remove:
+        if rec:
+            sbx(cfg, "template", "rm", "--force", rec["tag"], check=False, capture=True)
+        template_record_path(prof).unlink(missing_ok=True)
+        info(f"removed {rec['tag']}" if rec else f"profile '{prof.name}' has no prebuilt template")
+        return EXIT_OK
+    if prof.d.get("template"):
+        die(f"profile '{prof.name}' sets template = \"{prof.d['template']}\" itself; remove that to use a prebuilt one",
+            EXIT_USAGE)
+    if not prof.d["kits"]:
+        die(f"profile '{prof.name}' has no kits, so there is nothing to prebuild", EXIT_USAGE)
+    box = f"{prof.sandbox}-tpl"
+    tag = TEMPLATE_REPO.format(name=prof.name) + ":" + time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    fingerprint = template_fingerprint(prof)
+    ws = Path(tempfile.mkdtemp(prefix="agentbox-tpl-"))
+    try:
+        sbx(cfg, "rm", "--force", box, check=False, capture=True)       # ours: left over from a failed build
+        create = ["create", "--name", box]
+        for k in prof.kit_paths():
+            create += ["--kit", str(k)]
+        info(f"building {tag}: creating {box} with {prof.d['agent']} + {', '.join(prof.d['kits'])}"
+             " (the kits' install steps run now; this can take a while)")
+        sbx(cfg, *create, prof.agent_ref(), str(ws))
+        sbx(cfg, "stop", box, check=False, capture=True)
+        info(f"saving {box} as {tag}")
+        sbx(cfg, "template", "save", box, tag)
+    finally:
+        sbx(cfg, "rm", "--force", box, check=False, capture=True)
+        shutil.rmtree(ws, ignore_errors=True)
+    path = template_record_path(prof)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tag": tag, "fingerprint": fingerprint,
+                                "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+    if rec and rec["tag"] != tag:
+        sbx(cfg, "template", "rm", "--force", rec["tag"], check=False, capture=True)
+    info(f"new {prof.name} sandboxes start from {tag}; `agentbox fresh {prof.name}` to use it now."
+         " Rebuild after kit changes, or to pick up a newer agent version.")
+    return EXIT_OK
+
+
 def cmd_down(prof: Profile, args) -> int:
     force = getattr(args, "force", False)
     if not force and not sys.stdin.isatty():
@@ -2070,12 +2545,28 @@ def cmd_down(prof: Profile, args) -> int:
                 f" Wait for it (`agentbox wait {prof.name}`) or pass --force")
         info(f"--force: killing running job {job['id']}")
         vm_exec(prof, kill_script(job["id"]))
+    keep_sessions = getattr(args, "keep_sessions", False)
+    exists = sandbox_exists(prof)
+    if exists and not force:
+        lost = clone_unsaved_work(prof)
+        if lost:
+            die(f"{prof.sandbox} is in clone mode and removing it would lose:\n  - " + "\n  - ".join(lost)
+                + f"\nFetch what you want first (`agentbox fetch {prof.name} --start [--branch ...]`), or pass"
+                  " --force to drop it.")
+    if exists and keep_sessions:
+        problem = save_sessions(prof)
+        if problem and force:
+            info(f"WARNING: could not save the agent's sessions from {prof.sandbox}: {problem}."
+                 " --force: removing it anyway; its sessions are lost.")
+        elif problem:
+            die(f"could not save the agent's sessions from {prof.sandbox}: {problem}."
+                " Nothing was removed; fix that, pass --force to drop them, or use `agentbox down` and `up`.")
     if (prof.state / "snapshot.json").exists():
         cmd_audit(prof)
         print()
     stop_bridge(prof)
     stop_keepalive(prof)
-    if sandbox_exists(prof):
+    if exists:
         r = sbx(prof.cfg, "rm", *(["--force"] if force else []), prof.sandbox, check=False, capture=True)
         if sandbox_exists(prof):        # sbx rm can fail (or be declined) and still leave a sandbox behind
             detail = ((r.stderr or "") + (r.stdout or "")).strip()
@@ -2083,7 +2574,12 @@ def cmd_down(prof: Profile, args) -> int:
                 + (f"\n{detail}" if detail else ""))
     remove_secrets(prof)
     if not args.keep_state and prof.state.exists():
-        shutil.rmtree(prof.state)
+        if keep_sessions and (prof.state / "sessions").is_dir():
+            for q in prof.state.iterdir():          # everything but the saved sessions
+                if q.name != "sessions":
+                    shutil.rmtree(q) if q.is_dir() and not q.is_symlink() else q.unlink()
+        else:
+            shutil.rmtree(prof.state)
     info(f"{prof.sandbox} removed")
     return 0
 
@@ -2404,16 +2900,15 @@ def start_keepalive(prof: Profile):
         return
     log = open(prof.state / "keepalive.out", "a")
     p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "keepalive", prof.name],
-                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
-                         env={k: v for k, v in os.environ.items()
-                              if k in ("PATH", "HOME", "LANG", "USER", "AGENTBOX_CONFIG_DIR")})
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, **detached_popen_kwargs(),
+                         env=child_env())
     (prof.state / "keepalive.pid").write_text(str(p.pid))
 
 
 def stop_keepalive(prof: Profile):
     pid = keepalive_pid(prof)
     if pid:
-        os.kill(pid, signal.SIGTERM)
+        terminate(pid)
     (prof.state / "keepalive.pid").unlink(missing_ok=True)
 
 
@@ -2429,7 +2924,7 @@ def cmd_keepalive(prof: Profile) -> int:
             held[0].terminate()
         sys.exit(0)
 
-    signal.signal(signal.SIGTERM, on_term)
+    on_sigterm(on_term)
     cmd = [prof.cfg.settings["sbx"], "exec", prof.sandbox, "sh", "-c", hold_script(job_id)]
     drops = unknown = 0
     while True:
@@ -2655,8 +3150,8 @@ def cmd_run(prof: Profile, args) -> int:
     d = JOB_DIR.format(id=job_id)
     # start_head: HEAD before the agent runs, so `progress` can count the commits it makes
     r = vm_exec(prof, (f'd={d}; S=; command -v setsid >/dev/null 2>&1 && S=setsid; '
-                       f'git -C {shlex.quote(str(prof.primary))} rev-parse HEAD > "$d/start_head" 2>/dev/null || :; '
-                       f'$S nohup sh "$d/wrap.sh" "$d" {shlex.quote(str(prof.primary))} {shlex.join(cmd)} '
+                       f'git -C {shlex.quote(vm_path(prof.primary))} rev-parse HEAD > "$d/start_head" 2>/dev/null || :; '
+                       f'$S nohup sh "$d/wrap.sh" "$d" {shlex.quote(vm_path(prof.primary))} {shlex.join(cmd)} '
                        '>/dev/null 2>&1 </dev/null & i=0; '
                        'while [ ! -s "$d/pid" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; [ -s "$d/pid" ]'))
     if r.returncode != 0:
@@ -2953,7 +3448,7 @@ def refresh_progress(prof: Profile, job_id: str, final: bool) -> dict | None:
     and fold it into the cached totals. None if the VM could not be read. Only call for a RUNNING VM."""
     acc, got = load_acc(prof, job_id), False
     for _ in range(8):
-        r = vm_exec(prof, progress_script(job_id, acc["offset"], prof.primary, final))
+        r = vm_exec(prof, progress_script(job_id, acc["offset"], vm_path(prof.primary), final))
         raw = parse_progress_out(r.stdout or "") if r.returncode == 0 else None
         if raw is None:
             return acc if got else None
@@ -3369,7 +3864,7 @@ def append_history(prof: Profile, entry: dict) -> bool:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in keep))
-    os.chmod(tmp, 0o600)
+    owner_only(tmp)
     os.replace(tmp, prof.state / HISTORY_FILE)
     return True
 
@@ -6777,16 +7272,14 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
                 chk(False, problem, "rename or remove one of them in the skill sets")
         if prof.skillsets and not prof.skill_problems():
             chk(True, "skill sets pass the safety rules: " + ", ".join(ss.name for ss in prof.skillsets))
+        # `sbx kit validate` does not take v3 source kits; `kit inspect` loads (and, for a kit with a
+        # recipe, builds) one and fails on a bad descriptor. Declaration-only mixins need no builder.
         for k in prof.kit_paths():
-            rv = sbx(cfg, "kit", "validate", "--offline", k, check=False, capture=True)
-            if rv.returncode != 0:
-                rv = sbx(cfg, "kit", "validate", k, check=False, capture=True)
-            chk(rv.returncode == 0, f"kit {k.name} validates", (rv.stderr or rv.stdout or "").strip()[:400])
+            rv = sbx(cfg, "kit", "inspect", str(k), check=False, capture=True)
+            chk(rv.returncode == 0, f"kit {k.name} loads", (rv.stderr or rv.stdout or "").strip()[:400])
         kit_dir, _ = render_local_kit(prof, get_token(prof))
-        rv = sbx(cfg, "kit", "validate", "--offline", kit_dir, check=False, capture=True)
-        if rv.returncode != 0:
-            rv = sbx(cfg, "kit", "validate", kit_dir, check=False, capture=True)
-        chk(rv.returncode == 0, "generated kit validates", (rv.stderr or rv.stdout or "").strip()[:400])
+        rv = sbx(cfg, "kit", "inspect", kit_dir, check=False, capture=True)
+        chk(rv.returncode == 0, "generated kit loads", (rv.stderr or rv.stdout or "").strip()[:400])
         if prof.local_model:
             doctor_local_model(rep, prof)
         if prof.tool_names:
@@ -6889,7 +7382,7 @@ def _read_small(p: Path, limit: int = 1 << 20) -> str:
 
 
 def kit_installed(name: str) -> bool:
-    return (KITS_DIR / name / "spec.yaml").is_file()
+    return is_kit_dir(KITS_DIR / name) and not is_v2_kit_dir(KITS_DIR / name)
 
 
 def detect_workspace(ws: Path) -> dict:
@@ -7210,7 +7703,7 @@ def cmd_provision(cfg: Config, args) -> int:
         return [] if raw.lower() == "none" else [_checked(validate, x.strip(), flag) for x in raw.split(",") if x.strip()]
 
     def v_kit(k):
-        if not kit_installed(k) and not (xp(k) / "spec.yaml").is_file():
+        if not kit_installed(k) and not is_kit_dir(xp(k)):
             raise ValueError(f"kit '{k}' not found in {KITS_DIR}")
         return k
 
@@ -7438,12 +7931,15 @@ def main():
         sub.add_parser(c).add_argument("profile")
     p = sub.add_parser("tools"); p.add_argument("profile"); p.add_argument("--json", action="store_true")
     p = sub.add_parser("down"); p.add_argument("profile"); p.add_argument("--keep-state", action="store_true")
-    p.add_argument("--force", action="store_true", help="also kill a running headless job, skip sbx's"
+    p.add_argument("--force", action="store_true", help="also drop clone-mode work the host lacks, kill a running headless job, skip sbx's"
                    " confirmation and pass --force to `sbx rm`, which deletes the sandbox even if in use"
                    " (an open VS Code / SSH session)")
+    p = sub.add_parser("template", help="prebuild a sandbox image with the profile's kits installed")
+    p.add_argument("profile")
+    p.add_argument("--remove", action="store_true", help="delete the profile's prebuilt template")
     p = sub.add_parser("fresh"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
-    p.add_argument("--force", action="store_true", help="as for `down --force`: kill a running job, skip"
-                   " confirmation, delete the sandbox even if in use")
+    p.add_argument("--force", action="store_true", help="as for `down --force`: drop clone-mode work the host"
+                   " lacks, kill a running job, skip confirmation, delete the sandbox even if in use")
     p = sub.add_parser("run"); p.add_argument("profile")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--prompt-file", metavar="F", help="file holding the prompt ('-' = stdin)")
@@ -7536,6 +8032,7 @@ def main():
         sys.exit(cmd_up(prof, a))
     if a.cmd == "fresh":
         a.keep_state = False
+        a.keep_sessions = True          # a fresh VM, the same conversations
         cmd_down(prof, a)
         sys.exit(cmd_up(cfg.profile(a.profile), a))
     if a.cmd == "down":
@@ -7556,6 +8053,8 @@ def main():
         sys.exit(cmd_progress(prof, a))
     if a.cmd == "fetch":
         sys.exit(cmd_fetch(prof, a))
+    if a.cmd == "template":
+        sys.exit(cmd_template(prof, a))
     if a.cmd == "keepalive":
         sys.exit(cmd_keepalive(prof))
     if a.cmd == "shell":

@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest import mock
 
-from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab, needs_linux_vm
+from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab, needs_linux_vm, needs_symlinks, posix_only
 
 REAL_SLEEP = time.sleep          # ab.time is the real time module, so patching sleep patches ours too
 PROMPT = "SECRET-PROMPT-TEXT summarise the repo"
@@ -525,6 +525,7 @@ class KillSafetyTests(JobCase):
         got = self.run_kill(self.real_pid, no_group=True, shadow_pkill=True).splitlines()
         self.assertEqual(got, [f"-TERM -- -{self.real_pid}", f"pkill -TERM -P {self.real_pid}", f"-TERM {self.real_pid}"])
 
+    @needs_symlinks
     def test_without_a_process_group_or_pkill_it_reads_proc(self):
         import os
         import tempfile
@@ -605,6 +606,7 @@ class HostPidTests(AgentboxTestCase):
                 self.assertFalse(pf.exists(), command)
                 self.assertIsNone(other.poll(), command)
 
+    @posix_only
     def test_our_own_process_is_signalled(self):
         for word, stop in (("keepalive", ab.stop_keepalive), ("bridge", ab.stop_bridge)):
             proc = self.spawn_sleep()

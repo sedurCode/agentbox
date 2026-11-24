@@ -26,7 +26,7 @@ The owner set these rules. Follow them even when a task seems to ask for more.
 
 **Ask the owner first.** These change something:
 
-- `agentbox up`, `run`, `resume`, `fetch`, `stop`, `down`, `fresh`.
+- `agentbox up`, `run`, `resume`, `fetch`, `stop`, `down`, `fresh`, `template`.
 - `agentbox provision` without `--dry-run`.
 - Edits to `~/.config/agentbox/agentbox.toml`, kits or skill sets, and any install.
 
@@ -145,7 +145,8 @@ entries. Direct mode has nothing to fetch; the changes are already in the workin
   with a keep-alive session, but once the job ends the sandbox soon stops.
 - **The git remote is temporary.** In clone mode sbx adds a `sandbox-ab-<p>` remote to the host repo while
   the sandbox runs and removes it when it stops. `agentbox fetch` handles this. Commits live only in the VM
-  until fetched, so fetch before anyone runs `down`.
+  until fetched, so fetch before anyone runs `down`. `down` and `fresh` refuse while a clone-mode VM holds
+  commits the host lacks, uncommitted changes or stashes; to look, they boot a stopped sandbox.
 - **Booting relaunches the agent.** Starting a stopped sandbox (`fetch --start`, `logs --start`, `up`)
   relaunches the agent last started with `sbx run`. That is why `--start` is not the default, and why you
   ask before using it.
@@ -167,20 +168,79 @@ the owner agrees.
 - **clone vs direct.** Prefer `clone`: the agent works on its own clone and nothing on the host changes
   until a fetch. `direct` mounts the host tree read-write and is needed only for host tools (flashing,
   debugging); it needs `agentbox audit` after each session.
-- **Kits** add tooling and settings at creation (for example `python-node`, `claude-team`).
+- **Kits** add tooling and settings at creation (for example `python-node`, `claude-team`); section 8.
 - **Skills** (`skills = [...]`) mount skill sets read-only into the sandbox.
 - **`allow`** adds hosts to that sandbox's own network allow-list (sandbox-scoped; never global
   `sbx policy allow`). Ask before widening it, and name each host and why. Keep the list short: the
   agent can send the code to any host on it.
 - **Mounts and network rules apply when the sandbox is created.** After changing `allow`, `deny`, kits,
-  skills or workspaces, the sandbox needs `agentbox fresh <p>`, which deletes it (and any unfetched
-  commits). Ask first and fetch first.
+  skills or workspaces, the sandbox needs `agentbox fresh <p>`, which deletes it. It keeps Claude's sessions
+  (copied out and back), and refuses while unfetched clone-mode work exists; only `--force`, which you never
+  pass, drops that work. Ask first and fetch first.
 - **Local models.** If the installed agentbox supports `local_model` profiles (check `agentbox --help` and
   the README), treat them like any other profile; don't add one unless the owner asks.
 
 `agentbox doctor <p>` checks a profile without changing anything.
 
-## 8. Rex (optional)
+## 8. Kits and templates
+
+Kits live in `~/.config/agentbox/kits/<kit>/`, outside every workspace (a kit an agent can write could widen
+its own permissions). Writing or changing one is an edit that needs the owner's go-ahead: show them the file
+first. They use the sbx **kit spec v3** (github.com/docker/sandbox-kit-spec); sbx refuses to mix v2 kits
+with its agents.
+
+```yaml
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+version: "1.0.0"
+displayName: Rust toolchain
+description: rustup, cargo and the build tools
+capabilities:
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      install: {allow: ["static.rust-lang.org", "deb.debian.org"]}   # open only while install hooks run
+      runtime: {allow: ["crates.io", "static.crates.io"]}             # what the agent itself may reach
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: |
+            pkgs="build-essential pkg-config"
+            if dpkg -s $pkgs >/dev/null 2>&1; then exit 0; fi     # already there (a template): skip
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs
+          user: "0"
+          env: [HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, NO_PROXY, no_proxy]
+  - type: com.docker.sandbox/agent-context@2
+    config:
+      content: |
+        ## Rust
+        cargo and rustc are installed.
+```
+
+- **The file is `<kit>/<kit>.yaml`**, and the first line selects the v3 format. A `spec.yaml` in the folder
+  makes sbx treat the kit as v2, even beside a v3 file. Don't write a top-level `name:` (the folder is the
+  name) or `licenses:` (it makes sbx build the kit with Docker).
+- **Prefer declaration-only mixins** like the one above: no recipe, so nothing is built. Environment
+  variables go in `args` with `env: NAME`; files the agent needs go in `lifecycle@1` `files`.
+- **Install hooks** run once, as root, at creation. They see only the variables listed in `env:`, so list
+  the proxy variables for anything that downloads. Make apt hooks skip when the packages are there, as
+  above, so a prebuilt template saves the time.
+- **A recipe** (`<kit>.dockerfile` next to the YAML) is for workload kits that bring their own agent, like
+  `junie`. sbx builds it on first use, with Docker on the host or its `sbx-kit-builder` sandbox, which takes
+  minutes. apt packages in a mixin stay an install hook; they cannot be copied into a layer.
+- **Instructions** (`agent-context@2`) reach the agent as a per-kit file its `CLAUDE.md`/`AGENTS.md` links to.
+- **Check a kit** with `agentbox doctor <p>`. `sbx kit validate` does not take v3 kits; `sbx kit inspect
+  <dir>` does.
+- Kits apply at creation: a changed kit needs `agentbox fresh <p>` (section 7).
+
+**Prebuilt templates.** If a profile's sandboxes are slow to create because its kits install a lot (a
+compiler toolchain, GUI libraries), suggest `agentbox template <p>`. It builds a throwaway sandbox from the
+profile's agent and kits only (no code, secrets or host tools), saves it with `sbx template save`, and new
+sandboxes of that profile start from it: in one case 6 s instead of 64 s. It takes a minute or two and
+needs the owner's go-ahead. It freezes the agent and package versions until rebuilt. After a kit changes,
+agentbox stops using it and says so; rebuild then. `agentbox template <p> --remove` deletes it.
+
+## 9. Rex (optional)
 
 Only if the environment variable `REX_SESSION` is set and `rex` is on `PATH`: instead of polling, open
 `agentbox progress <p> --watch` in a Rex split so the owner can see the job, and wait for the job with

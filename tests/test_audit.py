@@ -1,6 +1,6 @@
 import unittest
 
-from helpers import AgentboxTestCase, ab
+from helpers import AgentboxTestCase, ab, needs_symlinks
 
 
 class GitConfigAuditTests(AgentboxTestCase):
@@ -57,6 +57,7 @@ class GitConfigAuditTests(AgentboxTestCase):
         self.assertIn("core.sshcommand", findings)
         self.assertIn("include.path", findings)
 
+    @needs_symlinks
     def test_symlinked_and_file_dot_git_are_reported(self):
         (self.ws / ".git").symlink_to(self.tmp)
         self.assertTrue(any(".git is a symlink" in f for f in ab.risky_git_config(self.ws)))
@@ -64,6 +65,7 @@ class GitConfigAuditTests(AgentboxTestCase):
     def test_no_repo_no_findings(self):
         self.assertEqual(ab.risky_git_config(self.ws), [])
 
+    @needs_symlinks
     def test_scan_records_symlinks_without_following(self):
         (self.ws / "Makefile").symlink_to("/etc/passwd")
         (self.ws / "CMakeLists.txt").write_text("project(x)\n")

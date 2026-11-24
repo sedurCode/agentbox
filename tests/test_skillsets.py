@@ -7,7 +7,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab
+from helpers import AgentboxTestCase, FakeSbx, LocalVM, ab, needs_symlinks, needs_mkfifo, posix_only, runs_vm_link_script
 
 HEX = "0123456789abcdef0123456789abcdef01234567"
 
@@ -79,6 +79,7 @@ class RuleTests(SkillCase):
         self.assertEqual((ss.problems, ss.skills, ss.commit), ([], ["alpha", "beta"], None))
         self.assertEqual(ss.path, (self.sets / "core").resolve())
 
+    @needs_symlinks
     def test_path_rules(self):
         self.assertIn("needs `path", self.problems(sets={"core": 'description = "x"'}))
         self.assertIn("does not exist", self.problems(sets={"core": f'path = "{self.tmp}/missing"'}))
@@ -192,6 +193,7 @@ class RuleTests(SkillCase):
         (root / "alpha" / "SKILL.md").mkdir()
         self.assertIn("no SKILL.md", self.problems(sets={"core": f'path = "{root}"'}))
 
+    @needs_symlinks
     def test_symlinks_anywhere_are_refused_even_with_allow_scripts(self):
         root = self.make_set("core", ("alpha",))
         (root / "alpha" / "deep").mkdir()
@@ -204,6 +206,7 @@ class RuleTests(SkillCase):
             for name in ("alpha/deep/ln", "alpha/dirlink", "toplink", ".hidden-link"):
                 self.assertIn(name, got)
 
+    @posix_only
     def test_text_only_and_executable_bit(self):
         root = self.make_set("core", ("alpha",))
         a = root / "alpha"
@@ -221,6 +224,7 @@ class RuleTests(SkillCase):
             self.assertNotIn(good, got)
         self.assertEqual(self.problems(sets={"core": f'path = "{root}"\nallow_scripts = true'}), "")
 
+    @needs_mkfifo
     def test_fifo_is_refused(self):
         root = self.make_set("core", ("alpha",))
         os.mkfifo(root / "alpha" / "pipe.md")
@@ -306,7 +310,10 @@ class RepoCase(SkillCase):
         (root / "scripts" / "link.sh").chmod(0o755)
         (root / "CLAUDE.md").write_text("x")
         if not (root / "AGENTS.md").is_symlink():
-            (root / "AGENTS.md").symlink_to("CLAUDE.md")
+            try:
+                (root / "AGENTS.md").symlink_to("CLAUDE.md")
+            except OSError:                     # no symlink privilege (Windows without Developer Mode)
+                (root / "AGENTS.md").write_text("x")
         (root / "package.json").write_text("{}")
         (root / ".github").mkdir(exist_ok=True)
         (root / ".github" / "ci.yml").write_text("x")
@@ -323,6 +330,7 @@ class RepoCase(SkillCase):
 
 
 class IncludeTests(RepoCase):
+    @needs_symlinks
     def test_only_included_folders_are_skills_and_the_rest_is_not_checked(self):
         ss = self.repo_set()
         self.assertEqual(ss.problems, [])          # symlink, script, binary and .github are outside the include
@@ -330,12 +338,15 @@ class IncludeTests(RepoCase):
         self.assertEqual(ss.folders["tdd"], "skills/engineering/tdd")
         self.assertEqual(ss.include, ["skills/engineering/tdd", "skills/productivity/grilling", "skills/local/sandbox"])
 
+    @needs_symlinks
     def test_without_include_the_repo_root_is_flat_and_fails_on_its_layout(self):
         root = self.make_repo()
         got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{root}"'}), "core").problems)
         self.assertIn("'skills' has no SKILL.md", got)
         self.assertIn("symlinks are not allowed: AGENTS.md", got)
 
+    @needs_symlinks
+    @needs_mkfifo
     def test_included_folders_get_every_rule(self):
         root = self.make_repo()
         tdd = root / "skills" / "engineering" / "tdd"
@@ -366,6 +377,7 @@ class IncludeTests(RepoCase):
             {"core": f'path = "{root}"\ninclude = ["skills/engineering/tdd", "skills/local/tdd"]'}), "core").problems)
         self.assertIn("two folders named 'tdd'", got)
 
+    @needs_symlinks
     def test_bad_include_paths(self):
         root = self.make_repo()
         (root / "linked").symlink_to(root / "skills")
@@ -403,8 +415,8 @@ class IncludeTests(RepoCase):
         root = self.make_repo()
         cfg = self.config({"core": f'path = "{root}"\ninclude = {self.INC}'}, 'skills = ["core"]')
         links = dict(cfg.profile("p").skill_links())
-        self.assertEqual(links["tdd"], f"{root}/skills/engineering/tdd")
-        self.assertEqual(links["sandbox"], f"{root}/skills/local/sandbox")
+        self.assertEqual(links["tdd"], f"{ab.vm_path(root)}/skills/engineering/tdd")
+        self.assertEqual(links["sandbox"], f"{ab.vm_path(root)}/skills/local/sandbox")
 
 
 class AllowScriptsTests(RepoCase):
@@ -434,6 +446,8 @@ class AllowScriptsTests(RepoCase):
         got = " ".join(ab.inspect_skillset(self.config({"core": f'path = "{flat}"\nallow_scripts = ["alpha"]'}), "core").problems)
         self.assertIn("no `include`", got)
 
+    @needs_symlinks
+    @needs_mkfifo
     def test_symlinks_and_fifos_stay_refused_even_when_covered(self):
         root = self.make_repo()
         tdd = root / "skills" / "engineering" / "tdd"
@@ -553,7 +567,7 @@ class DriftTests(RepoCase):
         err = self.existing()
         self.assertIn("WARNING", err)
         self.assertIn("running sandboxes already see the new content", err)
-        self.assertIn(f"git -C {self.root} diff {HEX} {self.NEW} -- skills/engineering/tdd skills/productivity/grilling"
+        self.assertIn(f"git -C {ab.shlex.quote(str(self.root))} diff {HEX} {self.NEW} -- skills/engineering/tdd skills/productivity/grilling"
                       " skills/local/sandbox", err)
 
     def test_other_branch_warns_even_at_the_same_commit(self):
@@ -592,16 +606,16 @@ class KitTests(SkillCase):
     def test_instructions_name_the_sets_and_say_read_only(self):
         prof = self.config(profile_extra='skills = ["core"]').profile("p")
         ab.render_local_kit(prof, "tok")
-        spec = (prof.state / "kit" / "spec.yaml").read_text()
-        self.assertIn(str((self.sets / "core").resolve()), spec)
+        spec = ab.kit_descriptor(prof.state / "kit" / ab.LOCAL_KIT_NAME).read_text()
+        self.assertIn(ab.vm_path((self.sets / "core").resolve()), spec)
         self.assertIn("read-only", spec)
 
     def test_no_skills_no_instructions_and_digest_is_stable(self):
         plain = self.config().profile("p")
         _, d_plain = ab.render_local_kit(plain, "tok")
-        self.assertNotIn("Skill sets", (plain.state / "kit" / "spec.yaml").read_text())
+        self.assertNotIn("Skill sets", ab.kit_descriptor(plain.state / "kit" / ab.LOCAL_KIT_NAME).read_text())
         # a profile that never used skills hashes exactly what it did before the key existed
-        text = (plain.state / "kit" / "spec.yaml").read_text()
+        text = ab.kit_descriptor(plain.state / "kit" / ab.LOCAL_KIT_NAME).read_text()
         legacy = {k: v for k, v in plain.d.items() if k != "skills"}
         self.assertEqual(d_plain, ab.hashlib.sha256(
             (text + json.dumps({}, sort_keys=True) + json.dumps(legacy, sort_keys=True, default=str)).encode()).hexdigest())
@@ -656,6 +670,7 @@ class MountTests(SkillCase):
         _, rec = self.ensure(False)
         self.assertEqual(next(c for c in rec.calls if c[0] == "create")[-1], str(self.ws))
 
+    @needs_symlinks
     def test_refuses_to_mount_a_set_that_broke_since_config_load(self):
         prof = self.config(profile_extra='skills = ["core"]').profile("p")
         self.assertEqual(prof.skill_problems(), [])        # inspected (and cached) while still clean
@@ -711,6 +726,8 @@ class LinkCase(SkillCase):
         return out
 
 
+@needs_symlinks
+@runs_vm_link_script
 class LinkTests(LinkCase):
     def test_links_every_skill_and_records_them(self):
         prof = self.prof()
@@ -733,6 +750,7 @@ class LinkTests(LinkCase):
         out = ab.vm_exec(prof, ab.skills_link_script(prof.skill_links())).stdout
         self.assertEqual(sorted(out.split("\n")[:2]), ["OK alpha", "OK beta"])
 
+    @needs_symlinks
     def test_agent_written_skills_are_never_touched(self):
         prof = self.prof()
         mine = self.skills_dir / "mine"
@@ -753,6 +771,7 @@ class LinkTests(LinkCase):
         self.link(self.config(profile_extra="").profile("p"))
         self.assertTrue((mine / "SKILL.md").is_file() and (self.skills_dir / "alpha" / "SKILL.md").is_file())
 
+    @needs_symlinks
     def test_replaces_its_own_stale_link_and_removes_unconfigured_ones(self):
         prof = self.prof()
         self.link(prof)
@@ -836,6 +855,8 @@ class SyncTests(SkillCase):
         self.assertFalse([c for c in vm.calls if c[0] == "exec"])
         self.assertTrue(any("not running" in m for m in out))
 
+    @needs_symlinks
+    @runs_vm_link_script
     def test_waiter_links_once_the_vm_comes_up_and_never_boots_it(self):
         vm = LocalVM(self, vm="stopped")
         prof = self.config(profile_extra='skills = ["core"]').profile("p")
@@ -862,6 +883,8 @@ class SyncTests(SkillCase):
 
 
 class CommandTests(LinkCase):
+    @needs_symlinks
+    @runs_vm_link_script
     def test_run_links_before_the_job_starts(self):
         prof = self.prof()
         for name, fn in (("start_keepalive", lambda p: None), ("ensure_sandbox", lambda p, retry=False: None)):
@@ -908,7 +931,7 @@ class StatusDoctorTests(LinkCase):
         def call(vm, cfg, *a, **k):
             if a[0] == "version":
                 return subprocess.CompletedProcess(a, 0, "sbx 9\n", "")
-            if a[:2] == ("kit", "validate"):
+            if a[:2] == ("kit", "inspect"):
                 return subprocess.CompletedProcess(a, 0, "", "")
             if a[0] == "exec" and "ssh-add" in a[-1]:
                 return subprocess.CompletedProcess(a, 2, "Could not open a connection to your authentication agent.", "")
@@ -919,6 +942,8 @@ class StatusDoctorTests(LinkCase):
             code, out, err = self.run_main("doctor", "p", "--json")
         return code, json.loads(out), err
 
+    @needs_symlinks
+    @runs_vm_link_script
     def test_doctor_reports_sets_and_link_state(self):
         self.config(profile_extra='skills = ["core"]')
         code, doc, _ = self.doctor()
@@ -941,6 +966,7 @@ class StatusDoctorTests(LinkCase):
         self.assertEqual(code, 1)
         self.assertTrue(any("skill set core" in m and "alpha/run.sh" in m for m in fails), fails)
 
+    @needs_symlinks
     def test_doctor_notices_a_link_pointing_elsewhere(self):
         self.config(profile_extra='skills = ["core"]')
         self.skills_dir.mkdir(parents=True)

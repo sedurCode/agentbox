@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import sys
 import unittest
 from unittest import mock
 
@@ -106,10 +107,13 @@ class HistoryFileTests(AgentboxTestCase):
         ab.save_job_record(self.prof, self.rec())
         old = os.umask(0o022)
         try:
-            ab.record_history(self.prof)
+            with mock.patch.object(ab, "owner_only", wraps=ab.owner_only) as owner_only:
+                ab.record_history(self.prof)
         finally:
             os.umask(old)
-        self.assertEqual(stat.S_IMODE((self.prof.state / ab.HISTORY_FILE).stat().st_mode), 0o600)
+        owner_only.assert_called_once()             # Windows: icacls is stubbed here; test_platform runs it
+        if sys.platform != "win32":
+            self.assertEqual(stat.S_IMODE((self.prof.state / ab.HISTORY_FILE).stat().st_mode), 0o600)
         self.assertEqual([p.name for p in self.prof.state.iterdir() if p.name.endswith(".tmp")], [])
 
     def test_keeps_the_last_200(self):

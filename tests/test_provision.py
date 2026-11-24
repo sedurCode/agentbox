@@ -6,7 +6,7 @@ import tomllib
 import unittest
 from unittest import mock
 
-from helpers import REAL_RUN, AgentboxTestCase, FakeSbx, ab, real_sh
+from helpers import REAL_RUN, AgentboxTestCase, FakeSbx, ab, real_sh, needs_hostile_filenames, needs_mkfifo, posix_only
 
 
 class Tty(io.StringIO):
@@ -28,7 +28,7 @@ class ProvisionCase(AgentboxTestCase):
         self.conf = self.cfg_dir / "agentbox.toml"
         for kit in ("python-node", "embedded-arm", "claude-team"):
             (self.cfg_dir / "kits" / kit).mkdir(parents=True)
-            (self.cfg_dir / "kits" / kit / "spec.yaml").write_text("name: x\n")
+            (self.cfg_dir / "kits" / kit / f"{kit}.yaml").write_text(ab.KIT_SYNTAX + "\nkind: mixin\n")
         self.proj = self.tmp / "proj"
         self.proj.mkdir()
         self.fake = FakeSbx(exists=False).install(self)
@@ -49,6 +49,7 @@ class ProvisionCase(AgentboxTestCase):
 
 
 class FlagOnlyTests(ProvisionCase):
+    @posix_only
     def test_yes_with_flags_appends_and_keeps_the_file(self):
         (self.proj / "pyproject.toml").write_text("[project]\n")
         before = self.conf.read_bytes()
@@ -161,6 +162,7 @@ class DetectionTests(ProvisionCase):
         kits, allow = ab.suggest_settings(ab.detect_workspace(self.proj), "claude", {})
         self.assertTrue(all(r for _, r in kits + allow))
 
+    @needs_mkfifo
     def test_never_runs_anything_from_the_workspace(self):
         (self.proj / "pyproject.toml").write_text("")
         (self.proj / "fifo").touch()
@@ -236,6 +238,7 @@ class EscapingTests(ProvisionCase):
         with self.assertRaises(ValueError):
             ab.toml_str("bad \udcff surrogate")
 
+    @needs_hostile_filenames
     def test_instructions_and_paths_survive_a_round_trip(self):
         weird = self.tmp / 'we"ird \\ ü😀 dir'
         weird.mkdir()
@@ -335,6 +338,7 @@ class WarningTests(ProvisionCase):
         self.assertIn("core.hookspath", self.warnings())
         self.assertIn("overrides", self.warnings())
 
+    @needs_hostile_filenames
     def test_warnings_are_printed_not_blocking_and_escaped(self):
         (self.proj / ".git" / "hooks").mkdir(parents=True)
         (self.proj / ".git" / "hooks" / "evil\x1b[2Jhook").write_text("")
