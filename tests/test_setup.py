@@ -53,6 +53,15 @@ class SetupTests(AgentboxTestCase):
         self.assertEqual(ab.CONFIG_FILE.read_text(), "# mine\n")
         self.assertEqual(sorted(p.name for p in kit.iterdir()), ["mine.yaml"])
 
+    def test_extra_files_in_a_kit_are_not_a_difference(self):
+        self.setup()
+        kit = ab.KITS_DIR / SHIPPED_KITS[0]
+        (kit / "spec.yaml.v2").write_text("an old backup\n")
+        self.assertEqual(self.actions(self.setup())[("kit", SHIPPED_KITS[0])], "kept")
+        shipped = next(p for p in kit.iterdir() if p.name != "spec.yaml.v2")
+        shipped.write_text("edited\n")
+        self.assertEqual(self.actions(self.setup())[("kit", SHIPPED_KITS[0])], "kept_differs")
+
     def test_v2_kit_is_moved_aside(self):
         kit = ab.KITS_DIR / SHIPPED_KITS[0]
         kit.mkdir(parents=True)

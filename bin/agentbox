@@ -8139,12 +8139,15 @@ def write_skill_stub(path: Path):
 # The defaults ship in share/ with the program (whatever installed it: install.sh, install.ps1, Homebrew);
 # setup copies them into the config dir and never overwrites anything there. Run it after installing and
 # after each upgrade: new kits arrive, and changed ones are reported, not replaced.
-def tree_differs(a: Path, b: Path) -> bool:
-    """True if the two directory trees differ in file names or contents."""
-    def files(root: Path) -> dict:
-        return {f.relative_to(root).as_posix(): f for f in root.rglob("*") if f.is_file()}
-    fa, fb = files(a), files(b)
-    return fa.keys() != fb.keys() or any(fa[k].read_bytes() != fb[k].read_bytes() for k in fa)
+def tree_differs(shipped: Path, mine: Path) -> bool:
+    """True if a file in `shipped` is missing from `mine` or has other contents there. Extra files of yours
+    (notes, backups) don't count."""
+    for f in shipped.rglob("*"):
+        if f.is_file():
+            g = mine / f.relative_to(shipped)
+            if not g.is_file() or g.read_bytes() != f.read_bytes():
+                return True
+    return False
 
 
 def setup_config() -> list[dict]:
