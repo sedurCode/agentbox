@@ -77,7 +77,7 @@ unzip agentbox.zip && cd agentbox && ./install.sh
 ```
 
 `install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
-small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and seeds `~/.config/agentbox/{agentbox.toml,kits/,gdb/}` without overwriting anything. It also installs the guide for
+small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and runs `agentbox setup` (below). It also installs the guide for
 agents on the host (`share/skill/`) but leaves their skill folders alone: run `agentbox skill setup` for that.
 It copies the VS Code extension (`share/vscode/`) and, if it finds Rex, the Rex actions (`share/rex/`), but
 installs neither into the editor or Rex: see *Rex and VS Code* below.
@@ -85,6 +85,19 @@ installs neither into the editor or Rex: see *Rex and VS Code* below.
 The launcher looks for Python at run time (`python3.14`, `3.13`, `3.12`, `3.11`, then `python3`;
 the first that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the
 install. With none it prints "agentbox needs Python 3.11+ (brew install python)" and exits 1.
+
+### `agentbox setup`
+
+Seeds your config dir, `~/.config/agentbox` (or `$AGENTBOX_CONFIG_DIR`), from the defaults that ship with
+agentbox in `share/kits` and `share/config`: `agentbox.toml` (from `agentbox.example.toml`), the kits and
+the `gdb/` scripts. It only adds what is missing and never overwrites your files: a kit or script you have
+that differs from this release's copy is reported as `kept (this release's copy differs)` and left alone.
+An old v2 kit (with a `spec.yaml`) is moved aside first. The dir is made owner-only. It ends with the next
+steps (`sbx login`, `agentbox doctor`, the optional `skill setup`, `vscode install` and `rex setup`);
+`--json` prints the same as one document.
+
+The installers run it for you. Run it yourself after installing any other way, and after each upgrade, so
+new kits arrive. Commands that need a config and find none tell you to run it.
 
 ### Rex and VS Code
 
@@ -228,7 +241,7 @@ the important keys:
 | `instructions` | extra text appended to the agent's instruction file inside the VM |
 | `local_model` | `opencode` only: a model served by Ollama on the host, `{ provider = "ollama", model = "...", port = 11434 }` — see *Local models with opencode* |
 
-Kits shipped in `kits/` and seeded into `~/.config/agentbox/kits/` (existing ones are kept; an old
+Kits shipped in `share/kits/` and seeded into `~/.config/agentbox/kits/` by `agentbox setup` (existing ones are kept; an old
 v2 copy — any `spec.yaml`, which sbx reads before a v3 descriptor — is moved aside to
 `<kit>.v2-backup-<time>` and replaced):
 
@@ -881,10 +894,11 @@ times and the permission mode only, never conversation content):
 
 `agentbox doctor [profile] --json` (exit `0` when `ok`, else `1`). `status` is one of `pass`, `fail`,
 `warn`, `info`, `skip`; `profile` is `null` for host-level checks; `hint`, `details` and `data` are
-optional:
+optional. `version` is the agentbox release (also `agentbox --version`):
 
 ```json
-{"ok": false, "checks": [
+{"ok": false, "version": "0.1.0", "checks": [
+  {"profile": null, "status": "info", "message": "agentbox 0.1.0 (Python 3.13.1, /opt/homebrew/...)"},
   {"profile": null, "status": "pass", "message": "sbx present: sbx 1.2.3"},
   {"profile": "h750", "status": "warn", "message": "GH_TOKEN: looks like a real credential (40 chars)",
    "hint": "check `sbx secret ls` ...", "data": {"name": "GH_TOKEN", "class": "real", "length": 40}},
