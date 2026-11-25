@@ -81,7 +81,7 @@ from pathlib import Path, PurePosixPath
 import tomllib
 
 # The release this script is: a vX.Y.Z tag is cut from a commit with this value (SemVer; 0.x while it settles).
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))
