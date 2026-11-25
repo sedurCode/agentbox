@@ -49,9 +49,9 @@ the VM. agentbox adds the parts you asked for on top:
 ## Quick start
 
 ```bash
-brew trust docker/tap && brew install docker/tap/sbx && sbx login   # once; see Install
-brew install python                                   # agentbox needs Python 3.11+ (stdlib only)
-unzip agentbox.zip && cd agentbox && ./install.sh     # installs agentbox itself; see Install
+brew install --cask docker/tap/sbx && sbx login      # once; Linux and Windows: see Install
+brew install sedurcode/agentbox/agentbox             # or the one-line installer; see Install
+agentbox setup                                        # once, and after each upgrade
 agentbox provision myproj --workspace ~/src/myproj    # guided; clone mode is suggested
 agentbox run myproj --prompt-file task.md --detach    # the brief goes in a file, never on a command line
 agentbox progress myproj --watch                      # until the job ends
@@ -65,16 +65,38 @@ agentbox down myproj                                  # when finished; asks for 
 
 ## 1. Install
 
-On Linux install Docker Sandboxes from docs.docker.com/sandboxes and Python 3.11+ with your package manager; the
-`brew` lines below are the macOS route. Host tools run with a fixed `PATH` (Homebrew, `/usr/local/bin`,
-`/usr/bin`, `/snap/bin`, then `~/.local/bin` last so it can't shadow system tools; missing directories skipped). Use an absolute path for anything else.
+agentbox needs Docker Sandboxes (`sbx`, signed in with `sbx login`) and Python 3.11+ (standard library only).
+
+**macOS, Homebrew** (upgrades with `brew upgrade agentbox`, then `agentbox setup`):
 
 ```bash
-brew trust docker/tap && brew install docker/tap/sbx
-brew install python            # agentbox needs Python 3.11+ (stdlib only)
-sbx login                      # Docker account; required by sbx
-unzip agentbox.zip && cd agentbox && ./install.sh
+brew install --cask docker/tap/sbx && sbx login
+brew install sedurcode/agentbox/agentbox             # brings brew's Python
+agentbox setup
 ```
+
+**macOS or Linux, one line** (on Linux, install sbx from docs.docker.com/sandboxes and Python 3.11+ with your
+package manager first):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sedurCode/agentbox/main/install.sh | bash
+```
+
+**Windows** (PowerShell):
+
+```powershell
+winget install -h Docker.sbx; sbx login
+winget install -h Python.Python.3.13
+irm https://raw.githubusercontent.com/sedurCode/agentbox/main/install.ps1 | iex
+```
+
+The one-line installers download the newest release (pre-releases too; `AGENTBOX_VERSION=v0.1.1` picks one),
+check it against the `SHA256SUMS` attached to the release, refuse it if that fails, and run that release's own
+`install.sh` / `install.ps1`. To upgrade, run the line again. To read the script first, download it, or download
+a release from the Releases page, unpack it and run `./install.sh` (or `.\install.ps1`) in it.
+
+Host tools run with a fixed `PATH` (Homebrew, `/usr/local/bin`, `/usr/bin`, `/snap/bin`, then `~/.local/bin`
+last so it can't shadow system tools; missing directories skipped). Use an absolute path for anything else.
 
 `install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
 small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and runs `agentbox setup` (below). It also installs the guide for
@@ -1260,6 +1282,17 @@ python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n
 Ubuntu CI job runs them. The `fetch` tests use real temporary git repos and need `git`.
 
 CI (`.github/workflows/ci.yml`) runs the same on Ubuntu and macOS with Python 3.11 and 3.14.
+
+### Releasing
+
+1. A PR that sets `VERSION` in `bin/agentbox` to the new `X.Y.Z`; merge it once CI passes.
+2. Once `main`'s CI passes, tag that commit and publish the release:
+   `git tag -a vX.Y.Z -m "agentbox X.Y.Z" && git push origin vX.Y.Z`, then `gh release create vX.Y.Z --verify-tag
+   --prerelease` with notes.
+3. `tools/release-checksums.sh vX.Y.Z` attaches `SHA256SUMS` (GitHub's tarball and zip for the tag). The one-line
+   installers refuse a release without it.
+4. In `sedurCode/homebrew-agentbox`, a PR updating `url` and `sha256` in `Formula/agentbox.rb` (the tarball's
+   line from `SHA256SUMS`); merge once its CI passes.
 
 ## Licence
 
