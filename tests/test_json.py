@@ -133,7 +133,7 @@ class DoctorJsonTests(JsonCase):
         self.assertEqual(code, 0)
         self.assertIn("  ok   sbx present: sbx 9.9.9", out)
         self.assertIn("  warn GH_TOKEN: looks like a real credential (40 chars)", out)
-        self.assertIn("  info PROXY_API_KEY: placeholder/unknown (12 chars)", out)
+        self.assertIn("  info PROXY_API_KEY: placeholder/unknown (12 chars)", out)   # gitleaks:allow (a doctor label, not a key)
         self.assertIn("  ok   no SSH agent forwarded", out)
         self.assertTrue(out.rstrip().endswith("all good"))
 
