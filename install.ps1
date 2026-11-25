@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEDAudio-Commercial
 # See LICENSING.md.
 # Install agentbox on Windows into ~\.local\share\agentbox, put an `agentbox.cmd` shim in ~\.local\bin,
-# and seed ~\.config\agentbox (never overwrites an existing config).
+# then run `agentbox setup`, which seeds ~\.config\agentbox (never overwrites an existing config).
 $ErrorActionPreference = 'Stop'
 
 $Src  = $PSScriptRoot
@@ -43,11 +43,16 @@ if (-not $py -and (Get-Command python -ErrorAction SilentlyContinue)) {
 if (-not $py) { throw 'need Python 3.11+ (winget install Python.Python.3.12)' }
 Write-Host "found $py"
 
-New-Item -ItemType Directory -Force "$Dest\bin", "$Dest\share", $Bin, "$Cfg\kits", "$Cfg\gdb" | Out-Null
+New-Item -ItemType Directory -Force "$Dest\bin", "$Dest\share", $Bin | Out-Null
 foreach ($f in 'hosttool', 'jobwrap', 'jobprogress') { Copy-Item "$Src\share\$f" "$Dest\share\$f" -Force }
 # the agent guide (`agentbox skill show`), as install.sh does
 New-Item -ItemType Directory -Force "$Dest\share\skill" | Out-Null
 Copy-Item "$Src\share\skill\*" "$Dest\share\skill\" -Recurse -Force
+# the defaults `agentbox setup` copies into the config dir; replaced whole, so removed files go
+foreach ($d in 'kits', 'config') {
+    Remove-Item "$Dest\share\$d" -Recurse -Force -ErrorAction SilentlyContinue
+    Copy-Item "$Src\share\$d" "$Dest\share\$d" -Recurse -Force
+}
 # the VS Code extension (`agentbox vscode install` packs it from here); replaced whole, so removed files go
 Remove-Item "$Dest\share\vscode" -Recurse -Force -ErrorAction SilentlyContinue
 Copy-Item "$Src\share\vscode" "$Dest\share\vscode" -Recurse -Force
@@ -65,33 +70,10 @@ Copy-Item "$Src\share\agentbox.cmd" "$Dest\bin\agentbox.cmd" -Force
 # no symlink (needs Developer Mode): a one-line shim on PATH calls the installed launcher
 Set-Content -Path "$Bin\agentbox.cmd" -Encoding ASCII -Value "@`"$Dest\bin\agentbox.cmd`" %*"
 
-foreach ($k in Get-ChildItem "$Src\kits" -Directory) {
-    $dst = "$Cfg\kits\$($k.Name)"
-    # sbx ships its agents as v3 kits and refuses to mix in v2 ones (spec.yaml): set an old copy aside
-    if (Test-Path "$dst\spec.yaml") {
-        $bak = "$dst.v2-backup-$(Get-Date -Format yyyyMMddHHmmss)"
-        Move-Item $dst $bak; Write-Host "moved the v2 kit $($k.Name) to $bak (sbx needs kit spec v3)"
-    }
-    if (Test-Path $dst) { Write-Host "kept existing kit $dst" }
-    else { Copy-Item $k.FullName $dst -Recurse; Write-Host "installed kit $($k.Name)" }
-}
-foreach ($g in Get-ChildItem "$Src\config\gdb\*.gdb") {
-    if (-not (Test-Path "$Cfg\gdb\$($g.Name)")) { Copy-Item $g.FullName "$Cfg\gdb\" }
-}
-if (Test-Path "$Cfg\agentbox.toml") { Write-Host "kept existing $Cfg\agentbox.toml" }
-else {
-    Copy-Item "$Src\config\agentbox.example.toml" "$Cfg\agentbox.toml"
-    Write-Host "created $Cfg\agentbox.toml - edit the profiles before first use"
-}
-# owner-only config dir (the agent must not be able to widen its own permissions)
-& icacls $Cfg /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
+$env:AGENTBOX_CONFIG_DIR = $Cfg
+& "$Dest\bin\agentbox.cmd" setup
+if ($LASTEXITCODE -ne 0) { Write-Error "agentbox setup failed"; exit 1 }
 
 if (($env:Path -split ';') -notcontains $Bin) { Write-Host "add $Bin to PATH" }
-if ($HaveRex) {
-    Write-Host 'Rex: `agentbox rex setup` adds the agentbox actions to ~\.config\rex\init.lua (a marked block; `agentbox rex remove` deletes it)'
-} else {
-    Write-Host 'Rex not found: skipped the Rex actions (install Rex, then run install.ps1 again to add them)'
-}
-Write-Host 'VS Code: `agentbox vscode install` adds the dashboard as an extension (again after upgrading agentbox)'
-Write-Host 'agents on this machine (Claude Code, Codex, OpenCode, Pi): `agentbox skill setup` installs the agentbox skill'
-Write-Host "done. next: sbx login, then edit $Cfg\agentbox.toml, then: agentbox doctor"
+if (-not $HaveRex) { Write-Host 'Rex not found: skipped the Rex actions (install Rex, then run install.ps1 again to add them)' }
+Write-Host "done (to upgrade, run the new install.ps1: it runs ``agentbox setup`` again)"

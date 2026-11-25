@@ -18,6 +18,7 @@ Docker Sandboxes (`sbx`).
     agentbox dashboard           running sandboxes at a glance: uptime, idle, tokens, cpu (--watch, --json)
     agentbox dashboard -i        interactive: every profile, its job and plan; watch, logs, fetch
     agentbox doctor [<profile>]  sanity / security checks (--json)
+    agentbox setup               seed ~/.config/agentbox (after installing and upgrading)
     agentbox --version           the agentbox release
     agentbox bridge <profile>    run the host-tool bridge in the foreground
     agentbox run <profile> (--prompt-file F | --prompt T) [--detach]   headless agent job
@@ -396,7 +397,7 @@ def sha256_file(p: Path) -> str:
 class Config:
     def __init__(self):
         if not CONFIG_FILE.exists():
-            die(f"no config at {CONFIG_FILE} - run install.sh or copy agentbox.example.toml there", EXIT_USAGE)
+            die(f"no config at {CONFIG_FILE}: run `agentbox setup`", EXIT_USAGE)
         self.raw = tomllib.loads(CONFIG_FILE.read_text())
         self.settings = {**DEFAULT_SETTINGS, **self.raw.get("settings", {})}
         self.tools = self.raw.get("tools", {})
@@ -8134,6 +8135,99 @@ def write_skill_stub(path: Path):
     write_text_atomic(path, SKILL_STUB, mode=0o644)     # agents read it; nothing in it is private
 
 
+# ------------------------------------------------- `agentbox setup`: per-user files in ~/.config/agentbox
+# The defaults ship in share/ with the program (whatever installed it: install.sh, install.ps1, Homebrew);
+# setup copies them into the config dir and never overwrites anything there. Run it after installing and
+# after each upgrade: new kits arrive, and changed ones are reported, not replaced.
+def tree_differs(a: Path, b: Path) -> bool:
+    """True if the two directory trees differ in file names or contents."""
+    def files(root: Path) -> dict:
+        return {f.relative_to(root).as_posix(): f for f in root.rglob("*") if f.is_file()}
+    fa, fb = files(a), files(b)
+    return fa.keys() != fb.keys() or any(fa[k].read_bytes() != fb[k].read_bytes() for k in fa)
+
+
+def setup_config() -> list[dict]:
+    """Seed CONFIG_DIR from SHARE_DIR. One row per item: {kind, name, path, action}."""
+    src_kits, src_cfg = SHARE_DIR / "kits", SHARE_DIR / "config"
+    if not src_kits.is_dir() or not (src_cfg / "agentbox.example.toml").is_file():
+        die(f"this agentbox has no defaults in {SHARE_DIR} (kits/, config/): reinstall it", EXIT_FAIL)
+    rows = []
+    for d in (CONFIG_DIR, KITS_DIR, CONFIG_DIR / "gdb"):
+        d.mkdir(parents=True, exist_ok=True)
+    for k in sorted(p for p in src_kits.iterdir() if p.is_dir()):
+        dst = KITS_DIR / k.name
+        row = {"kind": "kit", "name": k.name, "path": str(dst)}
+        if (dst / "spec.yaml").exists():         # sbx ships v3 kits and refuses to mix in v2 ones: set it aside
+            bak = dst.with_name(f"{dst.name}.v2-backup-{time.strftime('%Y%m%d%H%M%S')}")
+            dst.rename(bak)
+            rows.append({**row, "action": "moved_v2", "backup": str(bak)})
+        if dst.exists():
+            rows.append({**row, "action": "kept_differs" if tree_differs(k, dst) else "kept"})
+        else:
+            shutil.copytree(k, dst)
+            rows.append({**row, "action": "created"})
+    for g in sorted(src_cfg.glob("gdb/*.gdb")):
+        dst = CONFIG_DIR / "gdb" / g.name
+        row = {"kind": "gdb", "name": g.name, "path": str(dst)}
+        if dst.exists():
+            rows.append({**row, "action": "kept_differs" if dst.read_bytes() != g.read_bytes() else "kept"})
+        else:
+            shutil.copyfile(g, dst)
+            rows.append({**row, "action": "created"})
+    row = {"kind": "config", "name": CONFIG_FILE.name, "path": str(CONFIG_FILE)}
+    if CONFIG_FILE.exists():
+        rows.append({**row, "action": "kept"})
+    else:
+        shutil.copyfile(src_cfg / "agentbox.example.toml", CONFIG_FILE)
+        rows.append({**row, "action": "created"})
+    owner_only(CONFIG_DIR, is_dir=True)          # the agent must not be able to widen its own permissions
+    return rows
+
+
+def setup_next_steps(rows: list[dict]) -> list[str]:
+    steps = []
+    if not shutil.which("sbx"):
+        steps.append("install Docker Sandboxes: brew install --cask docker/tap/sbx (macOS);"
+                     " see docs.docker.com/sandboxes otherwise")
+    steps.append("sbx login (once)")
+    if any(r["kind"] == "config" and r["action"] == "created" for r in rows):
+        steps.append(f"edit the profiles in {CONFIG_FILE}, or: agentbox provision <name> --workspace <dir>")
+    steps.append("agentbox doctor")
+    steps.append("optional: agentbox skill setup (the agentbox skill for Claude Code, Codex, OpenCode, Pi)")
+    steps.append("optional: agentbox vscode install (the dashboard in VS Code)")
+    if rex_program() or (HOME / ".config" / "rex").is_dir():
+        steps.append("optional: agentbox rex setup (the agentbox actions in Rex)")
+    return steps
+
+
+SETUP_WORDS = {"created": "created", "kept": "kept", "kept_differs": "kept (this release's copy differs)",
+               "moved_v2": "moved aside (a v2 kit; sbx needs kit spec v3)"}
+
+
+def cmd_setup(args) -> int:
+    """`agentbox setup`: the per-user config dir. Safe to run again: it only adds what is missing."""
+    try:
+        rows = setup_config()
+    except OSError as e:
+        die(f"setup failed: {e}", EXIT_FAIL)
+    steps = setup_next_steps(rows)
+    if args.json:
+        emit_json({"version": VERSION, "config_dir": str(CONFIG_DIR), "share_dir": str(SHARE_DIR),
+                   "items": rows, "next": steps})
+        return EXIT_OK
+    print(f"agentbox {VERSION}: {CONFIG_DIR}")
+    for r in rows:
+        extra = f" -> {r['backup']}" if r.get("backup") else ""
+        print(f"  {r['kind']:<6} {r['name']:<24} {SETUP_WORDS[r['action']]}{extra}")
+    if any(r["action"] == "kept_differs" for r in rows):
+        print(f"  your copies are never replaced; this release's are in {SHARE_DIR}")
+    print("next:")
+    for s in steps:
+        print(f"  {s}")
+    return EXIT_OK
+
+
 def cmd_skill(args) -> int:
     if args.action == "show":
         try:
@@ -8260,12 +8354,16 @@ def main():
     p.add_argument("action", choices=("install", "status", "uninstall"),
                    help="install (or update) it, show whether it is current, or remove it")
     p.add_argument("--json", action="store_true", help="status: one JSON document")
+    p = sub.add_parser("setup", help="seed ~/.config/agentbox (config, kits); run after installing and after upgrades")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("skill", help="the agentbox skill for agents on this machine (Claude Code, Codex, OpenCode, Pi)")
     p.add_argument("action", choices=("show", "setup", "status", "remove"),
                    help="show: print the guide; setup: install SKILL.md stubs; status; remove: delete our stubs")
     p.add_argument("--json", action="store_true", help="status: one JSON document")
     a = ap.parse_args()
 
+    if a.cmd == "setup":     # creates the config: needs none
+        sys.exit(cmd_setup(a))
     if a.cmd == "rex":       # host-side only: touches no sandbox
         if a.json and a.action != "status":
             die("--json is only for `rex status`", EXIT_USAGE)

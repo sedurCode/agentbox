@@ -147,22 +147,22 @@ class ShippedKitTests(unittest.TestCase):
     KITS = ("claude-team", "embedded-arm", "junie", "python-node")
 
     def descriptor(self, name):
-        return (ROOT / "kits" / name / f"{name}.yaml").read_text()
+        return (ROOT / "share" / "kits" / name / f"{name}.yaml").read_text()
 
     def test_every_kit_is_v3(self):
-        self.assertEqual(sorted(p.name for p in (ROOT / "kits").iterdir() if p.is_dir()), list(self.KITS))
+        self.assertEqual(sorted(p.name for p in (ROOT / "share" / "kits").iterdir() if p.is_dir()), list(self.KITS))
         for k in self.KITS:
             text = self.descriptor(k)
             self.assertTrue(text.startswith(ab.KIT_SYNTAX + "\n"), k)
             self.assertIn('\nschemaVersion: "3"\n', text, k)
             self.assertNotIn("\nname:", text, k)                     # strict decode rejects the v2 field
-            self.assertFalse((ROOT / "kits" / k / "spec.yaml").exists(), k)
+            self.assertFalse((ROOT / "share" / "kits" / k / "spec.yaml").exists(), k)
             # `licenses:` makes sbx build even a declaration-only mixin (needs Docker on the host)
             self.assertNotIn("\nlicenses:", text, k)
 
     def test_only_the_workload_has_a_recipe(self):
         for k in self.KITS:
-            recipe = ROOT / "kits" / k / f"{k}.dockerfile"
+            recipe = ROOT / "share" / "kits" / k / f"{k}.dockerfile"
             self.assertEqual(recipe.exists(), k == "junie", k)
         self.assertIn("\nkind: workload\n", self.descriptor("junie"))
         self.assertIn("com.docker.sandbox/sbx@1", self.descriptor("junie"))
