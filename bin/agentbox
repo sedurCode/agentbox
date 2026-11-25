@@ -18,6 +18,7 @@ Docker Sandboxes (`sbx`).
     agentbox dashboard           running sandboxes at a glance: uptime, idle, tokens, cpu (--watch, --json)
     agentbox dashboard -i        interactive: every profile, its job and plan; watch, logs, fetch
     agentbox doctor [<profile>]  sanity / security checks (--json)
+    agentbox --version           the agentbox release
     agentbox bridge <profile>    run the host-tool bridge in the foreground
     agentbox run <profile> (--prompt-file F | --prompt T) [--detach]   headless agent job
     agentbox wait <profile> [--job ID] [--timeout S]   block; exit with the job's exit code
@@ -58,6 +59,7 @@ import http.server
 import io
 import json
 import os
+import platform
 import re
 import secrets as pysecrets
 import shlex
@@ -76,6 +78,9 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 import tomllib
+
+# The release this script is: a vX.Y.Z tag is cut from a commit with this value (SemVer; 0.x while it settles).
+VERSION = "0.1.0"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))
@@ -7343,7 +7348,7 @@ class Report:
         self.add("skip", msg)
 
     def result(self) -> dict:
-        return {"ok": self.ok, "checks": self.items}
+        return {"ok": self.ok, "version": VERSION, "checks": self.items}
 
 
 # ------------------------------------------------------------ local models (host side)
@@ -7466,6 +7471,7 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
     chk = rep.chk
 
     rep.say("host")
+    rep.note("info", f"agentbox {VERSION} (Python {platform.python_version()}, {Path(__file__).resolve()})")
     v = sbx(cfg, "version", check=False, capture=True)
     chk(v.returncode == 0, f"sbx present: {(v.stdout or '').strip().splitlines()[0] if v.stdout else '?'}",
         "brew trust docker/tap && brew install docker/tap/sbx && sbx login")
@@ -8172,6 +8178,7 @@ def cmd_skill(args) -> int:
 def main():
     ap = argparse.ArgumentParser(prog="agentbox", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"agentbox {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("up"); p.add_argument("profile"); p.add_argument("agent_args", nargs="*")
     for c in ("shell", "audit", "stop", "bridge"):

@@ -881,10 +881,11 @@ times and the permission mode only, never conversation content):
 
 `agentbox doctor [profile] --json` (exit `0` when `ok`, else `1`). `status` is one of `pass`, `fail`,
 `warn`, `info`, `skip`; `profile` is `null` for host-level checks; `hint`, `details` and `data` are
-optional:
+optional. `version` is the agentbox release (also `agentbox --version`):
 
 ```json
-{"ok": false, "checks": [
+{"ok": false, "version": "0.1.0", "checks": [
+  {"profile": null, "status": "info", "message": "agentbox 0.1.0 (Python 3.13.1, /opt/homebrew/...)"},
   {"profile": null, "status": "pass", "message": "sbx present: sbx 1.2.3"},
   {"profile": "h750", "status": "warn", "message": "GH_TOKEN: looks like a real credential (40 chars)",
    "hint": "check `sbx secret ls` ...", "data": {"name": "GH_TOKEN", "class": "real", "length": 40}},
