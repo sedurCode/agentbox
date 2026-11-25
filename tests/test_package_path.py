@@ -7,7 +7,7 @@ from helpers import AgentboxTestCase, ab
 
 class PackagePathTests(AgentboxTestCase):
     def test_appends_missing_dirs_after_the_callers(self):
-        got = ab.with_package_dirs("/usr/bin:/bin", isdir=lambda d: d == "/opt/homebrew/bin")
+        got = ab.with_package_dirs(os.pathsep.join(["/usr/bin", "/bin"]), isdir=lambda d: d == "/opt/homebrew/bin")
         self.assertEqual(got, os.pathsep.join(["/usr/bin", "/bin", "/opt/homebrew/bin"]))
 
     def test_keeps_the_callers_order_and_adds_nothing_twice(self):
