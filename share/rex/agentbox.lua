@@ -1,4 +1,5 @@
--- agentbox actions for Rex. Installed by agentbox (install.sh) into ~/.local/share/agentbox/share/rex/.
+-- agentbox actions for Rex. Ships with agentbox in share/rex/ (~/.local/share/agentbox/share/rex/ from the
+-- installers, <brew prefix>/opt/agentbox/libexec/share/rex/ from Homebrew).
 --
 -- In ~/.config/rex/init.lua:
 --   package.path = os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;" .. package.path

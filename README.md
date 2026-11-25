@@ -98,15 +98,26 @@ a release from the Releases page, unpack it and run `./install.sh` (or `.\instal
 Host tools run with a fixed `PATH` (Homebrew, `/usr/local/bin`, `/usr/bin`, `/snap/bin`, then `~/.local/bin`
 last so it can't shadow system tools; missing directories skipped). Use an absolute path for anything else.
 
-`install.sh` puts the CLI in `~/.local/share/agentbox` (the script as `bin/agentbox.py`, plus a
-small `sh` launcher `bin/agentbox`), links `~/.local/bin/agentbox`, and runs `agentbox setup` (below). It also installs the guide for
-agents on the host (`share/skill/`) but leaves their skill folders alone: run `agentbox skill setup` for that.
-It copies the VS Code extension (`share/vscode/`) and, if it finds Rex, the Rex actions (`share/rex/`), but
-installs neither into the editor or Rex: see *Rex and VS Code* below.
+**Where it goes.** The script (`bin/agentbox.py`) and everything it ships in `share/` (the agents' guide, the
+default kits and config, the VS Code extension, the Rex actions) live together:
 
-The launcher looks for Python at run time (`python3.14`, `3.13`, `3.12`, `3.11`, then `python3`;
-the first that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the
-install. With none it prints "agentbox needs Python 3.11+ (brew install python)" and exits 1.
+| installed with | files | `agentbox` command |
+|---|---|---|
+| Homebrew | `<brew prefix>/opt/agentbox/libexec/` (a stable link to the current version) | `<brew prefix>/bin/agentbox`, which always runs brew's Python |
+| `install.sh` (and the one line) | `~/.local/share/agentbox/` | `~/.local/bin/agentbox`, a link to a small launcher |
+| `install.ps1` (and the one line) | `~\.local\share\agentbox\` | `~\.local\bin\agentbox.cmd` |
+
+The installers run `agentbox setup` (below); with Homebrew you run it yourself. None of them installs the skill
+into your agents, the extension into VS Code or the actions into Rex: see `agentbox skill setup` and *Rex and
+VS Code* below.
+
+The `install.sh` launcher looks for Python at run time (`python3.15` down to `3.11`, then `python3`; the first
+that is 3.11+ wins), so removing or upgrading one interpreter doesn't break the install. With none it prints
+"agentbox needs Python 3.11+ (brew install python)" and exits 1. Started by a GUI app (Rex, an IDE) with a
+minimal `PATH`, agentbox adds Homebrew's and `/usr/local/bin` to its own, so it still finds `sbx`.
+
+**Upgrading.** Homebrew: `brew upgrade agentbox`. Otherwise: run the one line again (or the new release's
+installer). Then `agentbox setup` (the installers do it for you) and, if you use it, `agentbox vscode install`.
 
 ### `agentbox setup`
 
@@ -124,9 +135,8 @@ new kits arrive. Commands that need a config and find none tell you to run it.
 ### Rex and VS Code
 
 Both are optional and run on the host; each gives you the dashboard (every profile, its job, interactive
-sessions and review branches) and its actions. Neither changes anything until you opt in, and re-running
-`install.sh` (or `install.ps1`) after an upgrade refreshes the files both use (run `agentbox vscode install`
-again too; Rex loads the new files when it restarts).
+sessions and review branches) and its actions. Neither changes anything until you opt in. After upgrading
+agentbox, run `agentbox vscode install` again; Rex loads the new actions when it restarts or reloads its config.
 
 **VS Code**: one command, then reload VS Code's windows (Developer: Reload Window):
 
@@ -136,13 +146,12 @@ agentbox vscode status       # current, outdated (agentbox has a newer one) or m
 agentbox vscode uninstall    # removes it
 ```
 
-There is no build step and node isn't needed: `install` zips `~/.local/share/agentbox/share/vscode` into a
+There is no build step and node isn't needed: `install` zips the installed `share/vscode` into a
 `.vsix` and runs `code --install-extension <it> --force`. The VS Code CLI is found as for `agentbox code`:
 `[settings] vscode`, else `code` on `PATH`, else the one in the app bundle (no config is needed). See
 *Using agentbox from VS Code*.
 
-**Rex**: the installer copies the actions to `~/.local/share/agentbox/share/rex/` when it finds Rex
-(`$AGENTBOX_REX`, `rex` on `PATH`, Rex.app or `~/.config/rex/`); then, once:
+**Rex**: the actions ship with agentbox in `share/rex/`; to load them, once:
 
 ```bash
 agentbox rex setup           # adds the agentbox block to ~/.config/rex/init.lua (creating it if needed)
@@ -154,15 +163,16 @@ and restart Rex (or reload its config). `setup` appends one block between `-- ag
 `-- end agentbox` comments, and touches nothing else in the file; run it again after moving agentbox and it
 rewrites the block in place. If `init.lua` already loads agentbox with lines you wrote yourself (the old
 install instructions), `status` says `manual` and `setup` and `remove` leave them alone: delete them and run
-`setup` to hand them over. Neither the installer nor any other command edits Rex's config. The block is:
+`setup` to hand them over. No other command edits Rex's config. The block (for an `install.sh` install;
+Homebrew's points at `<brew prefix>/opt/agentbox/libexec/share/rex/`, which survives upgrades) is:
 
 ```lua
 package.path = os.getenv("HOME") .. "/.local/share/agentbox/share/rex/?.lua;" .. package.path
 require("agentbox").setup{}
 ```
 
-Installed Rex after agentbox? Run the installer again. See *Using agentbox from Rex* and
-[`share/rex/README.md`](share/rex/README.md).
+The actions run `~/.local/bin/agentbox`, else Homebrew's (`setup{ agentbox = "/path" }` picks another). See
+*Using agentbox from Rex* and [`share/rex/README.md`](share/rex/README.md).
 
 ### One-time sbx settings
 
@@ -778,13 +788,13 @@ in [`share/vscode/README.md`](share/vscode/README.md):
 
 It reads `agentbox dashboard --json` every 5 s while the view is visible and every 30 s while it is hidden
 (`agentbox.refreshInterval`, `agentbox.backgroundInterval`); `agentbox.path` points at another agentbox.
-The rows' `state` field it needs is new: with an older agentbox the view asks you to run the installer again.
+The rows' `state` field it needs is new: with an older agentbox the view asks you to upgrade agentbox.
 
 ### Using agentbox from Rex
 
 [Rex](https://www.superlogical.com/rex/docs) users get palette actions and job status from
-`share/rex/` (installed to `~/.local/share/agentbox/share/rex/` when the installer finds Rex; setup in
-*Rex and VS Code* in §1 and [`share/rex/README.md`](share/rex/README.md)):
+`share/rex/`, which ships with agentbox (setup in *Rex and VS Code* in §1 and
+[`share/rex/README.md`](share/rex/README.md)):
 
 - **Actions** (category "agentbox"): open a profile as a session with Agent, Progress and Shell tabs, run
   a job from a prompt file, open the interactive dashboard, fetch for review, review (`agentbox review` in a
@@ -859,8 +869,8 @@ The stub goes to `~/.claude/skills/agentbox/` (Claude Code; `$CLAUDE_CONFIG_DIR/
 set) and `~/.agents/skills/agentbox/` (Codex, OpenCode, Pi), plus `$CODEX_HOME/skills/agentbox/` when
 `CODEX_HOME` is set. Each stub carries a marker comment. A `SKILL.md` without the marker, or a symlink, is
 reported as `foreign` and never overwritten or removed; `remove` deletes only marked stubs, and their folder
-only if it is then empty. None of the `skill` commands needs a config or touches a sandbox, and
-`install.sh` does not run `setup` for you.
+only if it is then empty. None of the `skill` commands needs a config or touches a sandbox, and no
+installer runs `skill setup` for you.
 
 The guide covers the ground rules (which commands an agent may run on its own, which need your go-ahead,
 and what it must never do: `--force`, merging, pushing, reading secrets, task text on a command line),
@@ -1254,7 +1264,7 @@ for when auto mode gets in the way. `doctor` shows the mode and warns about `byp
   `~/.local/state/agentbox/ab-<profile>/bridge.out`.
 - **Kit errors at create** → `sbx kit inspect <dir>` (`sbx kit validate` does not take v3 source
   kits). The kits use kit spec v3 (see *Kits* above); `cannot mix v3 kits with v1/v2 kits` means a
-  kit is still a v2 `spec.yaml` — re-run the installer for the bundled ones. sbx kits are marked
+  kit is still a v2 `spec.yaml` — `agentbox setup` moves the bundled ones aside and installs v3 copies. sbx kits are marked
   experimental and the schema has changed more than once, so re-run `agentbox doctor` after sbx
   upgrades. The generated per-sandbox kit (`~/.local/state/agentbox/ab-<profile>/kit/agentbox/`) is
   built in one function (`local_kit_spec`) if it needs adjusting.
@@ -1274,14 +1284,15 @@ Tests use only the standard library and never call the real `sbx` (any attempt f
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && sh -n share/agentbox-launcher && sh -n share/jobwrap && sh -n share/jobprogress
+python3 -m py_compile bin/agentbox share/hosttool && bash -n install.sh && bash -n tools/release-checksums.sh && sh -n share/agentbox-launcher && sh -n share/jobwrap && sh -n share/jobprogress
 ```
 
 41 tests are skipped on macOS: they run the VM-side `sh` scripts
 (the job wrapper, the probes, the kill script), which use Linux tools such as `setsid` and `/proc`. The
 Ubuntu CI job runs them. The `fetch` tests use real temporary git repos and need `git`.
 
-CI (`.github/workflows/ci.yml`) runs the same on Ubuntu and macOS with Python 3.11 and 3.14.
+CI (`.github/workflows/ci.yml`) runs the same on Ubuntu, macOS and Windows with Python 3.11 and 3.14, and a
+gitleaks scan of the whole history (`secrets`).
 
 ### Releasing
 

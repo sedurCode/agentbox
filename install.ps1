@@ -104,15 +104,9 @@ foreach ($d in 'kits', 'config') {
 # the VS Code extension (`agentbox vscode install` packs it from here); replaced whole, so removed files go
 Remove-Item "$Dest\share\vscode" -Recurse -Force -ErrorAction SilentlyContinue
 Copy-Item "$Src\share\vscode" "$Dest\share\vscode" -Recurse -Force
-# Rex actions, only if Rex is here ($env:AGENTBOX_REX, rex on PATH, or a ~\.config\rex); ~\.config\rex is never touched
-$HaveRex = ($env:AGENTBOX_REX -and (Test-Path $env:AGENTBOX_REX -PathType Leaf)) -or
-           [bool](Get-Command rex -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $Home_ '.config\rex'))
-if ($HaveRex) {
-    New-Item -ItemType Directory -Force "$Dest\share\rex" | Out-Null
-    Copy-Item "$Src\share\rex\*" "$Dest\share\rex\" -Recurse -Force
-    # an earlier install shipped notify.lua; Rex's own notifications replace it
-    Remove-Item "$Dest\share\rex\notify.lua" -ErrorAction SilentlyContinue
-}
+# the Rex actions (used only once you run `agentbox rex setup`; ~\.config\rex is never touched here)
+Remove-Item "$Dest\share\rex" -Recurse -Force -ErrorAction SilentlyContinue
+Copy-Item "$Src\share\rex" "$Dest\share\rex" -Recurse -Force
 Copy-Item "$Src\bin\agentbox" "$Dest\bin\agentbox.py" -Force
 Copy-Item "$Src\share\agentbox.cmd" "$Dest\bin\agentbox.cmd" -Force
 # no symlink (needs Developer Mode): a one-line shim on PATH calls the installed launcher
@@ -123,5 +117,4 @@ $env:AGENTBOX_CONFIG_DIR = $Cfg
 if ($LASTEXITCODE -ne 0) { Write-Error "agentbox setup failed"; exit 1 }
 
 if (($env:Path -split ';') -notcontains $Bin) { Write-Host "add $Bin to PATH" }
-if (-not $HaveRex) { Write-Host 'Rex not found: skipped the Rex actions (install Rex, then run install.ps1 again to add them)' }
 Write-Host "done (to upgrade, run the new install.ps1: it runs ``agentbox setup`` again)"
