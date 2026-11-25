@@ -81,7 +81,29 @@ HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))
 CONFIG_FILE = CONFIG_DIR / "agentbox.toml"
 KITS_DIR = CONFIG_DIR / "kits"
-SHARE_DIR = Path(__file__).resolve().parent.parent / "share"
+
+
+def stable_path(p: str | Path) -> Path:
+    """p resolved, but a path inside a Homebrew keg (<prefix>/Cellar/<name>/<version>/...) becomes the same file
+    through <prefix>/opt/<name>/..., which survives `brew upgrade` + `brew cleanup` (the keg doesn't). Anything
+    else, or an opt link that doesn't lead to the same file, is returned resolved."""
+    real = Path(p).resolve()
+    parts = real.parts
+    for i in range(len(parts) - 3, 0, -1):
+        if parts[i] == "Cellar":
+            opt = Path(*parts[:i], "opt", parts[i + 1], *parts[i + 3:])
+            try:
+                if opt.resolve() == real:
+                    return opt
+            except OSError:
+                pass
+            break
+    return real
+
+
+SCRIPT = stable_path(__file__)                  # this script, by a path that outlives an upgrade
+PYTHON = str(stable_path(sys.executable)) if sys.executable else sys.executable
+SHARE_DIR = SCRIPT.parent.parent / "share"
 
 BUILTIN_AGENTS = {"claude", "codex", "copilot", "cursor", "droid", "gemini",
                   "kiro", "opencode", "docker-agent", "shell"}
@@ -1983,7 +2005,7 @@ def start_bridge(prof: Profile):
     prof.state.mkdir(parents=True, exist_ok=True)
     Bridge(prof)  # preflight in the foreground so errors are visible
     log = open(prof.state / "bridge.out", "a")
-    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bridge", prof.name],
+    p = subprocess.Popen([PYTHON, str(SCRIPT), "bridge", prof.name],
                          stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                          **detached_popen_kwargs(), env=child_env())
     (prof.state / "bridge.pid").write_text(str(p.pid))
@@ -3151,7 +3173,7 @@ def start_keepalive(prof: Profile):
     if keepalive_pid(prof):
         return
     log = open(prof.state / "keepalive.out", "a")
-    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "keepalive", prof.name],
+    p = subprocess.Popen([PYTHON, str(SCRIPT), "keepalive", prof.name],
                          stdout=log, stderr=log, stdin=subprocess.DEVNULL, **detached_popen_kwargs(),
                          env=child_env())
     (prof.state / "keepalive.pid").write_text(str(p.pid))
@@ -5552,7 +5574,7 @@ class DashCollector:
 
 def agentbox_argv(args: list[str]) -> list[str]:
     """This same agentbox, run as a child process."""
-    return [sys.executable, str(Path(__file__).resolve()), *args]
+    return [PYTHON, str(SCRIPT), *args]
 
 
 REX_APP_CLI = "/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"

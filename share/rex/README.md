@@ -19,8 +19,9 @@ require("agentbox").setup{}
 it), `missing` or `manual` (init.lua loads agentbox with lines you wrote; `setup` and `remove` leave those
 alone). `agentbox rex remove` deletes the block. You can also write the lines yourself instead.
 
-`setup{ agentbox = "/abs/path/to/agentbox" }` points at another agentbox binary (the default is
-`~/.local/bin/agentbox`). The command palette then has, under "agentbox":
+`setup{ agentbox = "/abs/path/to/agentbox" }` points at another agentbox binary (the default is the first
+that exists of `~/.local/bin/agentbox` and Homebrew's `/opt/homebrew/bin`, `/usr/local/bin` and
+`/home/linuxbrew/.linuxbrew/bin`). The command palette then has, under "agentbox":
 
 | action | what it does |
 |---|---|
