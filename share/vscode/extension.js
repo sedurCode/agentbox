@@ -19,13 +19,15 @@ const LOG_SCHEME = "agentbox-log";
 
 function cfg() { return vscode.workspace.getConfiguration("agentbox"); }
 
-/** The agentbox CLI: the setting, else ~/.local/bin/agentbox(.cmd) if present (a GUI app's PATH often lacks
- * ~/.local/bin), else `agentbox` on PATH. */
+/** The agentbox CLI: the setting, else the first that exists of install.sh's ~/.local/bin/agentbox(.cmd) and
+ * Homebrew's (a GUI app's PATH often lacks both), else `agentbox` on PATH. */
 function agentboxPath() {
   const set = cfg().get("path");
   if (set) return set.startsWith("~") ? path.join(os.homedir(), set.slice(1)) : set;
-  const local = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "agentbox.cmd" : "agentbox");
-  return fs.existsSync(local) ? local : "agentbox";
+  const win = process.platform === "win32";
+  const candidates = [path.join(os.homedir(), ".local", "bin", win ? "agentbox.cmd" : "agentbox")];
+  if (!win) candidates.push("/opt/homebrew/bin/agentbox", "/usr/local/bin/agentbox", "/home/linuxbrew/.linuxbrew/bin/agentbox");
+  return candidates.find(p => fs.existsSync(p)) || "agentbox";
 }
 
 /** Run agentbox and collect stdout. A .cmd needs cmd.exe on Windows, and with `shell` node joins the command

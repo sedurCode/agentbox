@@ -17,7 +17,18 @@ local M = {}
 
 local TERMINAL = "com.superlogical.terminal.shell"
 local HOME = os.getenv("HOME") or ""
-local opts = { agentbox = HOME .. "/.local/bin/agentbox" }
+-- The CLI: install.sh's link, else Homebrew's (Rex is a GUI app, so its PATH may have neither).
+-- setup{ agentbox = "/abs/path" } overrides it.
+local function default_agentbox()
+  local candidates = { HOME .. "/.local/bin/agentbox", "/opt/homebrew/bin/agentbox", "/usr/local/bin/agentbox",
+                       "/home/linuxbrew/.linuxbrew/bin/agentbox" }
+  for _, p in ipairs(candidates) do
+    local f = io.open(p, "r")
+    if f then f:close(); return p end
+  end
+  return candidates[1]
+end
+local opts = { agentbox = default_agentbox() }
 
 -- agentbox's NAME_RE: ^[a-z0-9][a-z0-9-]{0,40}$
 local function valid_name(s)

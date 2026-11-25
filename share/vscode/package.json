@@ -57,7 +57,7 @@
     "configuration": {
       "title": "agentbox",
       "properties": {
-        "agentbox.path": { "type": "string", "default": "", "scope": "machine", "markdownDescription": "The `agentbox` CLI. Empty: `~/.local/bin/agentbox` if it exists, else `agentbox` on `PATH`." },
+        "agentbox.path": { "type": "string", "default": "", "scope": "machine", "markdownDescription": "The `agentbox` CLI. Empty: the first that exists of `~/.local/bin/agentbox` and Homebrew's (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`), else `agentbox` on `PATH`." },
         "agentbox.refreshInterval": { "type": "number", "default": 5, "minimum": 2, "description": "Seconds between refreshes while the Profiles view is visible." },
         "agentbox.backgroundInterval": { "type": "number", "default": 30, "minimum": 0, "description": "Seconds between refreshes while the view is hidden (status bar and notifications). 0: only while visible." },
         "agentbox.statusBar": { "type": "boolean", "default": true, "description": "Show a summary in the status bar." },
