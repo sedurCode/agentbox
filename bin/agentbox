@@ -182,6 +182,15 @@ HOST_TOOL_PATH = ":".join(d for d in (
     "/opt/homebrew/bin", "/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
     "/usr/sbin", "/sbin", "/snap/bin", str(HOME / ".local" / "bin")) if os.path.isdir(d))
 MERGED_LISTS = ("allow", "deny", "kits", "skills")   # defaults + profile are unioned
+# Where package managers put sbx (and the tools agentbox runs on the host). Started by a GUI app (Rex, an IDE),
+# agentbox's own PATH may be just /usr/bin:/bin:/usr/sbin:/sbin; main() appends these.
+PACKAGE_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin")
+
+
+def with_package_dirs(path: str, isdir=os.path.isdir) -> str:
+    """PATH with PACKAGE_BIN_DIRS that exist appended, after the caller's own entries so those still win."""
+    have = [d for d in path.split(os.pathsep) if d]
+    return os.pathsep.join(have + [d for d in PACKAGE_BIN_DIRS if d not in have and isdir(d)])
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 # Claude Code's own skills: a user skill with one of these names would shadow it.
@@ -8386,6 +8395,8 @@ def main():
                    help="show: print the guide; setup: install SKILL.md stubs; status; remove: delete our stubs")
     p.add_argument("--json", action="store_true", help="status: one JSON document")
     a = ap.parse_args()
+    if not IS_WIN:           # however agentbox was started (launcher, Homebrew's wrapper, by hand), sbx is found
+        os.environ["PATH"] = with_package_dirs(os.environ.get("PATH", ""))
 
     if a.cmd == "setup":     # creates the config: needs none
         sys.exit(cmd_setup(a))
