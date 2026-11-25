@@ -22,5 +22,6 @@ class VersionTests(AgentboxTestCase):
         FakeSbx(exists=False).install(self)
         _, out, _ = self.run_main("doctor")
         self.assertRegex(out, rf"agentbox {re.escape(ab.VERSION)} \(Python \d+\.\d+")
+        self.assertIn(str(ab.SCRIPT), out)             # the stable path (Homebrew: opt/, not the versioned Cellar)
         _, out, _ = self.run_main("doctor", "--json")
         self.assertEqual(json.loads(out)["version"], ab.VERSION)

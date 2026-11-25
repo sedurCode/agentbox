@@ -81,7 +81,7 @@ from pathlib import Path, PurePosixPath
 import tomllib
 
 # The release this script is: a vX.Y.Z tag is cut from a commit with this value (SemVer; 0.x while it settles).
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("AGENTBOX_CONFIG_DIR", HOME / ".config" / "agentbox"))
@@ -7503,7 +7503,7 @@ def cmd_doctor(cfg: Config, name: str | None, as_json: bool = False, start: bool
     chk = rep.chk
 
     rep.say("host")
-    rep.note("info", f"agentbox {VERSION} (Python {platform.python_version()}, {Path(__file__).resolve()})")
+    rep.note("info", f"agentbox {VERSION} (Python {platform.python_version()}, {SCRIPT})")
     v = sbx(cfg, "version", check=False, capture=True)
     chk(v.returncode == 0, f"sbx present: {(v.stdout or '').strip().splitlines()[0] if v.stdout else '?'}",
         "brew trust docker/tap && brew install docker/tap/sbx && sbx login")
