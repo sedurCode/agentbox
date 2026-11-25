@@ -1,0 +1,8 @@
+# Findings gitleaks reports that aren't secrets. One per line: <commit>:<file>:<rule>:<line>.
+# Lines in the current tree are marked `gitleaks:allow` instead; these are the same lines in the commits
+# that added them, which a full-history scan still reports.
+# test assertions on the labels `agentbox doctor` prints for placeholder variables; no keys
+f0ce7306d61d46600f14c26ccd6a3b41287937fb:tests/test_json.py:generic-api-key:136
+fce86f03963dc873b5ad6786c865fc6d667e14d7:tests/test_vm_state.py:generic-api-key:186
+# an earlier version of this file's own comment, in this PR's first commit
+873a7c89b4dd56cf6a65573f915852abb1091186:.gitleaksignore:generic-api-key:4

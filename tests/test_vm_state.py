@@ -197,7 +197,7 @@ class StoppedDiagnosticsTests(AgentboxTestCase):
                                  "ssh-add": (2, "Could not open a connection to your authentication agent.\n")}).install(self)
         code, out, _ = self.run_main("doctor", "on", "--start")
         self.assertEqual(code, 0)
-        self.assertIn("A_KEY: placeholder/unknown", out)
+        self.assertIn("A_KEY: placeholder/unknown", out)   # gitleaks:allow (a doctor label, not a key)
         self.assertTrue([c for c in fake.calls if c[0] == "exec"])
 
     def test_audit_git_status_does_not_boot_a_stopped_sandbox(self):
