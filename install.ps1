@@ -3,6 +3,12 @@
 # See LICENSING.md.
 # Install agentbox on Windows into ~\.local\share\agentbox, put an `agentbox.cmd` shim in ~\.local\bin,
 # then run `agentbox setup`, which seeds ~\.config\agentbox (never overwrites an existing config).
+#
+# From an unpacked release: .\install.ps1. Without one (the one-line install):
+#   irm https://raw.githubusercontent.com/sedurCode/agentbox/main/install.ps1 | iex
+# downloads the newest release (pre-releases too; $env:AGENTBOX_VERSION = 'vX.Y.Z' picks one), checks it against
+# the release's SHA256SUMS and runs that release's own install.ps1. Under iex nothing here may `exit`: that
+# would close the user's window.
 $ErrorActionPreference = 'Stop'
 
 $Src  = $PSScriptRoot
@@ -42,6 +48,48 @@ if (-not $py -and (Get-Command python -ErrorAction SilentlyContinue)) {
 }
 if (-not $py) { throw 'need Python 3.11+ (winget install Python.Python.3.12)' }
 Write-Host "found $py"
+
+if (-not $Src -or -not (Test-Path (Join-Path $Src 'bin\agentbox')) -or -not (Test-Path (Join-Path $Src 'share'))) {
+    # no unpacked release here (run through iex): fetch one
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $Repo = if ($env:AGENTBOX_REPO) { $env:AGENTBOX_REPO } else { 'sedurCode/agentbox' }
+    $Tag = $env:AGENTBOX_VERSION
+    if (-not $Tag) {   # the newest release, pre-releases included (/releases/latest skips them)
+        $rel = @(Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$Repo/releases?per_page=1")
+        if (-not $rel -or -not $rel[0].tag_name) { throw "no agentbox release found at github.com/$Repo" }
+        $Tag = $rel[0].tag_name
+    }
+    if ($Tag -notmatch '^v\d+\.\d+\.\d+$') { throw "not a release tag: $Tag" }
+    $Name = "agentbox-$($Tag.Substring(1))"
+    $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentbox-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $Tmp | Out-Null
+    try {
+        Write-Host "downloading agentbox $Tag"
+        $Zip = Join-Path $Tmp "$Name.zip"
+        try { Invoke-WebRequest -UseBasicParsing "https://github.com/$Repo/archive/refs/tags/$Tag.zip" -OutFile $Zip }
+        catch { throw "could not download agentbox $Tag from github.com/$Repo ($($_.Exception.Message))" }
+        $Sums = Join-Path $Tmp 'SHA256SUMS'
+        try { Invoke-WebRequest -UseBasicParsing "https://github.com/$Repo/releases/download/$Tag/SHA256SUMS" -OutFile $Sums }
+        catch { throw "release $Tag has no SHA256SUMS: not installing an unverified download" }
+        $want = $null
+        foreach ($line in Get-Content $Sums) {
+            $f = -split $line
+            if ($f.Count -eq 2 -and $f[1].TrimStart('*') -eq "$Name.zip") { $want = $f[0].ToLower() }
+        }
+        $got = (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower()
+        if ($want -ne $got) { throw "checksum mismatch for $Name.zip: not installing it" }
+        Write-Host "verified $Name.zip (sha256 $($got.Substring(0, 12))...)"
+        Expand-Archive -Path $Zip -DestinationPath $Tmp
+        $Installer = Join-Path (Join-Path $Tmp $Name) 'install.ps1'
+        if (-not (Test-Path $Installer)) { throw "$Name has no install.ps1" }
+        # its own process, so the execution policy (Restricted by default) doesn't block a script file
+        & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $Installer
+        if ($LASTEXITCODE -ne 0) { throw "the $Tag installer failed" }
+    } finally {
+        Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return
+}
 
 New-Item -ItemType Directory -Force "$Dest\bin", "$Dest\share", $Bin | Out-Null
 foreach ($f in 'hosttool', 'jobwrap', 'jobprogress') { Copy-Item "$Src\share\$f" "$Dest\share\$f" -Force }

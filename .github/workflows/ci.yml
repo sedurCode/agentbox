@@ -29,6 +29,7 @@ jobs:
         run: |
           python -m py_compile bin/agentbox share/hosttool
           bash -n install.sh
+          bash -n tools/release-checksums.sh
           sh -n share/agentbox-launcher
           sh -n share/jobwrap
           sh -n share/jobprogress
