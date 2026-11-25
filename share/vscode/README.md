@@ -17,7 +17,7 @@ wants) and runs `code --install-extension` on it. The VS Code CLI is `[settings]
 `PATH`, else the one in the app bundle, as for `agentbox code`.
 
 To try it without installing: `code --extensionDevelopmentPath="$PWD/share/vscode"`. It needs an agentbox
-that puts `state` in `dashboard --json` rows; with an older one the view asks you to run `install.sh` again.
+that puts `state` in `dashboard --json` rows; with an older one the view asks you to upgrade agentbox.
 It finds the CLI at `agentbox.path`, else the first that exists of `~/.local/bin/agentbox` (`agentbox.cmd` on
 Windows) and Homebrew's (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`), else
 `agentbox` on `PATH`.

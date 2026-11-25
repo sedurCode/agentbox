@@ -2579,7 +2579,7 @@ def cmd_rex(args) -> int:
         else:
             print(f"{state:<9} {f}")
             if not actions.is_file():
-                print(f"the Rex actions aren't installed at {actions}: run the installer again")
+                print(f"the Rex actions aren't at {actions}: reinstall agentbox")
         return EXIT_OK
     if args.action == "remove":
         if state in ("current", "outdated"):
@@ -2592,7 +2592,7 @@ def cmd_rex(args) -> int:
             print(f"not set up: {f}")
         return EXIT_OK
     if not actions.is_file():
-        die(f"the Rex actions aren't installed at {actions}: run the installer again (it copies them when it finds Rex)")
+        die(f"the Rex actions aren't at {actions}: reinstall agentbox")
     if state == "current":
         print(f"current: {f}")
         return EXIT_OK

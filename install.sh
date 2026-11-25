@@ -76,17 +76,9 @@ cp -R "$SRC/share/config" "$DEST/share/config"
 # the VS Code extension (`agentbox vscode install` packs it from here); replaced whole, so removed files go
 rm -rf "$DEST/share/vscode"
 cp -R "$SRC/share/vscode" "$DEST/share/vscode"
-# Rex actions, only if Rex is here (found as agentbox's rex_program() finds it, or a ~/.config/rex);
-# ~/.config/rex/ is never touched (see share/rex/README.md)
-REX_APP_CLI="/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
-HAVE_REX=""
-if [ -x "${AGENTBOX_REX:-}" ] || command -v rex >/dev/null 2>&1 || [ -x "$REX_APP_CLI" ] || [ -d "$HOME/.config/rex" ]; then
-  HAVE_REX=1
-  mkdir -p "$DEST/share/rex"
-  cp -R "$SRC/share/rex/." "$DEST/share/rex/"
-  # an earlier install shipped notify.lua; Rex's own notifications replace it
-  rm -f "$DEST/share/rex/notify.lua"
-fi
+# the Rex actions (used only once you run `agentbox rex setup`; ~/.config/rex/ is never touched here)
+rm -rf "$DEST/share/rex"
+cp -R "$SRC/share/rex" "$DEST/share/rex"
 # the script is installed unchanged; a launcher picks a Python 3.11+ at run time, so
 # removing the interpreter found above doesn't break agentbox
 cp "$SRC/bin/agentbox" "$DEST/bin/agentbox.py"
@@ -97,5 +89,4 @@ ln -sf "$DEST/bin/agentbox" "$BIN/agentbox"
 AGENTBOX_CONFIG_DIR="$CFG" "$DEST/bin/agentbox" setup
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "add $BIN to PATH";; esac
-[ -n "$HAVE_REX" ] || echo "Rex not found: skipped the Rex actions (install Rex, then run install.sh again to add them)"
 echo "done (to upgrade, run the new install.sh: it runs \`agentbox setup\` again)"

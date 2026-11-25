@@ -78,7 +78,7 @@ class RexSetupTests(AgentboxTestCase):
         (self.share / "rex" / "agentbox.lua").unlink()
         code, _, err = self.run_main("rex", "setup")
         self.assertNotEqual(code, 0)
-        self.assertIn("run the installer again", err)
+        self.assertIn("reinstall agentbox", err)
         self.assertFalse(self.init.exists())
 
     def test_json_only_for_status(self):

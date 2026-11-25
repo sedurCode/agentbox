@@ -234,7 +234,7 @@ function parseDashboard(text) {
   const d = JSON.parse(text);
   if (!d || typeof d !== "object" || !Array.isArray(d.profiles)) throw new Error("not a dashboard document");
   if (d.profiles.length && !d.profiles.some(r => r && typeof r.state === "string"))
-    throw new Error("this agentbox is older than the VS Code extension (no `state` in dashboard --json): run install.sh again");
+    throw new Error("this agentbox is older than the VS Code extension (no `state` in dashboard --json): upgrade agentbox");
   d.profiles = d.profiles.filter(r => r && typeof r === "object" && typeof r.name === "string" && NAME_RE.test(r.name));
   return d;
 }

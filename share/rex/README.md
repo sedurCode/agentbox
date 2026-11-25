@@ -1,8 +1,8 @@
 # agentbox in Rex
 
-[Rex](https://www.superlogical.com/rex/docs) runs on the host only. `install.sh` (or `install.ps1`) copies these files to
-`~/.local/share/agentbox/share/rex/` if it finds Rex (`$AGENTBOX_REX`, `rex` on `PATH`,
-Rex.app or `~/.config/rex/`), and never touches `~/.config/rex/` (only `agentbox rex setup`, when you run it, does). Installed Rex after agentbox? Run the installer again.
+[Rex](https://www.superlogical.com/rex/docs) runs on the host only. These files ship with agentbox, however it was
+installed: `~/.local/share/agentbox/share/rex/` from the installers, `<brew prefix>/opt/agentbox/libexec/share/rex/`
+from Homebrew. Nothing touches `~/.config/rex/` except `agentbox rex setup` (and `remove`), when you run it.
 
 ## Actions
 
